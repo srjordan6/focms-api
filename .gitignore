@@ -1,0 +1,7 @@
+pgurl.txt
+_q.sql
+__pycache__/
+*.pyc
+.env
+.env.*
+api_keys.txt

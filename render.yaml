@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: focms-api
+    runtime: python
+    plan: starter
+    region: ohio
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn focms_api:app --host 0.0.0.0 --port 10000
+    healthCheckPath: /focms/v1/health
+    envVars:
+      - fromGroup: FOCMS-PROD
+
+  - type: cron
+    name: nces-scorecard-refresh
+    runtime: python
+    plan: starter
+    region: ohio
+    schedule: "0 4 1 * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python nces_scorecard_worker.py refresh-targets
+    envVars:
+      - fromGroup: FOCMS-PROD
