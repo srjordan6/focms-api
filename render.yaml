@@ -7,8 +7,20 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn focms_api:app --host 0.0.0.0 --port 10000
     healthCheckPath: /focms/v1/health
+    autoDeploy: true
     envVars:
-      - fromGroup: FOCMS-PROD
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_POOLED
+        sync: false
+      - key: SCORECARD_API_KEY
+        sync: false
+      - key: FOCMS_API_TOKENS_JSON
+        sync: false
+      - key: FOCMS_API_LOG_LEVEL
+        value: INFO
+      - key: FOCMS_WORKER_LOG_LEVEL
+        value: INFO
 
   - type: cron
     name: nces-scorecard-refresh
@@ -18,5 +30,17 @@ services:
     schedule: "0 4 1 * *"
     buildCommand: pip install -r requirements.txt
     startCommand: python nces_scorecard_worker.py refresh-targets
+    autoDeploy: true
     envVars:
-      - fromGroup: FOCMS-PROD
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_URL_POOLED
+        sync: false
+      - key: SCORECARD_API_KEY
+        sync: false
+      - key: FOCMS_API_TOKENS_JSON
+        sync: false
+      - key: FOCMS_API_LOG_LEVEL
+        value: INFO
+      - key: FOCMS_WORKER_LOG_LEVEL
+        value: INFO
