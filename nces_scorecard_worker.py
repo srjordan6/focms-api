@@ -23,6 +23,7 @@ import asyncpg, httpx
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ["DATABASE_URL"]
 API_KEY = os.environ["SCORECARD_API_KEY"]
+FOCMS_TENANT_ID = os.environ.get("FOCMS_TENANT_ID", "019ed384-56fc-7516-bfbf-efaa5231e281")
 LOG_LEVEL = os.environ.get("FOCMS_WORKER_LOG_LEVEL", "INFO")
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("nces-scorecard-worker")
@@ -135,10 +136,12 @@ async def resolve_leaids(mode: str, value: str | None, pool) -> list[str]:
         return [s.strip() for s in (value or "").split(",") if s.strip()]
     if mode == "refresh-targets":
         async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT DISTINCT university_leaid FROM target_universities WHERE deleted_at IS NULL"
-            )
-            return [r["university_leaid"] for r in rows]
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", FOCMS_TENANT_ID)
+                rows = await conn.fetch(
+                    "SELECT DISTINCT university_leaid FROM target_universities WHERE deleted_at IS NULL"
+                )
+                return [r["university_leaid"] for r in rows]
     if mode == "refresh-top-n":
         n = int(value or "100")
         async with pool.acquire() as conn:
