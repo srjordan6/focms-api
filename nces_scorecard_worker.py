@@ -146,16 +146,13 @@ async def upsert_cds_facts(conn: asyncpg.Connection, facts: list[dict[str, Any]]
     return n
 
 async def resolve_leaids(mode: str, value: str | None, pool) -> list[str]:
-    log.info("resolve_leaids start mode=%s tenant=%s", mode, FOCMS_TENANT_ID)
     """Determine which LEAIDs to refresh based on mode."""
     if mode == "refresh-leaids":
         return [s.strip() for s in (value or "").split(",") if s.strip()]
     if mode == "refresh-targets":
         async with pool.acquire() as conn:
             async with conn.transaction():
-                log.info("resolve_leaids: acquired conn, setting tenant")
                 await conn.execute(f"SELECT set_config('app.current_tenant_id', '{FOCMS_TENANT_ID}', true)")
-                log.info("resolve_leaids: tenant set, querying targets")
                 rows = await conn.fetch(
                     "SELECT DISTINCT university_leaid FROM target_universities WHERE deleted_at IS NULL"
                 )
