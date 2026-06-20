@@ -64,27 +64,39 @@ def row_to_universities(row: dict[str, Any]) -> dict[str, Any]:
         "state": row.get("school.state"),
         "admit_rate": row.get("latest.admissions.admission_rate.overall"),
         "cost_attendance": row.get("latest.cost.attendance.academic_year"),
-        "enrollment": row.get("latest.student.size"),
+        "enrollment_total": row.get("latest.student.size"),
         "data_year": 2024,
     }
 
 def row_to_cds_facts(row: dict[str, Any]) -> list[dict[str, Any]]:
-    """Extract per-fact rows for the university_cds_facts table."""
+    """Extract per-fact rows for the university_cds_facts table.
+
+    Real schema: (university_leaid, academic_year, cds_section, fact_key,
+                  fact_value_numeric, extraction_method, extraction_run_id,
+                  cds_review_status default 'raw').
+    Unique constraint: (university_leaid, academic_year, cds_section, fact_key,
+                        extraction_run_id). We use a stable extraction_run_id
+                        so the upsert collapses runs onto the same row.
+    """
     leaid = str(row.get("id"))
     facts = []
-    for fact_key, sc_key in [
-        ("sat_25_math", "latest.admissions.sat_scores.midpoint.math"),
-        ("sat_25_reading", "latest.admissions.sat_scores.midpoint.critical_reading"),
-        ("sat_75_math", "latest.admissions.sat_scores.75th_percentile.math"),
-        ("sat_75_reading", "latest.admissions.sat_scores.75th_percentile.critical_reading"),
-        ("act_50", "latest.admissions.act_scores.midpoint.cumulative"),
+    for fact_key, sc_key, cds_section in [
+        ("sat_25_math",    "latest.admissions.sat_scores.midpoint.math",                "C9"),
+        ("sat_25_reading", "latest.admissions.sat_scores.midpoint.critical_reading",    "C9"),
+        ("sat_75_math",    "latest.admissions.sat_scores.75th_percentile.math",         "C9"),
+        ("sat_75_reading", "latest.admissions.sat_scores.75th_percentile.critical_reading", "C9"),
+        ("act_50",         "latest.admissions.act_scores.midpoint.cumulative",          "C9"),
     ]:
         v = row.get(sc_key)
         if v is not None:
             facts.append({
-                "university_leaid": leaid, "fact_key": fact_key,
-                "fact_value_numeric": float(v), "data_year": 2024,
-                "source": "college_scorecard",
+                "university_leaid": leaid,
+                "academic_year": "2024-2025",
+                "cds_section": cds_section,
+                "fact_key": fact_key,
+                "fact_value_numeric": float(v),
+                "extraction_method": "scorecard_api",
+                "extraction_run_id": "scorecard_api_latest",
             })
     return facts
 
@@ -97,7 +109,7 @@ async def upsert_universities(conn: asyncpg.Connection, rows: list[dict[str, Any
             continue
         await conn.execute("""
             INSERT INTO universities (leaid, name, city, state, admit_rate,
-                                     cost_attendance, enrollment, data_year)
+                                     cost_attendance, enrollment_total, data_year)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             ON CONFLICT (leaid) DO UPDATE SET
                 name = EXCLUDED.name,
@@ -105,11 +117,11 @@ async def upsert_universities(conn: asyncpg.Connection, rows: list[dict[str, Any
                 state = EXCLUDED.state,
                 admit_rate = COALESCE(EXCLUDED.admit_rate, universities.admit_rate),
                 cost_attendance = COALESCE(EXCLUDED.cost_attendance, universities.cost_attendance),
-                enrollment = COALESCE(EXCLUDED.enrollment, universities.enrollment),
+                enrollment_total = COALESCE(EXCLUDED.enrollment_total, universities.enrollment_total),
                 data_year = GREATEST(EXCLUDED.data_year, universities.data_year),
                 updated_at = now()
         """, r["leaid"], r["name"], r["city"], r["state"],
-             r["admit_rate"], r["cost_attendance"], r["enrollment"], r["data_year"])
+             r["admit_rate"], r["cost_attendance"], r["enrollment_total"], r["data_year"])
         n += 1
     return n
 
@@ -118,15 +130,18 @@ async def upsert_cds_facts(conn: asyncpg.Connection, facts: list[dict[str, Any]]
     n = 0
     for f in facts:
         await conn.execute("""
-            INSERT INTO university_cds_facts (university_leaid, fact_key,
-                                              fact_value_numeric, data_year, source)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (university_leaid, fact_key, data_year) DO UPDATE SET
+            INSERT INTO university_cds_facts (
+                university_leaid, academic_year, cds_section, fact_key,
+                fact_value_numeric, extraction_method, extraction_run_id
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (university_leaid, academic_year, cds_section, fact_key, extraction_run_id)
+            DO UPDATE SET
                 fact_value_numeric = EXCLUDED.fact_value_numeric,
-                source = EXCLUDED.source,
+                extraction_method = EXCLUDED.extraction_method,
                 updated_at = now()
-        """, f["university_leaid"], f["fact_key"], f["fact_value_numeric"],
-             f["data_year"], f["source"])
+        """, f["university_leaid"], f["academic_year"], f["cds_section"], f["fact_key"],
+             f["fact_value_numeric"], f["extraction_method"], f["extraction_run_id"])
         n += 1
     return n
 
