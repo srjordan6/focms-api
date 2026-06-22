@@ -1,8 +1,23 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.3.2
+"""focms_api.py - FOCMS Data Provider REST API v0.4.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.4.0 (2026-06-22):
+- Self-migration on startup: creates public_showcases table, grants focms_app
+  schema CREATE privilege (one-time bootstrap that lets the MCP role do DDL
+  going forward), seeds John's showcase row. All idempotent (CREATE TABLE IF
+  NOT EXISTS, ON CONFLICT DO NOTHING) so safe to re-run on every deploy.
+- New endpoints:
+    GET    /focms/v1/showcase/{slug}            (public showcase lookup; no
+                                                 tenant context required since
+                                                 slug is global lookup key)
+    POST   /focms/v1/public_showcases           (create showcase config row)
+    PATCH  /focms/v1/public_showcases/{id}      (modify showcase config)
+- This is the architectural change that decouples adding a new student from a
+  GitHub push + Render rebuild. Adding tenant N+1 is now just an INSERT into
+  public_showcases; the outcomestar Next.js app reads the row at request time.
 
 v0.3.2 (2026-06-22):
 - Fix: audit_log action='create' was written even when the upsert path hit
@@ -62,6 +77,149 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s 
 log = logging.getLogger("focms-api")
 
 
+# ---------------------------------------------------------------------------
+# Startup migrations (idempotent)
+# ---------------------------------------------------------------------------
+
+MIGRATIONS: list[tuple[str, str]] = [
+    # Grant focms_app schema CREATE privilege so Claude can do DDL via MCP.
+    # This is the one-time bootstrap that ends the "Stephen runs DDL via Render
+    # Postgres console" pain. Idempotent — re-running is a no-op.
+    (
+        "grant_schema_create_to_focms_app",
+        "GRANT CREATE, USAGE ON SCHEMA public TO focms_app",
+    ),
+    # Default privileges: focms_app gets DML on any future table created by
+    # focms_user. Means MCP can immediately read/write new tables.
+    (
+        "default_privileges_tables_to_focms_app",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE focms_user IN SCHEMA public "
+        "GRANT REFERENCES, SELECT, INSERT, UPDATE, DELETE, TRIGGER ON TABLES TO focms_app",
+    ),
+    (
+        "default_privileges_sequences_to_focms_app",
+        "ALTER DEFAULT PRIVILEGES FOR ROLE focms_user IN SCHEMA public "
+        "GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO focms_app",
+    ),
+    # public_showcases — per-student public showcase configuration.
+    # Each row maps a URL slug (e.g. "john") to a tenant + student plus
+    # display config (theme, photo, tagline). Adding a new student becomes
+    # a one-row INSERT instead of a code change + deploy.
+    (
+        "create_public_showcases",
+        """CREATE TABLE IF NOT EXISTS public_showcases (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+            tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            student_id uuid NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+            slug text NOT NULL,
+            theme_key text NOT NULL DEFAULT 'mission-control',
+            display_name text,
+            tagline text,
+            photo_url text,
+            visibility text NOT NULL DEFAULT 'private'
+              CHECK (visibility IN ('public','unlisted','private')),
+            created_by uuid REFERENCES users(id),
+            updated_by uuid REFERENCES users(id),
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            deleted_at timestamptz
+        )""",
+    ),
+    (
+        "public_showcases_slug_unique",
+        "CREATE UNIQUE INDEX IF NOT EXISTS public_showcases_slug_unique "
+        "ON public_showcases (slug) WHERE deleted_at IS NULL",
+    ),
+    (
+        "public_showcases_tenant_idx",
+        "CREATE INDEX IF NOT EXISTS public_showcases_tenant_idx ON public_showcases (tenant_id)",
+    ),
+    (
+        "public_showcases_student_idx",
+        "CREATE INDEX IF NOT EXISTS public_showcases_student_idx ON public_showcases (student_id)",
+    ),
+    (
+        "public_showcases_grant_dml",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON public_showcases TO focms_app",
+    ),
+    (
+        "public_showcases_enable_rls",
+        "ALTER TABLE public_showcases ENABLE ROW LEVEL SECURITY",
+    ),
+    # RLS policy: tenant isolation for writes, but allow lookup by anyone when
+    # no tenant context is set (so the public showcase page can resolve slugs
+    # across tenants).
+    (
+        "public_showcases_policy",
+        """DO $do$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_policies
+                WHERE tablename = 'public_showcases'
+                  AND policyname = 'public_showcases_isolation'
+            ) THEN
+                CREATE POLICY public_showcases_isolation ON public_showcases
+                    USING (
+                        tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+                        OR NULLIF(current_setting('app.current_tenant_id', true), '') IS NULL
+                    );
+            END IF;
+        END $do$""",
+    ),
+    # Seed John's showcase row (idempotent — ON CONFLICT DO NOTHING).
+    # This is what makes outcomestar.app/john keep working after page.tsx
+    # drops its hardcoded TENANTS constant.
+    (
+        "seed_john_showcase",
+        """INSERT INTO public_showcases (
+            tenant_id, student_id, slug, theme_key, display_name,
+            tagline, photo_url, visibility
+        ) VALUES (
+            '019ed384-56fc-7516-bfbf-efaa5231e281'::uuid,
+            '019ed384-5769-72ca-864a-28e40c4e5d30'::uuid,
+            'john',
+            'mission-control',
+            'John Ray Jordan',
+            'Future astronaut · breaststroke specialist',
+            'https://johnrjordan.com/wp-content/uploads/2026/05/john-at-the-cotillion-Ball-03292026-2-2-scaled.jpg',
+            'public'
+        ) ON CONFLICT DO NOTHING""",
+    ),
+]
+
+
+async def run_migrations(pool: asyncpg.Pool) -> None:
+    """Run idempotent startup migrations.
+
+    Each statement is wrapped in its own try/except so one failure does not
+    block the rest from running. Failures are logged at WARNING level. The
+    service continues to start even if migrations partially fail — the
+    existing endpoints still work against the existing schema.
+    """
+    async with pool.acquire() as conn:
+        # Detect what user we are so we know whether DDL is expected to work.
+        try:
+            current = await conn.fetchval("SELECT current_user")
+            log.info("migrations: running as user=%s", current)
+        except Exception as exc:
+            log.warning("migrations: could not determine current_user: %s", exc)
+            current = "unknown"
+
+        success_count = 0
+        skip_count = 0
+        for name, sql in MIGRATIONS:
+            try:
+                await conn.execute(sql)
+                log.info("migration ok: %s", name)
+                success_count += 1
+            except Exception as exc:
+                # Common skip causes: insufficient privilege (when running as
+                # a non-owner role), or object already exists in a non-IF-NOT-EXISTS
+                # form. Log and continue.
+                log.warning("migration skipped: %s: %s", name, exc)
+                skip_count += 1
+        log.info("migrations complete: %d ok, %d skipped", success_count, skip_count)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """asyncpg pool. PgBouncer transaction mode requires statement_cache_size=0."""
@@ -69,6 +227,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         DATABASE_URL, min_size=2, max_size=10, statement_cache_size=0,
     )
     log.info("DB pool ready")
+    await run_migrations(app.state.pool)
     try:
         yield
     finally:
@@ -76,7 +235,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.3.2", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.4.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +370,7 @@ async def write_audit(
 
 @app.get("/focms/v1/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.3.2"}
+    return {"status": "ok", "version": "0.4.0"}
 
 
 @app.get("/focms/v1/types")
@@ -1598,6 +1757,226 @@ async def create_digital_presence(
         )
     return result
 
+
+
+
+# ===========================================================================
+# v0.4.0 — public_showcases endpoints
+# ===========================================================================
+
+
+class PublicShowcaseCreate(BaseModel):
+    """Body for POST /focms/v1/public_showcases.
+
+    `slug` becomes the URL segment in outcomestar.app/{slug}.
+    Constrained to lowercase alphanumeric + hyphen to keep URLs clean.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    student_id: UUID
+    slug: str = Field(..., min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    theme_key: Optional[str] = None
+    display_name: Optional[str] = None
+    tagline: Optional[str] = None
+    photo_url: Optional[str] = None
+    visibility: Optional[str] = None
+
+
+class PublicShowcasePatch(BaseModel):
+    """Body for PATCH /focms/v1/public_showcases/{id}. All fields optional."""
+    model_config = ConfigDict(extra="forbid")
+
+    slug: Optional[str] = Field(None, min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
+    theme_key: Optional[str] = None
+    display_name: Optional[str] = None
+    tagline: Optional[str] = None
+    photo_url: Optional[str] = None
+    visibility: Optional[str] = None
+
+
+@app.get("/focms/v1/showcase/{slug}")
+async def get_showcase_by_slug(
+    slug: str, request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    """Look up a public showcase config by URL slug.
+
+    Used by the outcomestar Next.js page router. Slug lookup is the entry
+    point for the public showcase — the returned tenant_id + student_id is
+    then used to fetch the rest of the student data via tenant-scoped
+    endpoints.
+
+    Unlike most endpoints this does not set the tenant context (slug is the
+    lookup key, not tenant). RLS policy allows lookup when no context is
+    set. Returns 404 when the showcase is private or missing.
+    """
+    async with request.app.state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, slug, tenant_id, student_id, theme_key,
+                   display_name, tagline, photo_url, visibility
+            FROM public_showcases
+            WHERE slug = $1
+              AND deleted_at IS NULL
+              AND visibility != 'private'
+            """,
+            slug,
+        )
+        if not row:
+            raise HTTPException(404, f"Showcase '{slug}' not found")
+        return {
+            "id": str(row["id"]),
+            "slug": row["slug"],
+            "tenant_id": str(row["tenant_id"]),
+            "student_id": str(row["student_id"]),
+            "theme_key": row["theme_key"],
+            "display_name": row["display_name"],
+            "tagline": row["tagline"],
+            "photo_url": row["photo_url"],
+            "visibility": row["visibility"],
+        }
+
+
+@app.post("/focms/v1/public_showcases", status_code=201)
+async def create_public_showcase(
+    body: PublicShowcaseCreate,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Create a public showcase row for a student.
+
+    The slug must be globally unique (URL keys cannot collide across
+    tenants). Returns 409 on conflict.
+    """
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO public_showcases (
+                    tenant_id, student_id, slug, theme_key, display_name,
+                    tagline, photo_url, visibility, created_by
+                ) VALUES (
+                    $1, $2, $3, COALESCE($4, 'mission-control'), $5,
+                    $6, $7, COALESCE($8, 'private'), $9
+                )
+                RETURNING *
+                """,
+                UUID(tenant_id), body.student_id, body.slug,
+                body.theme_key, body.display_name,
+                body.tagline, body.photo_url, body.visibility,
+                UUID(user_id),
+            )
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(
+                409, f"Slug '{body.slug}' is already taken"
+            ) from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="create",
+            target_table="public_showcases",
+            target_id=result["id"],
+            target_label=body.slug,
+            new_value={
+                "slug": body.slug,
+                "theme_key": body.theme_key,
+                "visibility": body.visibility,
+            },
+        )
+    return result
+
+
+@app.patch("/focms/v1/public_showcases/{showcase_id}")
+async def patch_public_showcase(
+    showcase_id: UUID,
+    body: PublicShowcasePatch,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Update fields on a showcase. Only fields present in the body are
+    written. Returns the updated row."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(400, "No fields to update")
+
+    set_parts = []
+    params: list[Any] = []
+    for i, (col, val) in enumerate(fields.items(), start=1):
+        set_parts.append(f"{col} = ${i}")
+        params.append(val)
+    set_parts.append(f"updated_by = ${len(params) + 1}")
+    params.append(UUID(user_id))
+    set_parts.append("updated_at = now()")
+    params.append(showcase_id)
+    where_param = f"${len(params)}"
+
+    sql = f"""
+        UPDATE public_showcases
+        SET {", ".join(set_parts)}
+        WHERE id = {where_param} AND deleted_at IS NULL
+        RETURNING *
+    """
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, "Slug already taken") from exc
+        if not row:
+            raise HTTPException(404, "Showcase not found")
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="update",
+            target_table="public_showcases",
+            target_id=str(showcase_id),
+            new_value={k: (str(v) if isinstance(v, UUID) else v) for k, v in fields.items()},
+        )
+    return result
+
+
+@app.delete("/focms/v1/public_showcases/{showcase_id}", status_code=204)
+async def delete_public_showcase(
+    showcase_id: UUID, request: Request,
+    principal: dict = Depends(require_write),
+):
+    """Soft-delete a showcase. Returns 204."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE public_showcases
+            SET deleted_at = now(), updated_by = $1, updated_at = now()
+            WHERE id = $2 AND deleted_at IS NULL
+            RETURNING id
+            """,
+            UUID(user_id), showcase_id,
+        )
+        if not row:
+            raise HTTPException(404, "Showcase not found or already deleted")
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action="delete",
+            target_table="public_showcases", target_id=str(showcase_id),
+        )
+    return JSONResponse(status_code=204, content=None)
 
 # ---------------------------------------------------------------------------
 # Error handlers
