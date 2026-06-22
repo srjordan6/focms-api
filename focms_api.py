@@ -1,39 +1,62 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.2.0
+"""focms_api.py - FOCMS Data Provider REST API v0.3.0
 
-Read-only API in front of FOCMS Postgres. Enforces per-request tenant context
-via RLS (set_config app.current_tenant_id). Designed to run as a Render Web
+Read + write API in front of FOCMS Postgres. Enforces per-request tenant
+context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
 
-Endpoints:
-    GET /focms/v1/health
-    GET /focms/v1/types
-    GET /focms/v1/student/{student_id}
-    GET /focms/v1/student/{student_id}/records?type=type
-    GET /focms/v1/student/{student_id}/target-universities
-    GET /focms/v1/student/{student_id}/computed/power-index   [NEW v0.2.0]
+Read endpoints (unchanged from v0.2.0):
+    GET    /focms/v1/health
+    GET    /focms/v1/types
+    GET    /focms/v1/student/{student_id}
+    GET    /focms/v1/student/{student_id}/records?type=type
+    GET    /focms/v1/student/{student_id}/target-universities
+    GET    /focms/v1/student/{student_id}/computed/power-index
+
+Write endpoints (new in v0.3.0):
+    POST   /focms/v1/archive_entries
+    GET    /focms/v1/archive_entries/{id}
+    PATCH  /focms/v1/archive_entries/{id}
+    POST   /focms/v1/archive_entries/{id}/append-detail
+    DELETE /focms/v1/archive_entries/{id}            (soft delete)
+    POST   /focms/v1/personal_records
+    POST   /focms/v1/events
+    POST   /focms/v1/assessments
+
+Write design notes:
+- One transaction per write; RETURNING the row, no follow-up SELECT.
+- Body is plain JSON with Pydantic validation. No base64 chunking. The
+  ~5KB MCP body cap does not apply to this surface; FastAPI handles
+  multi-MB bodies cleanly.
+- Idempotent upsert on (source_system, source_id) when the
+  ?upsert=true query param is set AND both fields are present. Without
+  that, duplicate source_id raises 409.
+- Append-detail endpoint exists specifically to make growing a doc
+  (playbook, archive entry) cheap — POST text once, server appends.
+  Use this instead of fetching, concatenating client-side, and PATCHing.
+- Audit log entry written for every successful write; audit failures
+  are logged but do not fail the write.
 
 Auth: Bearer token in Authorization header. Token maps to (tenant_id,
-user_id, role) via env-configured JSON. JWT upgrade is a Phase 1 follow-up.
+user_id, role) via FOCMS_API_TOKENS_JSON. Writes require role in
+{'admin', 'writer'}.
 
 Environment:
     DATABASE_URL_POOLED    - pgbouncer URL (transaction mode)
     FOCMS_API_TOKENS_JSON  - JSON dict mapping token to principal
     FOCMS_API_LOG_LEVEL    - INFO (default)
-
-v0.2.0 (2026-06-21): Added /computed/power-index. Computes Swimcloud-style
-Power Index server-side from swim_best rows in personal_records and NCAA D1
-Men 2026 base times from archive_entries.reference_data. Cited, no
-hardcoded reference data, deterministic.
 """
-import json, logging, os
+import json
+import logging
+import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
-from typing import Any, AsyncIterator
+from datetime import date, datetime, timezone
+from typing import Any, AsyncIterator, Optional
 from uuid import UUID
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -59,7 +82,41 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.3.0", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+# Roles that may write. Accepts back-compat token shapes (role unset or
+# 'admin' / 'writer') as well as the canonical tenant_role_enum values.
+WRITE_ROLES = {
+    "admin", "writer",                            # back-compat aliases
+    "tenant_owner", "tenant_admin", "platform_admin",  # canonical
+}
+
+# Map any incoming role string to a valid tenant_role_enum for audit_log.
+_ROLE_TO_ENUM = {
+    "admin": "tenant_admin",
+    "writer": "tenant_admin",
+    "owner": "tenant_owner",
+    "viewer": "tenant_viewer",
+    "platform": "platform_admin",
+    "tenant_owner": "tenant_owner",
+    "tenant_admin": "tenant_admin",
+    "tenant_viewer": "tenant_viewer",
+    "platform_admin": "platform_admin",
+}
+
+
+def role_to_enum(role: Optional[str]) -> str:
+    """Resolve a role label to a valid tenant_role_enum value.
+    Defaults to tenant_admin for unknown or missing roles (back-compat
+    with v0.2.0 tokens that did not carry a role)."""
+    if not role:
+        return "tenant_admin"
+    return _ROLE_TO_ENUM.get(role, "tenant_admin")
 
 
 def authenticate(authorization: str = Header(None)) -> dict[str, Any]:
@@ -69,13 +126,37 @@ def authenticate(authorization: str = Header(None)) -> dict[str, Any]:
     principal = TOKENS.get(token)
     if not principal:
         raise HTTPException(401, "Invalid bearer token")
+    # Normalize the principal so callers can rely on these keys.
+    if "tenant_id" not in principal:
+        raise HTTPException(500, "Token misconfigured: tenant_id missing")
+    principal.setdefault("role", "tenant_admin")
     return principal
+
+
+def require_write(principal: dict = Depends(authenticate)) -> dict[str, Any]:
+    """Authenticate AND require a role permitted to write.
+    Also requires user_id on the principal so writes can be attributed."""
+    role = principal.get("role", "")
+    if role not in WRITE_ROLES:
+        raise HTTPException(403, f"Role '{role}' is not permitted to write")
+    if not principal.get("user_id"):
+        raise HTTPException(
+            500,
+            "Token misconfigured: user_id required on principal for writes. "
+            "Update FOCMS_API_TOKENS_JSON to include user_id alongside tenant_id.",
+        )
+    return principal
+
+
+# ---------------------------------------------------------------------------
+# DB tx helper (RLS-bound)
+# ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def tx(request: Request, tenant_id: str) -> AsyncIterator[asyncpg.Connection]:
     """Acquire a pooled connection, start a tx, SET LOCAL the tenant id.
-    All RLS-protected reads must go through this helper."""
+    All RLS-protected reads and writes go through this helper."""
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -86,9 +167,57 @@ async def tx(request: Request, tenant_id: str) -> AsyncIterator[asyncpg.Connecti
             yield conn
 
 
+# ---------------------------------------------------------------------------
+# Audit
+# ---------------------------------------------------------------------------
+
+
+async def write_audit(
+    conn: asyncpg.Connection,
+    *,
+    actor_user_id: str,
+    actor_role: str,
+    tenant_id: str,
+    action: str,
+    target_table: str,
+    target_id: Optional[str] = None,
+    target_label: Optional[str] = None,
+    new_value: Optional[dict] = None,
+    prior_value: Optional[dict] = None,
+    request_id: Optional[str] = None,
+) -> None:
+    """Best-effort audit write. Failures are logged but do not raise."""
+    try:
+        await conn.execute(
+            """
+            INSERT INTO audit_log (
+                actor_user_id, actor_role, tenant_id, action,
+                target_table, target_id, target_label,
+                new_value, prior_value, request_id
+            ) VALUES ($1, $2::tenant_role_enum, $3, $4::audit_action_enum,
+                      $5, $6, $7, $8::jsonb, $9::jsonb, $10)
+            """,
+            UUID(actor_user_id), role_to_enum(actor_role), UUID(tenant_id), action,
+            target_table,
+            UUID(target_id) if target_id else None,
+            target_label,
+            json.dumps(new_value) if new_value is not None else None,
+            json.dumps(prior_value) if prior_value is not None else None,
+            request_id,
+        )
+    except Exception as exc:
+        # Audit failure is observable but never blocks the write.
+        log.warning("audit_log write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Health + types (unchanged)
+# ---------------------------------------------------------------------------
+
+
 @app.get("/focms/v1/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.2.0"}
+    return {"status": "ok", "version": "0.3.0"}
 
 
 @app.get("/focms/v1/types")
@@ -106,9 +235,15 @@ async def list_types(
             UNION ALL SELECT 'courses', count(*) FROM courses
             UNION ALL SELECT 'digital_presence', count(*) FROM digital_presence
             UNION ALL SELECT 'target_universities', count(*) FROM target_universities
+            UNION ALL SELECT 'archive_entries', count(*) FROM archive_entries
             ORDER BY type_name
         """)
         return {"types": [{"name": r["type_name"], "count": r["n"]} for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Student reads (unchanged)
+# ---------------------------------------------------------------------------
 
 
 @app.get("/focms/v1/student/{student_id}")
@@ -136,7 +271,6 @@ async def get_student(
         }
 
 
-# Whitelist of types we serve. Prevents SQL injection via the path parameter.
 RECORD_TABLES = {
     "events": "events",
     "assessments": "assessments",
@@ -233,19 +367,14 @@ async def get_target_universities(
 
 
 # ---------------------------------------------------------------------------
-# v0.2.0: Computed metrics
+# Power Index (unchanged from v0.2.0)
 # ---------------------------------------------------------------------------
-#
-# Swimcloud Power Point formula (class of 2026+ quad):
-#   PP = ((time_scy / ncaa_base)^3 - 1) * 100 + 1
-# Power Index = weighted average of TOP 4 (lowest) PPs at weights 100/100/25/5
+
 PI_WEIGHTS = [1.00, 1.00, 0.25, 0.05]
 
 
 def _compute_pp(seconds: float, event: str, course: str,
                 base_scy: dict, lcm_to_scy_factor: float):
-    """Compute Swimcloud Power Point for one event. Returns None if event
-    not in NCAA base table or course not SCY/LCM."""
     base = base_scy.get(event)
     if base is None:
         return None
@@ -260,7 +389,6 @@ def _compute_pp(seconds: float, event: str, course: str,
 
 
 def _split_event_course(label: str):
-    """'200 Breast SCY' -> ('200 Breast', 'SCY')"""
     parts = label.rsplit(" ", 1)
     return (parts[0], parts[1]) if len(parts) == 2 else (label, "")
 
@@ -270,16 +398,8 @@ async def get_power_index(
     student_id: UUID, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Compute Swimcloud-style Power Index for the student.
-
-    Pulls swim_best rows from personal_records and the NCAA D1 Men 2026
-    qualifying standards (SCY) from archive_entries.reference_data. The
-    base times source is cited in the response.
-
-    Returns 503 if the NCAA reference row is missing.
-    """
+    """Compute Swimcloud-style Power Index for the student."""
     async with tx(request, principal["tenant_id"]) as conn:
-        # 1) NCAA base times from reference_data
         base_row = await conn.fetchrow("""
             SELECT detail, source_url, archive_date, source_id
             FROM archive_entries
@@ -297,8 +417,6 @@ async def get_power_index(
         base_scy = base_payload["events"]
         lcm_factor = base_payload["conversion_to_lcm_factor"]
         base_year = base_payload["effective_year"]
-
-        # 2) This student's swim bests
         bests = await conn.fetch("""
             SELECT title, value_numeric AS seconds
             FROM personal_records
@@ -307,20 +425,14 @@ async def get_power_index(
               AND deleted_at IS NULL
               AND value_numeric IS NOT NULL
         """, student_id)
-
-    # 3) Compute Power Points per event
     pps = []
     for r in bests:
         event, course = _split_event_course(r["title"])
         pp = _compute_pp(float(r["seconds"]), event, course, base_scy, lcm_factor)
         if pp is not None:
             pps.append((r["title"], pp))
-
-    # 4) Sort ascending (lowest = best), take top 4
     pps.sort(key=lambda x: x[1])
     top_4_raw = pps[:4]
-
-    # 5) Weighted PI
     if top_4_raw:
         weights = PI_WEIGHTS[: len(top_4_raw)]
         total_w = sum(weights)
@@ -328,7 +440,6 @@ async def get_power_index(
         pi_value = round(pi_value, 1)
     else:
         pi_value = None
-
     return {
         "student_id": str(student_id),
         "tenant_id": principal["tenant_id"],
@@ -350,6 +461,703 @@ async def get_power_index(
             "computed_at": datetime.now(timezone.utc).isoformat(),
         },
     }
+
+
+# ===========================================================================
+# v0.3.0 — Write surface
+# ===========================================================================
+
+
+class ArchiveEntryCreate(BaseModel):
+    """Request body for POST /focms/v1/archive_entries."""
+    model_config = ConfigDict(extra="forbid")
+
+    archive_type: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    summary: str = Field(..., min_length=1)
+    archive_date: Optional[date] = None         # defaults to CURRENT_DATE
+    version: Optional[str] = None
+    pillar: Optional[str] = None
+    detail: Optional[str] = None
+    detail_html: Optional[str] = None
+    code_kind: Optional[str] = None
+    language: Optional[str] = None
+    lines_count: Optional[int] = None
+    related_files: Optional[list[str]] = None
+    related_records: Optional[list[str]] = None
+    related_entity_table: Optional[str] = None
+    related_entity_id: Optional[UUID] = None
+    source: Optional[str] = None                # defaults to 'native_postgres'
+    source_url: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+    visibility: Optional[str] = None            # defaults to 'private'
+
+
+class ArchiveEntryPatch(BaseModel):
+    """Request body for PATCH /focms/v1/archive_entries/{id}. All fields optional."""
+    model_config = ConfigDict(extra="forbid")
+
+    archive_type: Optional[str] = None
+    title: Optional[str] = None
+    summary: Optional[str] = None
+    archive_date: Optional[date] = None
+    version: Optional[str] = None
+    pillar: Optional[str] = None
+    detail: Optional[str] = None
+    detail_html: Optional[str] = None
+    code_kind: Optional[str] = None
+    language: Optional[str] = None
+    lines_count: Optional[int] = None
+    related_files: Optional[list[str]] = None
+    related_records: Optional[list[str]] = None
+    related_entity_table: Optional[str] = None
+    related_entity_id: Optional[UUID] = None
+    source_url: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+    visibility: Optional[str] = None
+
+
+class AppendDetail(BaseModel):
+    """Request body for POST /focms/v1/archive_entries/{id}/append-detail."""
+    model_config = ConfigDict(extra="forbid")
+    text: str = Field(..., min_length=1)
+
+
+def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
+    """Convert an asyncpg Record into a JSON-safe dict."""
+    out = {}
+    for k, v in dict(row).items():
+        if isinstance(v, UUID):
+            out[k] = str(v)
+        elif isinstance(v, (date, datetime)):
+            out[k] = v.isoformat()
+        else:
+            out[k] = v
+    return out
+
+
+@app.post("/focms/v1/archive_entries", status_code=201)
+async def create_archive_entry(
+    body: ArchiveEntryCreate,
+    request: Request,
+    upsert: bool = Query(False, description="If true and source_id+source_system are set, upsert on (source_system, source_id)."),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Insert a new archive entry. Returns the row.
+
+    If ?upsert=true and both source_system + source_id are provided, the
+    insert becomes an upsert on the existing partial unique index, returning
+    the updated row.
+    """
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    archive_date_val = body.archive_date or date.today()
+
+    common_cols = (
+        body.archive_type, archive_date_val, body.version, body.pillar,
+        body.title, body.summary, body.detail, body.detail_html,
+        body.code_kind, body.language, body.lines_count,
+        body.related_files, body.related_records,
+        body.related_entity_table, body.related_entity_id,
+        body.source or "native_postgres",
+        body.source_url, body.source_system, body.source_id,
+        body.visibility or "private",
+        UUID(user_id), UUID(tenant_id),
+    )
+
+    insert_sql = """
+        INSERT INTO archive_entries (
+            archive_type, archive_date, version, pillar, title, summary,
+            detail, detail_html, code_kind, language, lines_count,
+            related_files, related_records,
+            related_entity_table, related_entity_id,
+            source, source_url, source_system, source_id,
+            visibility, created_by, tenant_id
+        ) VALUES (
+            $1, $2, $3, $4::pillar_enum, $5, $6,
+            $7, $8, $9, $10, $11,
+            $12, $13,
+            $14, $15,
+            $16, $17, $18, $19,
+            $20::visibility_enum, $21, $22
+        )
+    """
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            archive_type    = EXCLUDED.archive_type,
+            archive_date    = EXCLUDED.archive_date,
+            version         = EXCLUDED.version,
+            pillar          = EXCLUDED.pillar,
+            title           = EXCLUDED.title,
+            summary         = EXCLUDED.summary,
+            detail          = EXCLUDED.detail,
+            detail_html     = EXCLUDED.detail_html,
+            code_kind       = EXCLUDED.code_kind,
+            language        = EXCLUDED.language,
+            lines_count     = EXCLUDED.lines_count,
+            related_files   = EXCLUDED.related_files,
+            related_records = EXCLUDED.related_records,
+            source_url      = EXCLUDED.source_url,
+            visibility      = EXCLUDED.visibility,
+            updated_by      = EXCLUDED.created_by,
+            updated_at      = now()
+        RETURNING *
+        """
+    else:
+        sql = insert_sql + " RETURNING *"
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *common_cols)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="create",
+            target_table="archive_entries",
+            target_id=result["id"],
+            target_label=body.title,
+            new_value={
+                "source_id": body.source_id,
+                "version": body.version,
+                "archive_type": body.archive_type,
+            },
+        )
+    return result
+
+
+@app.get("/focms/v1/archive_entries/{entry_id}")
+async def get_archive_entry(
+    entry_id: UUID, request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    async with tx(request, principal["tenant_id"]) as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM archive_entries WHERE id = $1 AND deleted_at IS NULL",
+            entry_id,
+        )
+        if not row:
+            raise HTTPException(404, "Archive entry not found")
+        return _row_to_dict(row)
+
+
+@app.patch("/focms/v1/archive_entries/{entry_id}")
+async def patch_archive_entry(
+    entry_id: UUID,
+    body: ArchiveEntryPatch,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Update fields on an archive entry. Only fields present in the body are
+    written. Returns the updated row."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(400, "No fields to update")
+
+    # Build SET clause dynamically with $N positional params
+    type_casts = {
+        "pillar": "::pillar_enum",
+        "visibility": "::visibility_enum",
+    }
+    set_parts = []
+    params = []
+    for i, (col, val) in enumerate(fields.items(), start=1):
+        cast = type_casts.get(col, "")
+        set_parts.append(f"{col} = ${i}{cast}")
+        # date and UUID values pass through asyncpg cleanly
+        params.append(val)
+    set_parts.append(f"updated_by = ${len(params) + 1}")
+    params.append(UUID(user_id))
+    set_parts.append("updated_at = now()")
+    params.append(entry_id)
+    where_param = f"${len(params)}"
+
+    sql = f"""
+        UPDATE archive_entries
+        SET {', '.join(set_parts)}
+        WHERE id = {where_param} AND deleted_at IS NULL
+        RETURNING *
+    """
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        if not row:
+            raise HTTPException(404, "Archive entry not found")
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="update",
+            target_table="archive_entries",
+            target_id=str(entry_id),
+            new_value={k: (str(v) if isinstance(v, (UUID, date, datetime)) else v) for k, v in fields.items()},
+        )
+    return result
+
+
+@app.post("/focms/v1/archive_entries/{entry_id}/append-detail")
+async def append_detail(
+    entry_id: UUID,
+    body: AppendDetail,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Append text to the entry's `detail` column. Lets a client grow a doc
+    without round-tripping the current value through the network. Returns
+    {id, new_bytes, new_sha256}."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE archive_entries
+            SET detail = COALESCE(detail, '') || $1::text,
+                updated_by = $2,
+                updated_at = now()
+            WHERE id = $3 AND deleted_at IS NULL
+            RETURNING id,
+                      octet_length(detail) AS bytes,
+                      encode(sha256(convert_to(detail, 'UTF8')), 'hex') AS sha256
+            """,
+            body.text, UUID(user_id), entry_id,
+        )
+        if not row:
+            raise HTTPException(404, "Archive entry not found")
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="update",
+            target_table="archive_entries",
+            target_id=str(entry_id),
+            target_label="append_detail",
+            new_value={"appended_chars": len(body.text), "total_bytes": row["bytes"]},
+        )
+        return {
+            "id": str(row["id"]),
+            "bytes": row["bytes"],
+            "sha256": row["sha256"],
+            "appended_chars": len(body.text),
+        }
+
+
+@app.delete("/focms/v1/archive_entries/{entry_id}", status_code=204)
+async def delete_archive_entry(
+    entry_id: UUID, request: Request,
+    principal: dict = Depends(require_write),
+):
+    """Soft-delete: sets deleted_at and deleted_by. Returns 204."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE archive_entries
+            SET deleted_at = now(), deleted_by = $1
+            WHERE id = $2 AND deleted_at IS NULL
+            RETURNING id
+            """,
+            UUID(user_id), entry_id,
+        )
+        if not row:
+            raise HTTPException(404, "Archive entry not found or already deleted")
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="delete",
+            target_table="archive_entries",
+            target_id=str(entry_id),
+        )
+    return JSONResponse(status_code=204, content=None)
+
+
+# ---------------------------------------------------------------------------
+# personal_records
+# ---------------------------------------------------------------------------
+
+
+class PersonalRecordCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    record_kind: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    achieved_date: Optional[date] = None
+    value_numeric: Optional[float] = None
+    value_text: Optional[str] = None
+    value_unit: Optional[str] = None
+    details: Optional[dict] = None
+    achieved_at_event_id: Optional[UUID] = None
+    affiliation_id: Optional[UUID] = None
+    prior_value_numeric: Optional[float] = None
+    total_drop_numeric: Optional[float] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/personal_records", status_code=201)
+async def create_personal_record(
+    body: PersonalRecordCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    insert_sql = """
+        INSERT INTO personal_records (
+            tenant_id, student_id, record_kind, title, achieved_date,
+            value_numeric, value_text, value_unit, details,
+            achieved_at_event_id, affiliation_id,
+            prior_value_numeric, total_drop_numeric,
+            notes, public_description, visibility,
+            source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3::record_kind_enum, $4, $5,
+            $6, $7, $8, $9::jsonb,
+            $10, $11,
+            $12, $13,
+            $14, $15, $16::visibility_enum,
+            $17, $18, $19
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.record_kind, body.title,
+        body.achieved_date,
+        body.value_numeric, body.value_text, body.value_unit,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.achieved_at_event_id, body.affiliation_id,
+        body.prior_value_numeric, body.total_drop_numeric,
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            record_kind         = EXCLUDED.record_kind,
+            title               = EXCLUDED.title,
+            achieved_date       = EXCLUDED.achieved_date,
+            value_numeric       = EXCLUDED.value_numeric,
+            value_text          = EXCLUDED.value_text,
+            value_unit          = EXCLUDED.value_unit,
+            details             = EXCLUDED.details,
+            prior_value_numeric = EXCLUDED.prior_value_numeric,
+            total_drop_numeric  = EXCLUDED.total_drop_numeric,
+            notes               = EXCLUDED.notes,
+            public_description  = EXCLUDED.public_description,
+            visibility          = EXCLUDED.visibility,
+            updated_by          = EXCLUDED.created_by,
+            updated_at          = now()
+        RETURNING *
+        """
+    else:
+        sql = insert_sql + " RETURNING *"
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="create",
+            target_table="personal_records",
+            target_id=result["id"],
+            target_label=body.title,
+            new_value={"record_kind": body.record_kind, "source_id": body.source_id},
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
+
+
+class EventCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    event_type: str = Field(..., min_length=1)
+    title: str = Field(..., min_length=1)
+    event_date: date
+    event_end_date: Optional[date] = None
+    location_name: Optional[str] = None
+    location_city: Optional[str] = None
+    location_state: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    details: Optional[dict] = None
+    affiliation_id: Optional[UUID] = None
+    related_event_id: Optional[UUID] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/events", status_code=201)
+async def create_event(
+    body: EventCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    insert_sql = """
+        INSERT INTO events (
+            tenant_id, student_id, event_type, title, event_date, event_end_date,
+            location_name, location_city, location_state, duration_minutes,
+            details, affiliation_id, related_event_id,
+            notes, public_description, visibility,
+            source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3::event_type_enum, $4, $5, $6,
+            $7, $8, $9, $10,
+            $11::jsonb, $12, $13,
+            $14, $15, $16::visibility_enum,
+            $17, $18, $19
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.event_type, body.title,
+        body.event_date, body.event_end_date,
+        body.location_name, body.location_city, body.location_state, body.duration_minutes,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.affiliation_id, body.related_event_id,
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            event_type         = EXCLUDED.event_type,
+            title              = EXCLUDED.title,
+            event_date         = EXCLUDED.event_date,
+            event_end_date     = EXCLUDED.event_end_date,
+            location_name      = EXCLUDED.location_name,
+            location_city      = EXCLUDED.location_city,
+            location_state     = EXCLUDED.location_state,
+            duration_minutes   = EXCLUDED.duration_minutes,
+            details            = EXCLUDED.details,
+            affiliation_id     = EXCLUDED.affiliation_id,
+            related_event_id   = EXCLUDED.related_event_id,
+            notes              = EXCLUDED.notes,
+            public_description = EXCLUDED.public_description,
+            visibility         = EXCLUDED.visibility,
+            updated_by         = EXCLUDED.created_by,
+            updated_at         = now()
+        RETURNING *
+        """
+    else:
+        sql = insert_sql + " RETURNING *"
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="create",
+            target_table="events",
+            target_id=result["id"],
+            target_label=body.title,
+            new_value={"event_type": body.event_type, "source_id": body.source_id},
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# assessments
+# ---------------------------------------------------------------------------
+
+
+class AssessmentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    assessment_type: str = Field(..., min_length=1)
+    instrument: str = Field(..., min_length=1)
+    test_date: date
+    subject: Optional[str] = None
+    school_year: Optional[str] = None
+    term: Optional[str] = None
+    grade_at_test: Optional[str] = None
+    age_at_test: Optional[float] = None
+    score: Optional[float] = None
+    score_type: Optional[str] = None
+    percentile: Optional[float] = None
+    performance_band: Optional[str] = None
+    range_low: Optional[float] = None
+    range_high: Optional[float] = None
+    achievement_norm: Optional[str] = None
+    standard_error: Optional[float] = None
+    readability_type: Optional[str] = None
+    readability_low: Optional[float] = None
+    readability_high: Optional[float] = None
+    subscores: Optional[list] = None
+    cognitive_strengths: Optional[list[str]] = None
+    cognitive_skills_to_support: Optional[list[str]] = None
+    cognitive_invalid_domains: Optional[list[str]] = None
+    projected_proficient: Optional[bool] = None
+    projected_sat_on_track: Optional[bool] = None
+    projected_act: Optional[float] = None
+    details: Optional[dict] = None
+    administered_by: Optional[str] = None
+    duration_minutes: Optional[int] = None
+    rapid_guessing_pct: Optional[float] = None
+    report_files: Optional[list] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/assessments", status_code=201)
+async def create_assessment(
+    body: AssessmentCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    insert_sql = """
+        INSERT INTO assessments (
+            tenant_id, student_id, assessment_type, instrument, subject,
+            test_date, school_year, term, grade_at_test, age_at_test,
+            score, score_type, percentile, performance_band,
+            range_low, range_high, achievement_norm, standard_error,
+            readability_type, readability_low, readability_high,
+            subscores, cognitive_strengths, cognitive_skills_to_support,
+            cognitive_invalid_domains, projected_proficient,
+            projected_sat_on_track, projected_act, details,
+            administered_by, duration_minutes, rapid_guessing_pct,
+            report_files, notes, public_description, visibility,
+            source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3::assessment_type_enum, $4, $5,
+            $6, $7, $8, $9, $10,
+            $11, $12, $13, $14,
+            $15, $16, $17, $18,
+            $19, $20, $21,
+            $22::jsonb, $23, $24,
+            $25, $26,
+            $27, $28, $29::jsonb,
+            $30, $31, $32,
+            $33::jsonb, $34, $35, $36::visibility_enum,
+            $37, $38, $39
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.assessment_type, body.instrument, body.subject,
+        body.test_date, body.school_year, body.term, body.grade_at_test, body.age_at_test,
+        body.score, body.score_type, body.percentile, body.performance_band,
+        body.range_low, body.range_high, body.achievement_norm, body.standard_error,
+        body.readability_type, body.readability_low, body.readability_high,
+        json.dumps(body.subscores) if body.subscores is not None else "[]",
+        body.cognitive_strengths, body.cognitive_skills_to_support,
+        body.cognitive_invalid_domains, body.projected_proficient,
+        body.projected_sat_on_track, body.projected_act,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.administered_by, body.duration_minutes, body.rapid_guessing_pct,
+        json.dumps(body.report_files) if body.report_files is not None else "[]",
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            instrument         = EXCLUDED.instrument,
+            subject            = EXCLUDED.subject,
+            test_date          = EXCLUDED.test_date,
+            score              = EXCLUDED.score,
+            percentile         = EXCLUDED.percentile,
+            performance_band   = EXCLUDED.performance_band,
+            details            = EXCLUDED.details,
+            notes              = EXCLUDED.notes,
+            visibility         = EXCLUDED.visibility,
+            updated_by         = EXCLUDED.created_by,
+            updated_at         = now()
+        RETURNING *
+        """
+    else:
+        sql = insert_sql + " RETURNING *"
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="create",
+            target_table="assessments",
+            target_id=result["id"],
+            target_label=body.instrument,
+            new_value={"assessment_type": body.assessment_type, "source_id": body.source_id},
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Error handlers
+# ---------------------------------------------------------------------------
 
 
 @app.exception_handler(asyncpg.PostgresError)
