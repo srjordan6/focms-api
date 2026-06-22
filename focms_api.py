@@ -1,10 +1,23 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.3.0
+"""focms_api.py - FOCMS Data Provider REST API v0.3.2
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
 
-Read endpoints (unchanged from v0.2.0):
+v0.3.2 (2026-06-22):
+- Fix: audit_log action='create' was written even when the upsert path hit
+  ON CONFLICT and actually updated an existing row. All 8 POST endpoints now
+  include `(xmax = 0) AS _was_insert` in RETURNING and branch audit action
+  to 'create' or 'update' accordingly. `_was_insert` is stripped from the
+  HTTP response body before return.
+
+v0.3.1 (2026-06-22):
+- Fix: /records returned 500 because asyncpg + statement_cache_size=0 +
+  PgBouncer leaves JSONB as a string, breaking dict(row["rec"]).
+- Add: POST endpoints for affiliations, goals, courses, digital_presence
+  rounding out the write surface for John's portfolio sections.
+
+Read endpoints:
     GET    /focms/v1/health
     GET    /focms/v1/types
     GET    /focms/v1/student/{student_id}
@@ -12,38 +25,19 @@ Read endpoints (unchanged from v0.2.0):
     GET    /focms/v1/student/{student_id}/target-universities
     GET    /focms/v1/student/{student_id}/computed/power-index
 
-Write endpoints (new in v0.3.0):
-    POST   /focms/v1/archive_entries
-    GET    /focms/v1/archive_entries/{id}
-    PATCH  /focms/v1/archive_entries/{id}
-    POST   /focms/v1/archive_entries/{id}/append-detail
-    DELETE /focms/v1/archive_entries/{id}            (soft delete)
+Write endpoints:
+    POST   /focms/v1/archive_entries          (+ PATCH/GET/DELETE/append-detail)
     POST   /focms/v1/personal_records
     POST   /focms/v1/events
     POST   /focms/v1/assessments
-
-Write design notes:
-- One transaction per write; RETURNING the row, no follow-up SELECT.
-- Body is plain JSON with Pydantic validation. No base64 chunking. The
-  ~5KB MCP body cap does not apply to this surface; FastAPI handles
-  multi-MB bodies cleanly.
-- Idempotent upsert on (source_system, source_id) when the
-  ?upsert=true query param is set AND both fields are present. Without
-  that, duplicate source_id raises 409.
-- Append-detail endpoint exists specifically to make growing a doc
-  (playbook, archive entry) cheap — POST text once, server appends.
-  Use this instead of fetching, concatenating client-side, and PATCHing.
-- Audit log entry written for every successful write; audit failures
-  are logged but do not fail the write.
+    POST   /focms/v1/affiliations              [NEW v0.3.1]
+    POST   /focms/v1/goals                     [NEW v0.3.1]
+    POST   /focms/v1/courses                   [NEW v0.3.1]
+    POST   /focms/v1/digital_presence          [NEW v0.3.1]
 
 Auth: Bearer token in Authorization header. Token maps to (tenant_id,
 user_id, role) via FOCMS_API_TOKENS_JSON. Writes require role in
-{'admin', 'writer'}.
-
-Environment:
-    DATABASE_URL_POOLED    - pgbouncer URL (transaction mode)
-    FOCMS_API_TOKENS_JSON  - JSON dict mapping token to principal
-    FOCMS_API_LOG_LEVEL    - INFO (default)
+{tenant_owner, tenant_admin, platform_admin}.
 """
 import json
 import logging
@@ -82,7 +76,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.3.2", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -217,7 +211,7 @@ async def write_audit(
 
 @app.get("/focms/v1/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.3.0"}
+    return {"status": "ok", "version": "0.3.2"}
 
 
 @app.get("/focms/v1/types")
@@ -295,17 +289,20 @@ async def get_records(
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch(
             f"""
-            SELECT to_jsonb(t) AS rec FROM {table} t
+            SELECT to_jsonb(t)::text AS rec FROM {table} t
             WHERE student_id = $1 AND deleted_at IS NULL
             ORDER BY COALESCE(updated_at, created_at) DESC LIMIT $2
             """,
             student_id, limit,
         )
+        # to_jsonb()::text returns a JSON string; parse client-side. This is
+        # necessary because PgBouncer transaction mode + statement_cache_size=0
+        # prevents asyncpg from auto-decoding JSONB type values.
         return {
             "type": type,
             "student_id": str(student_id),
             "count": len(rows),
-            "records": [dict(r["rec"]) for r in rows],
+            "records": [json.loads(r["rec"]) for r in rows],
         }
 
 
@@ -538,6 +535,15 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
     return out
 
 
+def _pop_audit_action(result: dict[str, Any]) -> str:
+    """Pop the `_was_insert` marker from a RETURNING dict and translate it
+    to an audit action string. Insert -> 'create'. Update (via ON CONFLICT)
+    -> 'update'. Defaults to 'create' when the marker is absent so
+    non-upsert paths keep their existing behavior."""
+    was_insert = result.pop("_was_insert", True)
+    return "create" if was_insert else "update"
+
+
 @app.post("/focms/v1/archive_entries", status_code=201)
 async def create_archive_entry(
     body: ArchiveEntryCreate,
@@ -605,10 +611,10 @@ async def create_archive_entry(
             visibility      = EXCLUDED.visibility,
             updated_by      = EXCLUDED.created_by,
             updated_at      = now()
-        RETURNING *
+        RETURNING *, (xmax = 0) AS _was_insert
         """
     else:
-        sql = insert_sql + " RETURNING *"
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
 
     async with tx(request, tenant_id) as conn:
         try:
@@ -618,12 +624,13 @@ async def create_archive_entry(
         except asyncpg.exceptions.InvalidTextRepresentationError as exc:
             raise HTTPException(400, f"Invalid value: {exc}") from exc
         result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
         await write_audit(
             conn,
             actor_user_id=user_id,
             actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id,
-            action="create",
+            action=audit_action,
             target_table="archive_entries",
             target_id=result["id"],
             target_label=body.title,
@@ -874,10 +881,10 @@ async def create_personal_record(
             visibility          = EXCLUDED.visibility,
             updated_by          = EXCLUDED.created_by,
             updated_at          = now()
-        RETURNING *
+        RETURNING *, (xmax = 0) AS _was_insert
         """
     else:
-        sql = insert_sql + " RETURNING *"
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
 
     async with tx(request, tenant_id) as conn:
         try:
@@ -889,12 +896,13 @@ async def create_personal_record(
         except asyncpg.ForeignKeyViolationError as exc:
             raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
         result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
         await write_audit(
             conn,
             actor_user_id=user_id,
             actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id,
-            action="create",
+            action=audit_action,
             target_table="personal_records",
             target_id=result["id"],
             target_label=body.title,
@@ -983,10 +991,10 @@ async def create_event(
             visibility         = EXCLUDED.visibility,
             updated_by         = EXCLUDED.created_by,
             updated_at         = now()
-        RETURNING *
+        RETURNING *, (xmax = 0) AS _was_insert
         """
     else:
-        sql = insert_sql + " RETURNING *"
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
 
     async with tx(request, tenant_id) as conn:
         try:
@@ -998,12 +1006,13 @@ async def create_event(
         except asyncpg.ForeignKeyViolationError as exc:
             raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
         result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
         await write_audit(
             conn,
             actor_user_id=user_id,
             actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id,
-            action="create",
+            action=audit_action,
             target_table="events",
             target_id=result["id"],
             target_label=body.title,
@@ -1126,10 +1135,10 @@ async def create_assessment(
             visibility         = EXCLUDED.visibility,
             updated_by         = EXCLUDED.created_by,
             updated_at         = now()
-        RETURNING *
+        RETURNING *, (xmax = 0) AS _was_insert
         """
     else:
-        sql = insert_sql + " RETURNING *"
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
 
     async with tx(request, tenant_id) as conn:
         try:
@@ -1141,16 +1150,451 @@ async def create_assessment(
         except asyncpg.ForeignKeyViolationError as exc:
             raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
         result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
         await write_audit(
             conn,
             actor_user_id=user_id,
             actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id,
-            action="create",
+            action=audit_action,
             target_table="assessments",
             target_id=result["id"],
             target_label=body.instrument,
             new_value={"assessment_type": body.assessment_type, "source_id": body.source_id},
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# v0.3.1: affiliations, goals, courses, digital_presence
+# ---------------------------------------------------------------------------
+
+
+class AffiliationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    affiliation_type: str = Field(..., min_length=1)
+    organization_name: str = Field(..., min_length=1)
+    organization_url: Optional[str] = None
+    organization_naics: Optional[str] = None
+    organization_city: Optional[str] = None
+    organization_state: Optional[str] = None
+    organization_country: Optional[str] = None
+    role: Optional[str] = None
+    role_start_date: Optional[date] = None
+    role_end_date: Optional[date] = None
+    coach_name: Optional[str] = None
+    coach_email: Optional[str] = None
+    coach_phone: Optional[str] = None
+    coach_role: Optional[str] = None
+    weekly_hours: Optional[float] = None
+    total_hours: Optional[float] = None
+    verification_contact_name: Optional[str] = None
+    verification_contact_email: Optional[str] = None
+    verification_contact_phone: Optional[str] = None
+    is_verified: Optional[bool] = None
+    details: Optional[dict] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/affiliations", status_code=201)
+async def create_affiliation(
+    body: AffiliationCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    insert_sql = """
+        INSERT INTO affiliations (
+            tenant_id, student_id, affiliation_type, organization_name,
+            organization_url, organization_naics, organization_city,
+            organization_state, organization_country, role,
+            role_start_date, role_end_date, coach_name, coach_email,
+            coach_phone, coach_role, weekly_hours, total_hours,
+            verification_contact_name, verification_contact_email,
+            verification_contact_phone, is_verified, details, notes,
+            public_description, visibility, source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3::affiliation_type_enum, $4,
+            $5, $6, $7,
+            $8, $9, $10,
+            $11, $12, $13, $14,
+            $15, $16, $17, $18,
+            $19, $20,
+            $21, COALESCE($22, false), $23::jsonb, $24,
+            $25, $26::visibility_enum, $27, $28, $29
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.affiliation_type, body.organization_name,
+        body.organization_url, body.organization_naics, body.organization_city,
+        body.organization_state, body.organization_country, body.role,
+        body.role_start_date, body.role_end_date, body.coach_name, body.coach_email,
+        body.coach_phone, body.coach_role, body.weekly_hours, body.total_hours,
+        body.verification_contact_name, body.verification_contact_email,
+        body.verification_contact_phone, body.is_verified,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            affiliation_type    = EXCLUDED.affiliation_type,
+            organization_name   = EXCLUDED.organization_name,
+            organization_url    = EXCLUDED.organization_url,
+            role                = EXCLUDED.role,
+            role_start_date     = EXCLUDED.role_start_date,
+            role_end_date       = EXCLUDED.role_end_date,
+            weekly_hours        = EXCLUDED.weekly_hours,
+            total_hours         = EXCLUDED.total_hours,
+            details             = EXCLUDED.details,
+            notes               = EXCLUDED.notes,
+            visibility          = EXCLUDED.visibility,
+            updated_by          = EXCLUDED.created_by,
+            updated_at          = now()
+        RETURNING *, (xmax = 0) AS _was_insert
+        """
+    else:
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action=audit_action, target_table="affiliations",
+            target_id=result["id"], target_label=body.organization_name,
+            new_value={"affiliation_type": body.affiliation_type, "source_id": body.source_id},
+        )
+    return result
+
+
+class GoalCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    title: str = Field(..., min_length=1)
+    pillar: Optional[str] = None
+    parent_goal_id: Optional[UUID] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    target_date: Optional[date] = None
+    target_value_numeric: Optional[float] = None
+    target_value_unit: Optional[str] = None
+    current_value_numeric: Optional[float] = None
+    progress_pct: Optional[float] = None
+    achieved_at: Optional[date] = None
+    achieved_value_numeric: Optional[float] = None
+    related_university_leaid: Optional[str] = None
+    related_pathway: Optional[str] = None
+    related_scholarship_program_id: Optional[UUID] = None
+    details: Optional[dict] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/goals", status_code=201)
+async def create_goal(
+    body: GoalCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    insert_sql = """
+        INSERT INTO goals (
+            tenant_id, student_id, parent_goal_id, pillar, category,
+            title, description, status, target_date,
+            target_value_numeric, target_value_unit, current_value_numeric,
+            progress_pct, achieved_at, achieved_value_numeric,
+            related_university_leaid, related_pathway, related_scholarship_program_id,
+            details, notes, public_description, visibility,
+            source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3, COALESCE($4, 'cross_cutting')::pillar_enum, $5,
+            $6, $7, COALESCE($8, 'active')::goal_status_enum, $9,
+            $10, $11, $12,
+            $13, $14, $15,
+            $16, $17::pathway_enum, $18,
+            $19::jsonb, $20, $21, $22::visibility_enum,
+            $23, $24, $25
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.parent_goal_id, body.pillar, body.category,
+        body.title, body.description, body.status, body.target_date,
+        body.target_value_numeric, body.target_value_unit, body.current_value_numeric,
+        body.progress_pct, body.achieved_at, body.achieved_value_numeric,
+        body.related_university_leaid, body.related_pathway, body.related_scholarship_program_id,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            title                = EXCLUDED.title,
+            description          = EXCLUDED.description,
+            status               = EXCLUDED.status,
+            target_date          = EXCLUDED.target_date,
+            target_value_numeric = EXCLUDED.target_value_numeric,
+            current_value_numeric = EXCLUDED.current_value_numeric,
+            progress_pct         = EXCLUDED.progress_pct,
+            achieved_at          = EXCLUDED.achieved_at,
+            details              = EXCLUDED.details,
+            notes                = EXCLUDED.notes,
+            visibility           = EXCLUDED.visibility,
+            updated_by           = EXCLUDED.created_by,
+            updated_at           = now()
+        RETURNING *, (xmax = 0) AS _was_insert
+        """
+    else:
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action=audit_action, target_table="goals",
+            target_id=result["id"], target_label=body.title,
+            new_value={"pillar": body.pillar, "source_id": body.source_id},
+        )
+    return result
+
+
+class CourseCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    course_kind: str = Field(..., min_length=1)
+    course_name: str = Field(..., min_length=1)
+    course_code: Optional[str] = None
+    subject_area: Optional[str] = None
+    rigor_level: Optional[str] = None
+    provider_name: Optional[str] = None
+    provider_leaid: Optional[str] = None
+    provider_uni_leaid: Optional[str] = None
+    school_year: Optional[str] = None
+    term: Optional[str] = None
+    grade_level: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
+    grade: Optional[str] = None
+    grade_numeric: Optional[float] = None
+    credits: Optional[float] = None
+    weighted_credits: Optional[float] = None
+    is_complete: Optional[bool] = None
+    instructor_name: Optional[str] = None
+    instructor_email: Optional[str] = None
+    details: Optional[dict] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/courses", status_code=201)
+async def create_course(
+    body: CourseCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    insert_sql = """
+        INSERT INTO courses (
+            tenant_id, student_id, course_kind, course_name, course_code,
+            subject_area, rigor_level, provider_name, provider_leaid,
+            provider_uni_leaid, school_year, term, grade_level,
+            start_date, end_date, grade, grade_numeric, credits,
+            weighted_credits, is_complete, instructor_name, instructor_email,
+            details, notes, public_description, visibility,
+            source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3::course_kind_enum, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, $12, $13,
+            $14, $15, $16, $17, $18,
+            $19, COALESCE($20, false), $21, $22,
+            $23::jsonb, $24, $25, $26::visibility_enum,
+            $27, $28, $29
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.course_kind, body.course_name, body.course_code,
+        body.subject_area, body.rigor_level, body.provider_name, body.provider_leaid,
+        body.provider_uni_leaid, body.school_year, body.term, body.grade_level,
+        body.start_date, body.end_date, body.grade, body.grade_numeric, body.credits,
+        body.weighted_credits, body.is_complete, body.instructor_name, body.instructor_email,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            course_name      = EXCLUDED.course_name,
+            course_code      = EXCLUDED.course_code,
+            rigor_level      = EXCLUDED.rigor_level,
+            grade            = EXCLUDED.grade,
+            grade_numeric    = EXCLUDED.grade_numeric,
+            credits          = EXCLUDED.credits,
+            weighted_credits = EXCLUDED.weighted_credits,
+            is_complete      = EXCLUDED.is_complete,
+            details          = EXCLUDED.details,
+            notes            = EXCLUDED.notes,
+            visibility       = EXCLUDED.visibility,
+            updated_by       = EXCLUDED.created_by,
+            updated_at       = now()
+        RETURNING *, (xmax = 0) AS _was_insert
+        """
+    else:
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action=audit_action, target_table="courses",
+            target_id=result["id"], target_label=body.course_name,
+            new_value={"course_kind": body.course_kind, "source_id": body.source_id},
+        )
+    return result
+
+
+class DigitalPresenceCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    student_id: UUID
+    presence_kind: str = Field(..., min_length=1)
+    platform: str = Field(..., min_length=1)
+    handle: str = Field(..., min_length=1)
+    profile_url: Optional[str] = None
+    display_name: Optional[str] = None
+    is_primary: Optional[bool] = None
+    is_minor_managed: Optional[bool] = None
+    is_public_findable: Optional[bool] = None
+    started_at: Optional[date] = None
+    closed_at: Optional[date] = None
+    follower_count: Optional[int] = None
+    follower_count_as_of: Optional[datetime] = None
+    privacy_setting: Optional[str] = None
+    details: Optional[dict] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    visibility: Optional[str] = None
+    source_system: Optional[str] = None
+    source_id: Optional[str] = None
+
+
+@app.post("/focms/v1/digital_presence", status_code=201)
+async def create_digital_presence(
+    body: DigitalPresenceCreate,
+    request: Request,
+    upsert: bool = Query(False),
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    insert_sql = """
+        INSERT INTO digital_presence (
+            tenant_id, student_id, presence_kind, platform, handle,
+            profile_url, display_name, is_primary, is_minor_managed,
+            is_public_findable, started_at, closed_at,
+            follower_count, follower_count_as_of, privacy_setting,
+            details, notes, public_description, visibility,
+            source_system, source_id, created_by
+        ) VALUES (
+            $1, $2, $3::presence_kind_enum, $4, $5,
+            $6, $7, COALESCE($8, false), COALESCE($9, false),
+            $10, $11, $12,
+            $13, $14, $15,
+            $16::jsonb, $17, $18, $19::visibility_enum,
+            $20, $21, $22
+        )
+    """
+    params = (
+        UUID(tenant_id), body.student_id, body.presence_kind, body.platform, body.handle,
+        body.profile_url, body.display_name, body.is_primary, body.is_minor_managed,
+        body.is_public_findable, body.started_at, body.closed_at,
+        body.follower_count, body.follower_count_as_of, body.privacy_setting,
+        json.dumps(body.details) if body.details is not None else "{}",
+        body.notes, body.public_description, body.visibility or "private",
+        body.source_system, body.source_id, UUID(user_id),
+    )
+    if upsert and body.source_system and body.source_id:
+        sql = insert_sql + """
+        ON CONFLICT (source_system, source_id) WHERE source_id IS NOT NULL
+        DO UPDATE SET
+            platform         = EXCLUDED.platform,
+            handle           = EXCLUDED.handle,
+            profile_url      = EXCLUDED.profile_url,
+            display_name     = EXCLUDED.display_name,
+            is_primary       = EXCLUDED.is_primary,
+            is_minor_managed = EXCLUDED.is_minor_managed,
+            follower_count   = EXCLUDED.follower_count,
+            details          = EXCLUDED.details,
+            notes            = EXCLUDED.notes,
+            visibility       = EXCLUDED.visibility,
+            updated_by       = EXCLUDED.created_by,
+            updated_at       = now()
+        RETURNING *, (xmax = 0) AS _was_insert
+        """
+    else:
+        sql = insert_sql + " RETURNING *, (xmax = 0) AS _was_insert"
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.UniqueViolationError as exc:
+            raise HTTPException(409, f"Duplicate: {exc.detail or exc}") from exc
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        except asyncpg.ForeignKeyViolationError as exc:
+            raise HTTPException(400, f"Referenced row missing: {exc.detail or exc}") from exc
+        result = _row_to_dict(row)
+        audit_action = _pop_audit_action(result)
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action=audit_action, target_table="digital_presence",
+            target_id=result["id"], target_label=f"{body.platform}/{body.handle}",
+            new_value={"presence_kind": body.presence_kind, "source_id": body.source_id},
         )
     return result
 
