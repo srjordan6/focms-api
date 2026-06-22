@@ -1,7 +1,7 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.1
+"""focms_api.py - FOCMS Data Provider REST API v0.2.0
 
 Read-only API in front of FOCMS Postgres. Enforces per-request tenant context
-via RLS (SET LOCAL app.current_tenant_id). Designed to run as a Render Web
+via RLS (set_config app.current_tenant_id). Designed to run as a Render Web
 Service behind PgBouncer in transaction mode.
 
 Endpoints:
@@ -10,6 +10,7 @@ Endpoints:
     GET /focms/v1/student/{student_id}
     GET /focms/v1/student/{student_id}/records?type=type
     GET /focms/v1/student/{student_id}/target-universities
+    GET /focms/v1/student/{student_id}/computed/power-index   [NEW v0.2.0]
 
 Auth: Bearer token in Authorization header. Token maps to (tenant_id,
 user_id, role) via env-configured JSON. JWT upgrade is a Phase 1 follow-up.
@@ -18,9 +19,15 @@ Environment:
     DATABASE_URL_POOLED    - pgbouncer URL (transaction mode)
     FOCMS_API_TOKENS_JSON  - JSON dict mapping token to principal
     FOCMS_API_LOG_LEVEL    - INFO (default)
+
+v0.2.0 (2026-06-21): Added /computed/power-index. Computes Swimcloud-style
+Power Index server-side from swim_best rows in personal_records and NCAA D1
+Men 2026 base times from archive_entries.reference_data. Cited, no
+hardcoded reference data, deterministic.
 """
 import json, logging, os
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 from uuid import UUID
 
@@ -52,7 +59,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.2.0", lifespan=lifespan)
 
 
 def authenticate(authorization: str = Header(None)) -> dict[str, Any]:
@@ -81,7 +88,7 @@ async def tx(request: Request, tenant_id: str) -> AsyncIterator[asyncpg.Connecti
 
 @app.get("/focms/v1/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.1.0"}
+    return {"status": "ok", "version": "0.2.0"}
 
 
 @app.get("/focms/v1/types")
@@ -225,6 +232,126 @@ async def get_target_universities(
         return {"student_id": str(student_id), "targets": result}
 
 
+# ---------------------------------------------------------------------------
+# v0.2.0: Computed metrics
+# ---------------------------------------------------------------------------
+#
+# Swimcloud Power Point formula (class of 2026+ quad):
+#   PP = ((time_scy / ncaa_base)^3 - 1) * 100 + 1
+# Power Index = weighted average of TOP 4 (lowest) PPs at weights 100/100/25/5
+PI_WEIGHTS = [1.00, 1.00, 0.25, 0.05]
+
+
+def _compute_pp(seconds: float, event: str, course: str,
+                base_scy: dict, lcm_to_scy_factor: float):
+    """Compute Swimcloud Power Point for one event. Returns None if event
+    not in NCAA base table or course not SCY/LCM."""
+    base = base_scy.get(event)
+    if base is None:
+        return None
+    if course == "SCY":
+        t_scy = seconds
+    elif course == "LCM":
+        t_scy = seconds * lcm_to_scy_factor
+    else:
+        return None
+    pp = ((t_scy / base) ** 3 - 1) * 100 + 1
+    return round(pp, 2)
+
+
+def _split_event_course(label: str):
+    """'200 Breast SCY' -> ('200 Breast', 'SCY')"""
+    parts = label.rsplit(" ", 1)
+    return (parts[0], parts[1]) if len(parts) == 2 else (label, "")
+
+
+@app.get("/focms/v1/student/{student_id}/computed/power-index")
+async def get_power_index(
+    student_id: UUID, request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    """Compute Swimcloud-style Power Index for the student.
+
+    Pulls swim_best rows from personal_records and the NCAA D1 Men 2026
+    qualifying standards (SCY) from archive_entries.reference_data. The
+    base times source is cited in the response.
+
+    Returns 503 if the NCAA reference row is missing.
+    """
+    async with tx(request, principal["tenant_id"]) as conn:
+        # 1) NCAA base times from reference_data
+        base_row = await conn.fetchrow("""
+            SELECT detail, source_url, archive_date, source_id
+            FROM archive_entries
+            WHERE archive_type = 'reference_data'
+              AND source_id = 'ncaa_d1_men_2026_qualifying_standards_scy'
+            LIMIT 1
+        """)
+        if base_row is None or not base_row["detail"]:
+            raise HTTPException(
+                503,
+                "NCAA D1 base times reference data not present in "
+                "archive_entries. Cannot compute Power Index.",
+            )
+        base_payload = json.loads(base_row["detail"])
+        base_scy = base_payload["events"]
+        lcm_factor = base_payload["conversion_to_lcm_factor"]
+        base_year = base_payload["effective_year"]
+
+        # 2) This student's swim bests
+        bests = await conn.fetch("""
+            SELECT title, value_numeric AS seconds
+            FROM personal_records
+            WHERE student_id = $1
+              AND record_kind = 'swim_best'
+              AND deleted_at IS NULL
+              AND value_numeric IS NOT NULL
+        """, student_id)
+
+    # 3) Compute Power Points per event
+    pps = []
+    for r in bests:
+        event, course = _split_event_course(r["title"])
+        pp = _compute_pp(float(r["seconds"]), event, course, base_scy, lcm_factor)
+        if pp is not None:
+            pps.append((r["title"], pp))
+
+    # 4) Sort ascending (lowest = best), take top 4
+    pps.sort(key=lambda x: x[1])
+    top_4_raw = pps[:4]
+
+    # 5) Weighted PI
+    if top_4_raw:
+        weights = PI_WEIGHTS[: len(top_4_raw)]
+        total_w = sum(weights)
+        pi_value = sum(top_4_raw[i][1] * weights[i] for i in range(len(top_4_raw))) / total_w
+        pi_value = round(pi_value, 1)
+    else:
+        pi_value = None
+
+    return {
+        "student_id": str(student_id),
+        "tenant_id": principal["tenant_id"],
+        "power_index": {
+            "value": pi_value,
+            "top_4": [{"event_course": l, "pp": p} for l, p in top_4_raw],
+            "total_eligible_events": len(pps),
+            "method": "swimcloud_2026_quad_class_of_2026_and_later",
+            "base_times_source": {
+                "archive_source_id": base_row["source_id"],
+                "source_url": base_row["source_url"],
+                "effective_year": base_year,
+                "refreshed_at": str(base_row["archive_date"]),
+            },
+            "formula": (
+                "PP = ((time_scy / ncaa_base)^3 - 1) * 100 + 1; "
+                "PI = weighted avg of top 4 (lowest) PPs at 100/100/25/5 percent"
+            ),
+            "computed_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+
+
 @app.exception_handler(asyncpg.PostgresError)
 async def pg_error_handler(request: Request, exc: asyncpg.PostgresError) -> JSONResponse:
     log.error("Postgres error: %s", exc, exc_info=True)
@@ -232,4 +359,3 @@ async def pg_error_handler(request: Request, exc: asyncpg.PostgresError) -> JSON
         status_code=500,
         content={"error": "database_error", "detail": str(exc)},
     )
-
