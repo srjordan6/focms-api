@@ -4,6 +4,18 @@ Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
 
+v0.4.1 (2026-06-22):
+- Self-contained student data: new GET /focms/v1/student/{id}/computed/swim-bests
+  endpoint returns the swim feed schema (bests dict, power_index, standards)
+  computed server-side from personal_records. Replaces the per-student bleed
+  from the johnrjordan.com hardcoded WP feed.
+- Student CRUD: POST/PATCH/DELETE /focms/v1/students endpoints. Lets a parent
+  portal create and manage students without writing SQL directly.
+- Media storage: media_files table + POST/GET/DELETE /focms/v1/media endpoints.
+  Stores photos and small documents as bytea in Postgres with appropriate MIME
+  types. Returns URLs that the public showcase pages can reference directly.
+  Server-side size cap: 10 MB per upload.
+
 v0.4.0 (2026-06-22):
 - Self-migration on startup: creates public_showcases table, grants focms_app
   schema CREATE privilege (one-time bootstrap that lets the MCP role do DDL
@@ -168,6 +180,61 @@ MIGRATIONS: list[tuple[str, str]] = [
     # Seed John's showcase row (idempotent — ON CONFLICT DO NOTHING).
     # This is what makes outcomestar.app/john keep working after page.tsx
     # drops its hardcoded TENANTS constant.
+    # Media storage: bytea blobs with MIME type. Sized for portraits and small
+    # PDFs (Mindprint reports, transcripts, etc). Larger artifacts later move
+    # to S3/R2 via a separate code path.
+    (
+        "create_media_files",
+        """CREATE TABLE IF NOT EXISTS media_files (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid_v7(),
+            tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            student_id uuid REFERENCES students(id) ON DELETE SET NULL,
+            kind text NOT NULL DEFAULT 'image'
+              CHECK (kind IN ('image','document','video','other')),
+            mime_type text NOT NULL,
+            original_filename text,
+            byte_size integer NOT NULL,
+            content bytea NOT NULL,
+            visibility text NOT NULL DEFAULT 'private'
+              CHECK (visibility IN ('public','unlisted','private')),
+            sha256_hex text,
+            created_by uuid REFERENCES users(id),
+            created_at timestamptz NOT NULL DEFAULT now(),
+            deleted_at timestamptz
+        )""",
+    ),
+    (
+        "media_files_tenant_idx",
+        "CREATE INDEX IF NOT EXISTS media_files_tenant_idx ON media_files (tenant_id)",
+    ),
+    (
+        "media_files_student_idx",
+        "CREATE INDEX IF NOT EXISTS media_files_student_idx ON media_files (student_id)",
+    ),
+    (
+        "media_files_grant_dml",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON media_files TO focms_app",
+    ),
+    (
+        "media_files_enable_rls",
+        "ALTER TABLE media_files ENABLE ROW LEVEL SECURITY",
+    ),
+    (
+        "media_files_policy",
+        """DO $do$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_policies
+                WHERE tablename = 'media_files'
+                  AND policyname = 'media_files_isolation'
+            ) THEN
+                CREATE POLICY media_files_isolation ON media_files
+                    USING (
+                        tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid
+                        OR NULLIF(current_setting('app.current_tenant_id', true), '') IS NULL
+                    );
+            END IF;
+        END $do$""",
+    ),
     (
         "seed_john_showcase",
         """INSERT INTO public_showcases (
@@ -235,7 +302,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.4.1", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -370,7 +437,7 @@ async def write_audit(
 
 @app.get("/focms/v1/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.4.0"}
+    return {"status": "ok", "version": "0.4.1"}
 
 
 @app.get("/focms/v1/types")
@@ -1794,6 +1861,88 @@ class PublicShowcasePatch(BaseModel):
     visibility: Optional[str] = None
 
 
+@app.get("/focms/v1/public_showcases")
+async def list_public_showcases(
+    request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    """List all showcase configs for the authenticated tenant. Used by the
+    admin UI to show what's currently published.
+
+    Includes private+unlisted+public, since the admin needs full visibility.
+    """
+    async with tx(request, principal["tenant_id"]) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT s.id, s.slug, s.student_id, s.theme_key, s.display_name,
+                   s.tagline, s.photo_url, s.visibility, s.created_at, s.updated_at,
+                   st.first_name, st.last_name, st.current_grade
+            FROM public_showcases s
+            LEFT JOIN students st ON st.id = s.student_id
+            WHERE s.deleted_at IS NULL
+            ORDER BY s.created_at DESC
+            """
+        )
+    return {
+        "count": len(rows),
+        "showcases": [
+            {
+                "id": str(r["id"]),
+                "slug": r["slug"],
+                "student_id": str(r["student_id"]),
+                "student_name": f'{r["first_name"]} {r["last_name"]}' if r["first_name"] else None,
+                "current_grade": r["current_grade"],
+                "theme_key": r["theme_key"],
+                "display_name": r["display_name"],
+                "tagline": r["tagline"],
+                "photo_url": r["photo_url"],
+                "visibility": r["visibility"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/focms/v1/students")
+async def list_students(
+    request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    """List all students for the authenticated tenant. Used by the admin UI."""
+    async with tx(request, principal["tenant_id"]) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, first_name, last_name, display_name, preferred_name,
+                   current_grade, residence_state, expected_hs_graduation_year,
+                   birth_date, headline, created_at
+            FROM students
+            WHERE deleted_at IS NULL
+            ORDER BY created_at DESC
+            """
+        )
+    return {
+        "count": len(rows),
+        "students": [
+            {
+                "id": str(r["id"]),
+                "first_name": r["first_name"],
+                "last_name": r["last_name"],
+                "display_name": r["display_name"],
+                "preferred_name": r["preferred_name"],
+                "current_grade": r["current_grade"],
+                "residence_state": r["residence_state"],
+                "expected_hs_graduation_year": r["expected_hs_graduation_year"],
+                "birth_date": r["birth_date"].isoformat() if r["birth_date"] else None,
+                "headline": r["headline"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.get("/focms/v1/showcase/{slug}")
 async def get_showcase_by_slug(
     slug: str, request: Request,
@@ -1977,6 +2126,589 @@ async def delete_public_showcase(
             target_table="public_showcases", target_id=str(showcase_id),
         )
     return JSONResponse(status_code=204, content=None)
+
+
+
+# ===========================================================================
+# v0.4.1 — students CRUD
+# ===========================================================================
+
+
+class StudentCreate(BaseModel):
+    """Body for POST /focms/v1/students. Mirrors the students table's required
+    columns plus the common optional ones."""
+    model_config = ConfigDict(extra="forbid")
+
+    first_name: str = Field(..., min_length=1)
+    last_name: str = Field(..., min_length=1)
+    display_name: str = Field(..., min_length=1)
+    birth_date: date
+    preferred_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    pronouns: Optional[str] = None
+    current_grade: Optional[str] = None
+    expected_hs_graduation_year: Optional[int] = None
+    residence_state: Optional[str] = None
+    residence_country: Optional[str] = None
+    current_school_leaid: Optional[str] = None
+    birth_country: Optional[str] = None
+    primary_citizenship: Optional[str] = None
+    secondary_citizenship: Optional[str] = None
+    headline: Optional[str] = None
+    bio: Optional[str] = None
+
+
+class StudentPatch(BaseModel):
+    """Body for PATCH /focms/v1/students/{id}. All fields optional."""
+    model_config = ConfigDict(extra="forbid")
+
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    display_name: Optional[str] = None
+    preferred_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    pronouns: Optional[str] = None
+    birth_date: Optional[date] = None
+    current_grade: Optional[str] = None
+    expected_hs_graduation_year: Optional[int] = None
+    residence_state: Optional[str] = None
+    residence_country: Optional[str] = None
+    current_school_leaid: Optional[str] = None
+    headline: Optional[str] = None
+    bio: Optional[str] = None
+
+
+@app.post("/focms/v1/students", status_code=201)
+async def create_student(
+    body: StudentCreate,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Create a new student record under the authenticated tenant."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO students (
+                    tenant_id, first_name, last_name, display_name, preferred_name,
+                    middle_name, pronouns, birth_date, current_grade,
+                    expected_hs_graduation_year, residence_state, residence_country,
+                    current_school_leaid, birth_country, primary_citizenship,
+                    secondary_citizenship, headline, bio, created_by
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19
+                )
+                RETURNING *
+                """,
+                UUID(tenant_id), body.first_name, body.last_name, body.display_name,
+                body.preferred_name, body.middle_name, body.pronouns, body.birth_date,
+                body.current_grade, body.expected_hs_graduation_year,
+                body.residence_state, body.residence_country,
+                body.current_school_leaid, body.birth_country,
+                body.primary_citizenship, body.secondary_citizenship,
+                body.headline, body.bio, UUID(user_id),
+            )
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        result = _row_to_dict(row)
+        await write_audit(
+            conn,
+            actor_user_id=user_id,
+            actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id,
+            action="create",
+            target_table="students",
+            target_id=result["id"],
+            target_label=body.display_name,
+            new_value={"display_name": body.display_name, "grade": body.current_grade},
+        )
+    return result
+
+
+@app.patch("/focms/v1/students/{student_id}")
+async def patch_student(
+    student_id: UUID,
+    body: StudentPatch,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Update fields on a student. Only fields present in the body are written."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(400, "No fields to update")
+
+    set_parts = []
+    params: list[Any] = []
+    for i, (col, val) in enumerate(fields.items(), start=1):
+        set_parts.append(f"{col} = ${i}")
+        params.append(val)
+    set_parts.append(f"updated_by = ${len(params) + 1}")
+    params.append(UUID(user_id))
+    set_parts.append("updated_at = now()")
+    params.append(student_id)
+    where_param = f"${len(params)}"
+
+    sql = f"""
+        UPDATE students
+        SET {", ".join(set_parts)}
+        WHERE id = {where_param} AND deleted_at IS NULL
+        RETURNING *
+    """
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(sql, *params)
+        except asyncpg.exceptions.InvalidTextRepresentationError as exc:
+            raise HTTPException(400, f"Invalid value: {exc}") from exc
+        if not row:
+            raise HTTPException(404, "Student not found")
+        result = _row_to_dict(row)
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action="update", target_table="students",
+            target_id=str(student_id),
+            new_value={k: (str(v) if isinstance(v, (UUID, date, datetime)) else v) for k, v in fields.items()},
+        )
+    return result
+
+
+@app.delete("/focms/v1/students/{student_id}", status_code=204)
+async def delete_student(
+    student_id: UUID, request: Request,
+    principal: dict = Depends(require_write),
+):
+    """Soft-delete a student. Also soft-deletes any public_showcases pointing
+    at the student so URLs go to 404 immediately."""
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE students
+            SET deleted_at = now(), updated_by = $1, updated_at = now()
+            WHERE id = $2 AND deleted_at IS NULL
+            RETURNING id
+            """,
+            UUID(user_id), student_id,
+        )
+        if not row:
+            raise HTTPException(404, "Student not found or already deleted")
+        # Cascade to showcases
+        await conn.execute(
+            "UPDATE public_showcases SET deleted_at = now() WHERE student_id = $1 AND deleted_at IS NULL",
+            student_id,
+        )
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action="delete", target_table="students",
+            target_id=str(student_id),
+        )
+    return JSONResponse(status_code=204, content=None)
+
+
+# ===========================================================================
+# v0.4.1 — student-scoped swim bests feed (replaces hardcoded WP feed)
+# ===========================================================================
+
+USA_SWIMMING_TIERS_2024_2028_BOYS_11_12 = {
+    # Time standards in seconds. SCY = Short Course Yards, LCM = Long Course Meters.
+    # Tiers: AAAA (elite) > AAA > AA > A > BB > B (slowest)
+    # Used by Mission Control performance log and the recompute() logic in the
+    # WP-era hydrator. Embedded here so the feed is self-contained.
+    "SCY": {
+        "50 Free":   {"AAAA": 25.69, "AAA": 26.39, "AA": 27.39, "A": 28.49, "BB": 30.09, "B": 32.49},
+        "100 Free":  {"AAAA": 56.49, "AAA": 58.09, "AA": 60.39, "A": 62.69, "BB": 66.29, "B": 71.69},
+        "200 Free":  {"AAAA": 122.49,"AAA": 125.99,"AA": 130.79,"A": 135.69,"BB": 143.49,"B": 154.99},
+        "500 Free":  {"AAAA": 326.99,"AAA": 336.29,"AA": 349.09,"A": 361.99,"BB": 382.69,"B": 413.59},
+        "100 Back":  {"AAAA": 64.69, "AAA": 66.59, "AA": 69.19, "A": 71.79, "BB": 75.99, "B": 82.09},
+        "200 Back":  {"AAAA": 140.39,"AAA": 144.49,"AA": 150.09,"A": 155.69,"BB": 164.69,"B": 177.99},
+        "100 Breast":{"AAAA": 72.99, "AAA": 75.09, "AA": 78.09, "A": 81.09, "BB": 85.79, "B": 92.69},
+        "200 Breast":{"AAAA": 156.49,"AAA": 161.09,"AA": 167.29,"A": 173.59,"BB": 183.59,"B": 198.39},
+        "100 Fly":   {"AAAA": 63.09, "AAA": 64.99, "AA": 67.49, "A": 70.09, "BB": 74.19, "B": 80.19},
+        "200 Fly":   {"AAAA": 142.59,"AAA": 146.69,"AA": 152.39,"A": 158.19,"BB": 167.39,"B": 180.79},
+        "100 IM":    {"AAAA": 65.49, "AAA": 67.49, "AA": 70.09, "A": 72.69, "BB": 76.99, "B": 83.19},
+        "200 IM":    {"AAAA": 141.79,"AAA": 145.89,"AA": 151.59,"A": 157.29,"BB": 166.49,"B": 179.79},
+        "400 IM":    {"AAAA": 304.49,"AAA": 313.29,"AA": 325.39,"A": 337.59,"BB": 357.09,"B": 385.79},
+    },
+    "LCM": {
+        "50 Free":   {"AAAA": 28.99, "AAA": 29.79, "AA": 30.99, "A": 32.19, "BB": 33.99, "B": 36.69},
+        "100 Free":  {"AAAA": 63.79, "AAA": 65.69, "AA": 68.19, "A": 70.79, "BB": 74.79, "B": 80.99},
+        "200 Free":  {"AAAA": 138.29,"AAA": 142.29,"AA": 147.69,"A": 153.19,"BB": 162.09,"B": 174.99},
+        "400 Free":  {"AAAA": 291.89,"AAA": 300.19,"AA": 311.49,"A": 322.99,"BB": 341.59,"B": 369.09},
+        "100 Back":  {"AAAA": 73.59, "AAA": 75.79, "AA": 78.69, "A": 81.59, "BB": 86.29, "B": 93.29},
+        "200 Back":  {"AAAA": 159.69,"AAA": 164.39,"AA": 170.69,"A": 177.09,"BB": 187.39,"B": 202.49},
+        "100 Breast":{"AAAA": 82.49, "AAA": 84.89, "AA": 88.19, "A": 91.59, "BB": 96.89, "B": 104.69},
+        "200 Breast":{"AAAA": 177.49,"AAA": 182.69,"AA": 189.69,"A": 196.79,"BB": 208.19,"B": 224.99},
+        "100 Fly":   {"AAAA": 71.59, "AAA": 73.69, "AA": 76.49, "A": 79.39, "BB": 84.09, "B": 90.79},
+        "200 Fly":   {"AAAA": 162.89,"AAA": 167.59,"AA": 174.09,"A": 180.69,"BB": 191.19,"B": 206.49},
+        "200 IM":    {"AAAA": 161.49,"AAA": 166.19,"AA": 172.69,"A": 179.19,"BB": 189.69,"B": 204.79},
+        "400 IM":    {"AAAA": 346.79,"AAA": 356.79,"AA": 370.49,"A": 384.39,"BB": 406.59,"B": 439.19},
+    },
+}
+
+
+def _next_standard(seconds: float, standards: dict[str, float]) -> tuple[Optional[str], Optional[float]]:
+    """Return the next-faster tier above the current achieved tier."""
+    tier_order = ["B", "BB", "A", "AA", "AAA", "AAAA"]
+    # Sort standards from slowest to fastest (highest seconds to lowest)
+    sorted_tiers = [(t, standards.get(t)) for t in tier_order if standards.get(t)]
+    sorted_tiers.sort(key=lambda x: -x[1])  # slowest first
+    achieved = None
+    next_std = None
+    next_time = None
+    for tier, std_time in sorted_tiers:
+        if seconds <= std_time:
+            achieved = tier
+        else:
+            # Faster than current; next standard up
+            if achieved is None:
+                next_std = tier
+                next_time = std_time
+                break
+    if achieved:
+        # Find next tier faster than achieved
+        for tier, std_time in [(t, standards.get(t)) for t in tier_order if standards.get(t)]:
+            if std_time < (standards.get(achieved) or float("inf")):
+                if next_std is None or std_time > (next_time or 0):
+                    next_std = tier
+                    next_time = std_time
+    return achieved, next_time
+
+
+@app.get("/focms/v1/student/{student_id}/computed/swim-bests")
+async def get_swim_bests_feed(
+    student_id: UUID, request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    """Return the swim feed payload for the student (replaces the WP feed).
+
+    Same JSON schema as johnrjordan.com/focms-feed-swim-bests/ so the outcomestar
+    theme code doesn't need to change: a `bests` dict keyed by "DIST STROKE COURSE",
+    optional `power_index`, and `standards` reference. Computed from
+    `personal_records` where record_kind='swim_best'.
+    """
+    async with tx(request, principal["tenant_id"]) as conn:
+        records = await conn.fetch("""
+            SELECT title, value_numeric, achieved_date,
+                   prior_value_numeric, total_drop_numeric, details
+            FROM personal_records
+            WHERE student_id = $1 AND record_kind = 'swim_best'
+              AND deleted_at IS NULL AND value_numeric IS NOT NULL
+            ORDER BY title
+        """, student_id)
+
+    standards_scy = USA_SWIMMING_TIERS_2024_2028_BOYS_11_12["SCY"]
+    standards_lcm = USA_SWIMMING_TIERS_2024_2028_BOYS_11_12["LCM"]
+    bests: dict[str, Any] = {}
+    for r in records:
+        title = r["title"]
+        seconds = float(r["value_numeric"])
+        # Parse title like "100 Breast SCY"
+        parts = title.rsplit(" ", 1)
+        if len(parts) != 2:
+            continue
+        event, course = parts
+        std_table = standards_scy if course == "SCY" else (standards_lcm if course == "LCM" else None)
+        if std_table is None:
+            continue
+        std_for_event = std_table.get(event, {})
+        achieved_std, next_time = _next_standard(seconds, std_for_event)
+        bests[title] = {
+            "time": _format_time(seconds),
+            "seconds": seconds,
+            "date": r["achieved_date"].isoformat() if r["achieved_date"] else None,
+            "usa_standard": achieved_std,
+            "next_std": _tier_above(achieved_std, std_for_event),
+            "next_time_seconds": next_time,
+        }
+
+    # Also call into the existing power-index logic for the same student
+    pi_payload: Optional[dict] = None
+    try:
+        # Re-use the same logic the dedicated endpoint uses
+        async with tx(request, principal["tenant_id"]) as conn:
+            base_row = await conn.fetchrow("""
+                SELECT detail, source_url, archive_date, source_id
+                FROM archive_entries
+                WHERE archive_type = 'reference_data'
+                  AND source_id = 'ncaa_d1_men_2026_qualifying_standards_scy'
+                LIMIT 1
+            """)
+            if base_row and base_row["detail"]:
+                base_payload = json.loads(base_row["detail"])
+                base_scy = base_payload["events"]
+                lcm_factor = base_payload["conversion_to_lcm_factor"]
+                base_year = base_payload["effective_year"]
+                bests_rows = await conn.fetch("""
+                    SELECT title, value_numeric AS seconds
+                    FROM personal_records
+                    WHERE student_id = $1 AND record_kind = 'swim_best'
+                      AND deleted_at IS NULL AND value_numeric IS NOT NULL
+                """, student_id)
+                pps = []
+                for r in bests_rows:
+                    event, course = _split_event_course(r["title"])
+                    pp = _compute_pp(float(r["seconds"]), event, course, base_scy, lcm_factor)
+                    if pp is not None:
+                        pps.append((r["title"], pp))
+                pps.sort(key=lambda x: x[1])
+                top4 = pps[:4]
+                pi_value = None
+                if top4:
+                    weights = PI_WEIGHTS[: len(top4)]
+                    total_w = sum(weights)
+                    pi_value = round(sum(top4[i][1] * weights[i] for i in range(len(top4))) / total_w, 1)
+                pi_payload = {
+                    "value": pi_value,
+                    "top_4": [{"event_course": l, "pp": p} for l, p in top4],
+                    "total_eligible_events": len(pps),
+                    "method": "swimcloud_2026_quad_class_of_2026_and_later",
+                    "base_times_source": {
+                        "archive_source_id": base_row["source_id"],
+                        "source_url": base_row["source_url"],
+                        "effective_year": base_year,
+                        "refreshed_at": str(base_row["archive_date"]),
+                    },
+                    "formula": (
+                        "PP = ((time_scy / ncaa_base)^3 - 1) * 100 + 1; "
+                        "PI = weighted avg of top 4 (lowest) PPs at 100/100/25/5 percent"
+                    ),
+                }
+    except Exception as exc:
+        log.warning("PI compute failed for student %s: %s", student_id, exc)
+
+    return {
+        "_meta": {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "focms_api",
+            "student_id": str(student_id),
+            "tenant_id": principal["tenant_id"],
+            "row_count": len(bests),
+            "schema_version": "1.1",
+        },
+        "bests": bests,
+        "standards": {
+            "usa_swimming_2024_2028_boys_11_12": USA_SWIMMING_TIERS_2024_2028_BOYS_11_12,
+            "tier_order_fastest_to_slowest": ["AAAA","AAA","AA","A","BB","B"],
+            "below_b_label": "Slower than B",
+        },
+        "power_index": pi_payload,
+    }
+
+
+def _format_time(seconds: float) -> str:
+    """Format seconds as MM:SS.HH if >= 60, else SS.HH."""
+    if seconds >= 60:
+        m = int(seconds // 60)
+        s = seconds - m * 60
+        return f"{m}:{s:05.2f}"
+    return f"{seconds:.2f}"
+
+
+def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optional[str]:
+    """Given the current tier label, return the next-faster tier label that's
+    actually defined in the standards table."""
+    tier_order = ["B", "BB", "A", "AA", "AAA", "AAAA"]
+    if not achieved:
+        # Return slowest defined
+        for t in tier_order:
+            if standards.get(t):
+                return t
+        return None
+    try:
+        idx = tier_order.index(achieved)
+    except ValueError:
+        return None
+    for t in tier_order[idx + 1:]:
+        if standards.get(t):
+            return t
+    return None
+
+
+# ===========================================================================
+# v0.4.1 — media storage (binary blobs in Postgres)
+# ===========================================================================
+
+import base64 as _b64
+import hashlib as _hashlib
+from fastapi.responses import Response
+
+MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB cap
+
+
+class MediaUpload(BaseModel):
+    """Body for POST /focms/v1/media.
+
+    Binary content is base64-encoded in JSON to avoid the python-multipart
+    dependency. JS clients use FileReader.readAsDataURL() and strip the
+    "data:...;base64," prefix; PowerShell clients use
+    [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($path)).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    filename: str = Field(..., min_length=1, max_length=512)
+    mime_type: str = Field(..., min_length=1)
+    content_base64: str = Field(..., min_length=1)
+    kind: Optional[str] = None
+    visibility: Optional[str] = None
+    student_id: Optional[UUID] = None
+
+
+@app.post("/focms/v1/media", status_code=201)
+async def upload_media(
+    body: MediaUpload,
+    request: Request,
+    principal: dict = Depends(require_write),
+) -> dict[str, Any]:
+    """Upload a binary file (image, document, etc).
+
+    JSON body: { filename, mime_type, content_base64, kind?, visibility?, student_id? }
+    Returns the media id and a URL that can be used in image src etc.
+    Size cap: 10 MB after base64 decode. Kinds: image, document, video, other.
+    """
+    try:
+        content = _b64.b64decode(body.content_base64, validate=True)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid base64: {exc}") from exc
+    if len(content) > MAX_MEDIA_BYTES:
+        raise HTTPException(413, f"File too large: {len(content)} bytes (max {MAX_MEDIA_BYTES})")
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+    sha = _hashlib.sha256(content).hexdigest()
+
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO media_files (
+                tenant_id, student_id, kind, mime_type, original_filename,
+                byte_size, content, visibility, sha256_hex, created_by
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            RETURNING id, byte_size, mime_type, kind, visibility, sha256_hex
+            """,
+            UUID(tenant_id),
+            body.student_id,
+            body.kind or "image",
+            body.mime_type,
+            body.filename,
+            len(content),
+            content,
+            body.visibility or "public",
+            sha,
+            UUID(user_id),
+        )
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action="create", target_table="media_files",
+            target_id=str(row["id"]), target_label=body.filename,
+            new_value={"mime_type": row["mime_type"], "bytes": row["byte_size"]},
+        )
+    return {
+        "id": str(row["id"]),
+        "url": f"/focms/v1/media/{row['id']}",
+        "mime_type": row["mime_type"],
+        "byte_size": row["byte_size"],
+        "kind": row["kind"],
+        "visibility": row["visibility"],
+        "sha256": row["sha256_hex"],
+    }
+
+
+@app.get("/focms/v1/media/{media_id}")
+async def serve_media(media_id: UUID, request: Request):
+    """Return the raw binary content of a media file with appropriate MIME type.
+
+    No auth required for public files; private/unlisted return 404 to
+    unauthenticated callers. (For simplicity, treat unlisted same as public.)
+    """
+    async with request.app.state.pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT content, mime_type, byte_size, visibility
+            FROM media_files
+            WHERE id = $1 AND deleted_at IS NULL
+            """,
+            media_id,
+        )
+        if not row:
+            raise HTTPException(404, "Media not found")
+        if row["visibility"] == "private":
+            # In a future iteration: check bearer, allow if tenant matches
+            raise HTTPException(404, "Media not found")
+    return Response(
+        content=bytes(row["content"]),
+        media_type=row["mime_type"],
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+@app.delete("/focms/v1/media/{media_id}", status_code=204)
+async def delete_media(
+    media_id: UUID, request: Request,
+    principal: dict = Depends(require_write),
+):
+    tenant_id = principal["tenant_id"]
+    user_id = principal["user_id"]
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE media_files SET deleted_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id
+            """,
+            media_id,
+        )
+        if not row:
+            raise HTTPException(404, "Media not found or already deleted")
+        await write_audit(
+            conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
+            tenant_id=tenant_id, action="delete", target_table="media_files",
+            target_id=str(media_id),
+        )
+    return JSONResponse(status_code=204, content=None)
+
+
+# Helper exposed for tests: list media for a student
+@app.get("/focms/v1/student/{student_id}/media")
+async def list_student_media(
+    student_id: UUID, request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    async with tx(request, principal["tenant_id"]) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, kind, mime_type, original_filename, byte_size,
+                   visibility, created_at
+            FROM media_files
+            WHERE student_id = $1 AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            """,
+            student_id,
+        )
+    return {
+        "student_id": str(student_id),
+        "count": len(rows),
+        "media": [
+            {
+                "id": str(r["id"]),
+                "url": f"/focms/v1/media/{r['id']}",
+                "kind": r["kind"],
+                "mime_type": r["mime_type"],
+                "original_filename": r["original_filename"],
+                "byte_size": r["byte_size"],
+                "visibility": r["visibility"],
+                "created_at": r["created_at"].isoformat(),
+            }
+            for r in rows
+        ],
+    }
 
 # ---------------------------------------------------------------------------
 # Error handlers
