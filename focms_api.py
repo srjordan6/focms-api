@@ -1,8 +1,24 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.4.2
+"""focms_api.py - FOCMS Data Provider REST API v0.4.3
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.4.3 (2026-06-23):
+- PII encryption at rest. Per-tenant envelope encryption using pgcrypto's
+  OpenPGP symmetric primitives. Master KEK lives in FOCMS_KEK_MASTER env
+  var (never touches the DB). Per-tenant DEKs are random 256-bit keys
+  wrapped with the KEK and stored in `tenant_data_keys`. PII columns
+  `first_name_ciphertext`, `middle_name_ciphertext`, `last_name_ciphertext`,
+  `birth_date_ciphertext` added to `students`. Existing tenant DEKs are
+  provisioned and existing student PII is encrypted on startup (idempotent
+  — only encrypts where ciphertext column is NULL). Plaintext columns
+  preserved during transition; v0.4.4 will route reads/writes through the
+  encrypted columns; v0.4.5 drops the plaintext columns once stable.
+- Helper SQL functions exposed: focms_encrypt_pii(tenant, plaintext, kek),
+  focms_decrypt_pii(tenant, ciphertext, kek), focms_tenant_dek(tenant, kek),
+  focms_provision_tenant_dek(tenant, kek, created_by). All SECURITY DEFINER.
+- /focms/v1/health now reports crypto status (kek_set, dek_count).
 
 v0.4.2 (2026-06-23):
 - WP CPT porting Phase A (jrj_swim_race cutover): new GET
@@ -95,6 +111,11 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL_POOLED or DATABASE_URL must be set")
 TOKENS = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
 LOG_LEVEL = os.environ.get("FOCMS_API_LOG_LEVEL", "INFO")
+# v0.4.3: master key encryption key for envelope-encrypted PII. If unset,
+# crypto operations (DEK provisioning, PII encrypt/decrypt) are skipped at
+# startup and the helper functions return errors when called. Set this on
+# Render env vars; the value is a 64-char lowercase hex string (256 bits).
+FOCMS_KEK_MASTER = os.environ.get("FOCMS_KEK_MASTER")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("focms-api")
@@ -262,6 +283,111 @@ MIGRATIONS: list[tuple[str, str]] = [
             'public'
         ) ON CONFLICT DO NOTHING""",
     ),
+    # ----------------------------------------------------------------------
+    # v0.4.3 — per-tenant envelope encryption for PII at rest
+    # ----------------------------------------------------------------------
+    # tenant_data_keys: stores per-tenant DEKs (data encryption keys) wrapped
+    # with the master KEK (key encryption key). One row per tenant. The
+    # wrapped DEK is useless without the KEK which lives only in env vars.
+    (
+        "crypto_pgcrypto_extension",
+        "CREATE EXTENSION IF NOT EXISTS pgcrypto",
+    ),
+    (
+        "crypto_create_tenant_data_keys",
+        """CREATE TABLE IF NOT EXISTS tenant_data_keys (
+            tenant_id       uuid PRIMARY KEY,
+            dek_wrapped     bytea NOT NULL,
+            algorithm       text NOT NULL DEFAULT 'aes256/openpgp-symmetric',
+            kek_version     integer NOT NULL DEFAULT 1,
+            key_version     integer NOT NULL DEFAULT 1,
+            created_at      timestamptz NOT NULL DEFAULT now(),
+            created_by      uuid NOT NULL,
+            rotated_at      timestamptz,
+            rotated_by      uuid,
+            notes           text
+        )""",
+    ),
+    (
+        "crypto_grant_app_dml_tenant_data_keys",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_data_keys TO focms_app",
+    ),
+    # Helper functions. All SECURITY DEFINER so the calling role doesn't need
+    # direct grants on tenant_data_keys — only EXECUTE on the function.
+    # KEK is passed explicitly on every call (no session GUC dependency) so
+    # the helpers work identically from API, MCP, or psql.
+    (
+        "crypto_fn_tenant_dek",
+        """CREATE OR REPLACE FUNCTION focms_tenant_dek(p_tenant_id uuid, p_kek text)
+        RETURNS text
+        LANGUAGE sql STABLE
+        SECURITY DEFINER
+        AS $crypto_fn$
+          SELECT pgp_sym_decrypt(
+            (SELECT dek_wrapped FROM tenant_data_keys WHERE tenant_id = p_tenant_id),
+            p_kek
+          )
+        $crypto_fn$""",
+    ),
+    (
+        "crypto_fn_encrypt_pii",
+        """CREATE OR REPLACE FUNCTION focms_encrypt_pii(p_tenant_id uuid, p_plaintext text, p_kek text)
+        RETURNS bytea
+        LANGUAGE sql STABLE
+        SECURITY DEFINER
+        AS $crypto_fn$
+          SELECT CASE
+            WHEN p_plaintext IS NULL THEN NULL
+            ELSE pgp_sym_encrypt(p_plaintext, focms_tenant_dek(p_tenant_id, p_kek))
+          END
+        $crypto_fn$""",
+    ),
+    (
+        "crypto_fn_decrypt_pii",
+        """CREATE OR REPLACE FUNCTION focms_decrypt_pii(p_tenant_id uuid, p_ciphertext bytea, p_kek text)
+        RETURNS text
+        LANGUAGE sql STABLE
+        SECURITY DEFINER
+        AS $crypto_fn$
+          SELECT CASE
+            WHEN p_ciphertext IS NULL THEN NULL
+            ELSE pgp_sym_decrypt(p_ciphertext, focms_tenant_dek(p_tenant_id, p_kek))
+          END
+        $crypto_fn$""",
+    ),
+    (
+        "crypto_fn_provision_tenant_dek",
+        """CREATE OR REPLACE FUNCTION focms_provision_tenant_dek(p_tenant_id uuid, p_kek text, p_created_by uuid)
+        RETURNS uuid
+        LANGUAGE sql
+        SECURITY DEFINER
+        AS $crypto_fn$
+          WITH new_dek AS (SELECT encode(gen_random_bytes(32), 'hex') AS dek_text)
+          INSERT INTO tenant_data_keys (tenant_id, dek_wrapped, created_by)
+          SELECT p_tenant_id, pgp_sym_encrypt(dek_text, p_kek), p_created_by FROM new_dek
+          ON CONFLICT (tenant_id) DO NOTHING
+          RETURNING tenant_id
+        $crypto_fn$""",
+    ),
+    # Students PII ciphertext columns. Plaintext columns kept during transition.
+    # v0.4.4 will route API reads/writes through the ciphertext columns;
+    # v0.4.5 drops the plaintext columns once stable.
+    (
+        "crypto_alter_students_add_first_name_ct",
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS first_name_ciphertext bytea",
+    ),
+    (
+        "crypto_alter_students_add_middle_name_ct",
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS middle_name_ciphertext bytea",
+    ),
+    (
+        "crypto_alter_students_add_last_name_ct",
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS last_name_ciphertext bytea",
+    ),
+    (
+        "crypto_alter_students_add_birth_date_ct",
+        "ALTER TABLE students ADD COLUMN IF NOT EXISTS birth_date_ciphertext bytea",
+    ),
 ]
 
 
@@ -298,6 +424,65 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
         log.info("migrations complete: %d ok, %d skipped", success_count, skip_count)
 
 
+async def run_crypto_setup(pool: asyncpg.Pool) -> None:
+    """v0.4.3: provision per-tenant DEKs and backfill students PII ciphertext.
+
+    Idempotent. Only does work where ciphertext is NULL or the tenant has no
+    DEK yet. Safe to re-run on every deploy. If FOCMS_KEK_MASTER is not set,
+    this skips entirely (and logs a warning); the rest of the API still
+    starts and serves traffic against the plaintext columns.
+    """
+    if not FOCMS_KEK_MASTER:
+        log.warning("crypto: FOCMS_KEK_MASTER not set; skipping DEK provisioning + PII backfill")
+        return
+
+    async with pool.acquire() as conn:
+        # Provision DEKs for any tenants without one. created_by is Stephen
+        # for now (the platform admin); when a self-serve onboarding flow
+        # exists, that user_id will replace this.
+        try:
+            stephen_uuid = "019ed384-56d8-77fb-bfe6-00b1d064da18"
+            tenants_needing = await conn.fetch("""
+                SELECT t.id FROM tenants t
+                LEFT JOIN tenant_data_keys k ON k.tenant_id = t.id
+                WHERE k.tenant_id IS NULL
+            """)
+            provisioned = 0
+            for r in tenants_needing:
+                # Use the provision function so the algorithm + key length
+                # stay consistent with any future call sites.
+                res = await conn.fetchval(
+                    "SELECT focms_provision_tenant_dek($1, $2, $3::uuid)",
+                    r["id"], FOCMS_KEK_MASTER, stephen_uuid,
+                )
+                if res is not None:
+                    provisioned += 1
+            log.info("crypto: provisioned %d new tenant DEK(s)", provisioned)
+        except Exception as exc:
+            log.warning("crypto: DEK provisioning failed: %s", exc)
+            return
+
+        # Backfill students PII ciphertext for any rows where the ciphertext
+        # column is NULL. One UPDATE handles all four columns; cast the date
+        # to text before encrypting so we can round-trip through pgp_sym.
+        # The WHERE clause makes this idempotent — re-runs are no-ops once
+        # ciphertext is populated.
+        try:
+            result = await conn.execute("""
+                UPDATE students SET
+                    first_name_ciphertext  = focms_encrypt_pii(tenant_id, first_name, $1),
+                    middle_name_ciphertext = focms_encrypt_pii(tenant_id, middle_name, $1),
+                    last_name_ciphertext   = focms_encrypt_pii(tenant_id, last_name, $1),
+                    birth_date_ciphertext  = focms_encrypt_pii(tenant_id, birth_date::text, $1),
+                    updated_at = now()
+                WHERE deleted_at IS NULL
+                  AND first_name_ciphertext IS NULL
+            """, FOCMS_KEK_MASTER)
+            log.info("crypto: students PII backfill - %s", result)
+        except Exception as exc:
+            log.warning("crypto: students backfill failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """asyncpg pool. PgBouncer transaction mode requires statement_cache_size=0."""
@@ -306,6 +491,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     log.info("DB pool ready")
     await run_migrations(app.state.pool)
+    await run_crypto_setup(app.state.pool)
     try:
         yield
     finally:
@@ -313,7 +499,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.4.2", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.4.3", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -447,8 +633,32 @@ async def write_audit(
 
 
 @app.get("/focms/v1/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.4.2"}
+async def health(request: Request) -> dict[str, Any]:
+    """Service health + crypto wiring sanity check.
+
+    The crypto subsection lets ops verify after deploy that the KEK env var
+    is configured and per-tenant DEKs are in place. Returns counts only —
+    never any key material.
+    """
+    payload: dict[str, Any] = {"status": "ok", "version": "0.4.3"}
+    crypto: dict[str, Any] = {"kek_set": FOCMS_KEK_MASTER is not None}
+    try:
+        async with request.app.state.pool.acquire() as conn:
+            crypto["dek_count"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM tenant_data_keys"
+            )
+            crypto["students_encrypted"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM students "
+                "WHERE deleted_at IS NULL AND first_name_ciphertext IS NOT NULL"
+            )
+            crypto["students_unencrypted"] = await conn.fetchval(
+                "SELECT COUNT(*) FROM students "
+                "WHERE deleted_at IS NULL AND first_name_ciphertext IS NULL"
+            )
+    except Exception as exc:
+        crypto["error"] = f"{type(exc).__name__}: {exc}"
+    payload["crypto"] = crypto
+    return payload
 
 
 @app.get("/focms/v1/types")
