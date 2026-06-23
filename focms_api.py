@@ -1,8 +1,17 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.4.0
+"""focms_api.py - FOCMS Data Provider REST API v0.4.2
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.4.2 (2026-06-23):
+- WP CPT porting Phase A (jrj_swim_race cutover): new GET
+  /focms/v1/student/{id}/computed/swim-race-log endpoint returns the full
+  swim race history sorted by date desc, with parsed details (distance,
+  stroke, course, time, meet, team, points, time standard, relay flag).
+  Replaces the WP jrj_swim_race CPT as the canonical race log data source
+  for johnrjordan.com. WP CPT will be deprecated in a subsequent release
+  once the WP page templates are updated to consume this endpoint.
 
 v0.4.1 (2026-06-22):
 - Self-contained student data: new GET /focms/v1/student/{id}/computed/swim-bests
@@ -51,6 +60,8 @@ Read endpoints:
     GET    /focms/v1/student/{student_id}/records?type=type
     GET    /focms/v1/student/{student_id}/target-universities
     GET    /focms/v1/student/{student_id}/computed/power-index
+    GET    /focms/v1/student/{student_id}/computed/swim-bests
+    GET    /focms/v1/student/{student_id}/computed/swim-race-log
 
 Write endpoints:
     POST   /focms/v1/archive_entries          (+ PATCH/GET/DELETE/append-detail)
@@ -302,7 +313,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.4.1", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.4.2", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +448,7 @@ async def write_audit(
 
 @app.get("/focms/v1/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok", "version": "0.4.1"}
+    return {"status": "ok", "version": "0.4.2"}
 
 
 @app.get("/focms/v1/types")
@@ -2532,6 +2543,104 @@ def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optiona
 
 
 # ===========================================================================
+# v0.4.2 — student-scoped swim race log feed (replaces WP jrj_swim_race CPT)
+@app.get("/focms/v1/student/{student_id}/computed/swim-race-log")
+async def get_swim_race_log_feed(
+    student_id: UUID, request: Request,
+    principal: dict = Depends(authenticate),
+    limit: int = 1000,
+    course: Optional[str] = None,
+    stroke: Optional[str] = None,
+    since: Optional[str] = None,
+) -> dict[str, Any]:
+    """Return the swim race log feed for the student (replaces WP jrj_swim_race CPT).
+
+    Returns all swim_race events sorted by event_date desc, with parsed details
+    (distance, stroke, course, time, meet, team, points, time standard, relay flag).
+
+    Optional query params:
+      - limit: max rows (default 1000)
+      - course: filter by SCY / SCM / LCM
+      - stroke: filter by FR / BK / BR / FL / IM
+      - since: ISO date (YYYY-MM-DD), only races on or after this date
+    """
+    where_clauses = [
+        "student_id = $1",
+        "event_type = 'swim_race'",
+        "deleted_at IS NULL",
+    ]
+    params: list[Any] = [student_id]
+
+    if course:
+        params.append(course.upper())
+        where_clauses.append(f"details->>'course' = ${len(params)}")
+    if stroke:
+        params.append(stroke.upper())
+        where_clauses.append(f"details->>'stroke' = ${len(params)}")
+    if since:
+        try:
+            since_d = date.fromisoformat(since)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f"invalid since date: {since!r}")
+        params.append(since_d)
+        where_clauses.append(f"event_date >= ${len(params)}")
+
+    params.append(int(limit))
+    limit_param = f"${len(params)}"
+
+    sql = f"""
+        SELECT source_id, title, event_date,
+               details::text AS details_json,
+               source_system, visibility
+        FROM events
+        WHERE {' AND '.join(where_clauses)}
+        ORDER BY event_date DESC, source_id DESC
+        LIMIT {limit_param}
+    """
+
+    async with tx(request, principal["tenant_id"]) as conn:
+        rows = await conn.fetch(sql, *params)
+
+    races = []
+    for r in rows:
+        d = json.loads(r["details_json"]) if r["details_json"] else {}
+        time_str = d.get("swim_time") or ""
+        is_relay = isinstance(time_str, str) and time_str.endswith("r")
+        time_clean = time_str.rstrip("r") if isinstance(time_str, str) else time_str
+        races.append({
+            "source_id": r["source_id"],
+            "date": r["event_date"].isoformat() if r["event_date"] else None,
+            "title": r["title"],
+            "distance_m": d.get("distance_m"),
+            "stroke": d.get("stroke"),
+            "course": d.get("course"),
+            "time": time_clean,
+            "is_relay_leg": is_relay,
+            "meet": d.get("meet"),
+            "team": d.get("team"),
+            "lsc": d.get("lsc"),
+            "age": d.get("age"),
+            "points": d.get("points"),
+            "time_standard": d.get("time_standard"),
+            "source_system": r["source_system"],
+            "visibility": r["visibility"],
+        })
+
+    return {
+        "student_id": str(student_id),
+        "total": len(races),
+        "races": races,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
+        "source_system": "focms_api/events",
+        "filters": {
+            "course": course,
+            "stroke": stroke,
+            "since": since,
+            "limit": limit,
+        },
+    }
+
+
 # v0.4.1 — media storage (binary blobs in Postgres)
 # ===========================================================================
 
