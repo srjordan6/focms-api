@@ -119,6 +119,7 @@ import asyncpg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from focms_addresses import router as addresses_router
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -513,8 +514,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.4.3", lifespan=lifespan)
-
+app = FastAPI(title="FOCMS Data Provider API", version="0.5.0", lifespan=lifespan)
+app.include_router(addresses_router)
 
 # ---------------------------------------------------------------------------
 # Auth
