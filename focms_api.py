@@ -1,4 +1,5 @@
-﻿"""focms_api.py - FOCMS Data Provider REST API v0.7.0
+﻿from fastapi.middleware.cors import CORSMiddleware
+"""focms_api.py - FOCMS Data Provider REST API v0.7.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
