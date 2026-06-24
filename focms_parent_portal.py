@@ -635,11 +635,11 @@ async def _save_one_field(
             )
             prior_value = row["v"] if row else None
 
-            sql = f'''INSERT INTO public.{src_table} (student_id, tenant_id, "{key_col}", "{src_col}")
-                     VALUES ($1, $2, $3, $4)
+            sql = f'''INSERT INTO public.{src_table} (student_id, tenant_id, created_by, "{key_col}", "{src_col}")
+                     VALUES ($1, $2, $3, $4, $5)
                      ON CONFLICT (student_id, "{key_col}") DO UPDATE
                      SET "{src_col}" = EXCLUDED."{src_col}", updated_at = now()'''
-            await conn.execute(sql, student_id, ctx.tenant_id, key_val, update.value)
+            await conn.execute(sql, student_id, ctx.tenant_id, ctx.token_id, key_val, update.value)
 
         elif pattern == "student_direct":
             row = await conn.fetchrow(
