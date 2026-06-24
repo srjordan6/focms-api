@@ -1,8 +1,23 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.5.0
+"""focms_api.py - FOCMS Data Provider REST API v0.6.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.6.0 (2026-06-24):
+- Internationalization (i18n) endpoints. New module focms_i18n.py defines:
+    GET   /focms/v1/i18n/strings          (batch UI string retrieval)
+    POST  /focms/v1/i18n/translate        (single text translation/transliteration/romanization)
+    POST  /focms/v1/i18n/translate-batch  (bulk translation for UI string seeding)
+  Powered by Google Cloud Translation API v2 (same API key as Places) with a
+  translation_cache table for memoization. Supports 29 locales out of the box;
+  any new locale added to the `locales` table works automatically. Free-text
+  parent input gets cached translations on first save; UI strings get cached
+  per (namespace, locale) pair forever (text meaning is stable). Names in
+  non-Latin scripts (Korean Hangul, Chinese Han, Japanese Kana, Arabic, Hindi,
+  Russian, Hebrew, Greek, Thai) get romanized via translation_kind='romanize'
+  so the same parent_supplied name flows through to UCA / Common App in Latin
+  script with the original native-script form preserved for parent display.
 
 v0.5.0 (2026-06-24):
 - Address autocomplete + validation + international phone validation.
@@ -120,6 +135,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from focms_addresses import router as addresses_router
+from focms_i18n import router as i18n_router
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -514,8 +530,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.6.0", lifespan=lifespan)
 app.include_router(addresses_router)
+app.include_router(i18n_router)
 
 # ---------------------------------------------------------------------------
 # Auth
