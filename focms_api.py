@@ -1,4 +1,4 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.7.0
+﻿"""focms_api.py - FOCMS Data Provider REST API v0.7.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
@@ -53,7 +53,7 @@ v0.4.3 (2026-06-23):
   `first_name_ciphertext`, `middle_name_ciphertext`, `last_name_ciphertext`,
   `birth_date_ciphertext` added to `students`. Existing tenant DEKs are
   provisioned and existing student PII is encrypted on startup (idempotent
-  â€” only encrypts where ciphertext column is NULL). Plaintext columns
+  Ã¢â‚¬â€ only encrypts where ciphertext column is NULL). Plaintext columns
   preserved during transition; v0.4.4 will route reads/writes through the
   encrypted columns; v0.4.5 drops the plaintext columns once stable.
 - Helper SQL functions exposed: focms_encrypt_pii(tenant, plaintext, kek),
@@ -172,7 +172,7 @@ log = logging.getLogger("focms-api")
 MIGRATIONS: list[tuple[str, str]] = [
     # Grant focms_app schema CREATE privilege so Claude can do DDL via MCP.
     # This is the one-time bootstrap that ends the "Stephen runs DDL via Render
-    # Postgres console" pain. Idempotent â€” re-running is a no-op.
+    # Postgres console" pain. Idempotent Ã¢â‚¬â€ re-running is a no-op.
     (
         "grant_schema_create_to_focms_app",
         "GRANT CREATE, USAGE ON SCHEMA public TO focms_app",
@@ -189,7 +189,7 @@ MIGRATIONS: list[tuple[str, str]] = [
         "ALTER DEFAULT PRIVILEGES FOR ROLE focms_user IN SCHEMA public "
         "GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO focms_app",
     ),
-    # public_showcases â€” per-student public showcase configuration.
+    # public_showcases Ã¢â‚¬â€ per-student public showcase configuration.
     # Each row maps a URL slug (e.g. "john") to a tenant + student plus
     # display config (theme, photo, tagline). Adding a new student becomes
     # a one-row INSERT instead of a code change + deploy.
@@ -253,7 +253,7 @@ MIGRATIONS: list[tuple[str, str]] = [
             END IF;
         END $do$""",
     ),
-    # Seed John's showcase row (idempotent â€” ON CONFLICT DO NOTHING).
+    # Seed John's showcase row (idempotent Ã¢â‚¬â€ ON CONFLICT DO NOTHING).
     # This is what makes outcomestar.app/john keep working after page.tsx
     # drops its hardcoded TENANTS constant.
     # Media storage: bytea blobs with MIME type. Sized for portraits and small
@@ -322,13 +322,13 @@ MIGRATIONS: list[tuple[str, str]] = [
             'john',
             'mission-control',
             'John Ray Jordan',
-            'Future astronaut Â· breaststroke specialist',
+            'Future astronaut Ã‚Â· breaststroke specialist',
             'https://johnrjordan.com/wp-content/uploads/2026/05/john-at-the-cotillion-Ball-03292026-2-2-scaled.jpg',
             'public'
         ) ON CONFLICT DO NOTHING""",
     ),
     # ----------------------------------------------------------------------
-    # v0.4.3 â€” per-tenant envelope encryption for PII at rest
+    # v0.4.3 Ã¢â‚¬â€ per-tenant envelope encryption for PII at rest
     # ----------------------------------------------------------------------
     # tenant_data_keys: stores per-tenant DEKs (data encryption keys) wrapped
     # with the master KEK (key encryption key). One row per tenant. The
@@ -357,7 +357,7 @@ MIGRATIONS: list[tuple[str, str]] = [
         "GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_data_keys TO focms_app",
     ),
     # Helper functions. All SECURITY DEFINER so the calling role doesn't need
-    # direct grants on tenant_data_keys â€” only EXECUTE on the function.
+    # direct grants on tenant_data_keys Ã¢â‚¬â€ only EXECUTE on the function.
     # KEK is passed explicitly on every call (no session GUC dependency) so
     # the helpers work identically from API, MCP, or psql.
     (
@@ -440,7 +440,7 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
 
     Each statement is wrapped in its own try/except so one failure does not
     block the rest from running. Failures are logged at WARNING level. The
-    service continues to start even if migrations partially fail â€” the
+    service continues to start even if migrations partially fail Ã¢â‚¬â€ the
     existing endpoints still work against the existing schema.
     """
     async with pool.acquire() as conn:
@@ -509,7 +509,7 @@ async def run_crypto_setup(pool: asyncpg.Pool) -> None:
         # Backfill students PII ciphertext for any rows where the ciphertext
         # column is NULL. One UPDATE handles all four columns; cast the date
         # to text before encrypting so we can round-trip through pgp_sym.
-        # The WHERE clause makes this idempotent â€” re-runs are no-ops once
+        # The WHERE clause makes this idempotent Ã¢â‚¬â€ re-runs are no-ops once
         # ciphertext is populated.
         try:
             result = await conn.execute("""
@@ -544,6 +544,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="FOCMS Data Provider API", version="0.7.0", lifespan=lifespan)
+# CORS - parent portal frontend at outcomestar.app
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://outcomestar.app",
+        "https://www.outcomestar.app",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.include_router(addresses_router)
 app.include_router(i18n_router)
 app.include_router(parent_portal_router)
@@ -683,7 +695,7 @@ async def health(request: Request) -> dict[str, Any]:
     """Service health + crypto wiring sanity check.
 
     The crypto subsection lets ops verify after deploy that the KEK env var
-    is configured and per-tenant DEKs are in place. Returns counts only â€”
+    is configured and per-tenant DEKs are in place. Returns counts only Ã¢â‚¬â€
     never any key material.
     """
     payload: dict[str, Any] = {"status": "ok", "version": "0.4.3"}
@@ -954,7 +966,7 @@ async def get_power_index(
 
 
 # ===========================================================================
-# v0.3.0 â€” Write surface
+# v0.3.0 Ã¢â‚¬â€ Write surface
 # ===========================================================================
 
 
@@ -2095,7 +2107,7 @@ async def create_digital_presence(
 
 
 # ===========================================================================
-# v0.4.0 â€” public_showcases endpoints
+# v0.4.0 Ã¢â‚¬â€ public_showcases endpoints
 # ===========================================================================
 
 
@@ -2218,7 +2230,7 @@ async def get_showcase_by_slug(
     """Look up a public showcase config by URL slug.
 
     Used by the outcomestar Next.js page router. Slug lookup is the entry
-    point for the public showcase â€” the returned tenant_id + student_id is
+    point for the public showcase Ã¢â‚¬â€ the returned tenant_id + student_id is
     then used to fetch the rest of the student data via tenant-scoped
     endpoints.
 
@@ -2397,7 +2409,7 @@ async def delete_public_showcase(
 
 
 # ===========================================================================
-# v0.4.1 â€” students CRUD
+# v0.4.1 Ã¢â‚¬â€ students CRUD
 # ===========================================================================
 
 
@@ -2580,7 +2592,7 @@ async def delete_student(
 
 
 # ===========================================================================
-# v0.4.1 â€” student-scoped swim bests feed (replaces hardcoded WP feed)
+# v0.4.1 Ã¢â‚¬â€ student-scoped swim bests feed (replaces hardcoded WP feed)
 # ===========================================================================
 
 USA_SWIMMING_TIERS_2024_2028_BOYS_11_12 = {
@@ -2799,7 +2811,7 @@ def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optiona
 
 
 # ===========================================================================
-# v0.4.2 â€” student-scoped swim race log feed (replaces WP jrj_swim_race CPT)
+# v0.4.2 Ã¢â‚¬â€ student-scoped swim race log feed (replaces WP jrj_swim_race CPT)
 @app.get("/focms/v1/student/{student_id}/computed/swim-race-log")
 async def get_swim_race_log_feed(
     student_id: UUID, request: Request,
@@ -2897,7 +2909,7 @@ async def get_swim_race_log_feed(
     }
 
 
-# v0.4.1 â€” media storage (binary blobs in Postgres)
+# v0.4.1 Ã¢â‚¬â€ media storage (binary blobs in Postgres)
 # ===========================================================================
 
 import base64 as _b64
