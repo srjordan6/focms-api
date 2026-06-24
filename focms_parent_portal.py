@@ -687,7 +687,7 @@ async def _save_one_field(
                     actor_user_id, actor_role, actor_ip, occurred_at, action,
                     tenant_id, student_id, target_table, target_id, field_changed,
                     prior_value, new_value, reason
-                ) VALUES ($1, 'parent', $2, now(), 'update', $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, 'parent_form_save')""",
+                ) VALUES ($1, 'tenant_admin', $2, now(), 'update', $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, 'parent_form_save')""",
                 ctx.token_id,
                 None,
                 ctx.tenant_id, student_id, src_table, update.record_id, src_col,
