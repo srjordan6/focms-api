@@ -1,4 +1,4 @@
-"""focms_parent_portal.py - Parent-facing API endpoints for FOCMS v0.7.0.
+﻿"""focms_parent_portal.py - Parent-facing API endpoints for FOCMS v0.7.0.
 
 Endpoints:
   POST  /focms/v1/parent/auth/verify-token
@@ -47,17 +47,11 @@ SAVE_TABLE_CONFIG: dict[str, dict] = {
     "veteran_military_status":  {"pattern": "one_to_one", "conflict_columns": ["student_id"]},
     "psychological_profile":    {"pattern": "one_to_one", "conflict_columns": ["student_id"]},
     "student_addresses": {
-        "pattern": "keyed_upsert", "key_column": "address_type",
-        "field_code_key_index": 1, "conflict_columns": ["student_id", "address_type"],
+        "pattern": "keyed_upsert", "key_column": "address_kind",
+        "field_code_key_index": 1, "conflict_columns": ["student_id", "address_kind"],
     },
-    "student_school_enrollments": {
-        "pattern": "keyed_upsert", "key_column": "enrollment_phase",
-        "field_code_key_index": 1, "conflict_columns": ["student_id", "enrollment_phase"],
-    },
-    "essays": {
-        "pattern": "keyed_upsert", "key_column": "essay_kind",
-        "field_code_key_index": 1, "conflict_columns": ["student_id", "essay_kind"],
-    },
+    "student_school_enrollments": {"pattern": "array_update"},
+    "essays": {"pattern": "array_update"},
     "students": {"pattern": "student_direct"},
     "family_members":            {"pattern": "array_update"},
     "work_experiences":          {"pattern": "array_update"},
@@ -284,6 +278,12 @@ def _coerce_for_json(val: Any) -> Any:
         return None
     if isinstance(val, (str, int, float, bool)):
         return val
+    if isinstance(val, bytes):
+        return "<encrypted:" + str(len(val)) + "b>"
+    if isinstance(val, list):
+        return [_coerce_for_json(v) for v in val]
+    if isinstance(val, dict):
+        return {str(k): _coerce_for_json(v) for k, v in val.items()}
     if hasattr(val, "isoformat"):
         return val.isoformat()
     return str(val)
@@ -391,33 +391,41 @@ async def _fetch_current_values(conn: asyncpg.Connection, student_id: UUID, form
 
     if "student_personal_details" in by_table:
         cols = [f["source_column"] for f in by_table["student_personal_details"]
-                if f.get("source_column") and SAFE_IDENTIFIER.match(f["source_column"])]
+                if f.get("source_column") and SAFE_IDENTIFIER.match(f["source_column"])
+                and not f["source_column"].endswith("_ciphertext")]
         if cols:
-            col_list = ", ".join(f'"{c}"' for c in cols)
-            row = await conn.fetchrow(
-                f"SELECT {col_list} FROM public.student_personal_details WHERE student_id = $1",
-                student_id,
-            )
-            if row:
-                for field in by_table["student_personal_details"]:
-                    col = field.get("source_column")
-                    if col and col in row:
-                        values[field["field_code"]] = _coerce_for_json(row[col])
+            try:
+                col_list = ", ".join(f'"{c}"' for c in cols)
+                row = await conn.fetchrow(
+                    f"SELECT {col_list} FROM public.student_personal_details WHERE student_id = $1",
+                    student_id,
+                )
+                if row:
+                    for field in by_table["student_personal_details"]:
+                        col = field.get("source_column")
+                        if col and col in row:
+                            values[field["field_code"]] = _coerce_for_json(row[col])
+            except Exception:
+                logger.warning("student_personal_details read failed", exc_info=True)
 
     if "students" in by_table:
         cols = [f["source_column"] for f in by_table["students"]
-                if f.get("source_column") and SAFE_IDENTIFIER.match(f["source_column"])]
+                if f.get("source_column") and SAFE_IDENTIFIER.match(f["source_column"])
+                and not f["source_column"].endswith("_ciphertext")]
         if cols:
-            col_list = ", ".join(f'"{c}"' for c in cols)
-            row = await conn.fetchrow(
-                f"SELECT {col_list} FROM public.students WHERE id = $1",
-                student_id,
-            )
-            if row:
-                for field in by_table["students"]:
-                    col = field.get("source_column")
-                    if col and col in row:
-                        values[field["field_code"]] = _coerce_for_json(row[col])
+            try:
+                col_list = ", ".join(f'"{c}"' for c in cols)
+                row = await conn.fetchrow(
+                    f"SELECT {col_list} FROM public.students WHERE id = $1",
+                    student_id,
+                )
+                if row:
+                    for field in by_table["students"]:
+                        col = field.get("source_column")
+                        if col and col in row:
+                            values[field["field_code"]] = _coerce_for_json(row[col])
+            except Exception:
+                logger.warning("students read failed", exc_info=True)
 
     if "student_addresses" in by_table:
         by_type: dict[str, list[dict]] = {}
@@ -426,18 +434,22 @@ async def _fetch_current_values(conn: asyncpg.Connection, student_id: UUID, form
             by_type.setdefault(key, []).append(f)
         for addr_type, fields in by_type.items():
             cols = [f["source_column"] for f in fields
-                    if f.get("source_column") and SAFE_IDENTIFIER.match(f["source_column"])]
+                    if f.get("source_column") and SAFE_IDENTIFIER.match(f["source_column"])
+                    and not f["source_column"].endswith("_ciphertext")]
             if cols:
-                col_list = ", ".join(f'"{c}"' for c in cols)
-                row = await conn.fetchrow(
-                    f"SELECT {col_list} FROM public.student_addresses WHERE student_id=$1 AND address_type=$2",
-                    student_id, addr_type,
-                )
-                if row:
-                    for field in fields:
-                        col = field.get("source_column")
-                        if col and col in row:
-                            values[field["field_code"]] = _coerce_for_json(row[col])
+                try:
+                    col_list = ", ".join(f'"{c}"' for c in cols)
+                    row = await conn.fetchrow(
+                        f"SELECT {col_list} FROM public.student_addresses WHERE student_id=$1 AND address_kind=$2",
+                        student_id, addr_type,
+                    )
+                    if row:
+                        for field in fields:
+                            col = field.get("source_column")
+                            if col and col in row:
+                                values[field["field_code"]] = _coerce_for_json(row[col])
+                except Exception:
+                    logger.warning("student_addresses %s read failed", addr_type, exc_info=True)
 
     for tbl in ("veteran_military_status", "psychological_profile"):
         if tbl in by_table:
