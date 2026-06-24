@@ -1,8 +1,22 @@
-"""focms_api.py - FOCMS Data Provider REST API v0.4.3
+"""focms_api.py - FOCMS Data Provider REST API v0.5.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.5.0 (2026-06-24):
+- Address autocomplete + validation + international phone validation.
+  New endpoints (defined in focms_addresses.py):
+    POST   /focms/v1/addresses/autocomplete
+    POST   /focms/v1/addresses/{address_id}/validate
+    POST   /focms/v1/phones/validate
+  Powered by Google Places API (autocomplete + place details) with a 7-day
+  Postgres-backed suggestion cache. Address validation persists every
+  attempt to address_validations (full audit) and updates the
+  student_addresses row with standardized + verified fields.
+  Phone validation backed by SQL fn_validate_phone() across 21 countries;
+  libphonenumber Python upgrade comes in v0.6.0 with same JSON contract.
+  USPS v3 deferred (vendor portal mid-relaunch until 2026-07-12).
 
 v0.4.3 (2026-06-23):
 - PII encryption at rest. Per-tenant envelope encryption using pgcrypto's
