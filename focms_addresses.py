@@ -6,6 +6,14 @@ Drops in alongside focms_api.py. Wired up by adding 3 lines to focms_api.py:
     # ...inside app creation:
     app.include_router(addresses_router)
 
+v0.5.0a (2026-06-24):
+- Hotfix: every DB acquire wrapped in `async with conn.transaction():` and
+  tenant binding moved to parameterized `SELECT set_config('app.current_tenant_id',
+  $1, true)` — matches the proven tx() helper in focms_api.py. The original
+  v0.5.0 release used raw SET LOCAL outside a transaction, which Postgres
+  rejects, so every endpoint returned 500 on the first DB call. No API-contract
+  change; only the internal implementation.
+
 v0.5.0 (2026-06-24):
 - POST /focms/v1/addresses/autocomplete           Google Places (New) proxy
                                                   with 7-day Postgres cache.
@@ -95,9 +103,15 @@ def _require_write_role(auth: AuthContext) -> None:
         raise HTTPException(403, f"role {auth.role!r} cannot write")
 
 
-async def _set_tenant_context(conn: asyncpg.Connection, tenant_id: UUID) -> None:
-    # PgBouncer transaction mode: parameterized SET LOCAL hangs, must be literal.
-    await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+async def _bind_tenant(conn: asyncpg.Connection, tenant_id: UUID) -> None:
+    """Set the per-request tenant id for RLS. MUST be called inside an
+    `async with conn.transaction():` block so set_config(..., is_local=true)
+    survives subsequent statements in the same transaction. Matches the
+    pattern used by tx() in focms_api.py."""
+    await conn.execute(
+        "SELECT set_config('app.current_tenant_id', $1, true)",
+        str(tenant_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,51 +327,52 @@ async def addresses_autocomplete(
         )
 
     async with pool.acquire() as conn:
-        await _set_tenant_context(conn, auth.tenant_id)
+        async with conn.transaction():
+            await _bind_tenant(conn, auth.tenant_id)
 
-        # Cache lookup
-        cached = await conn.fetchrow(
-            """
-            SELECT id, suggestions, suggestion_count, cache_hits,
-                   cache_expires_at, response_received_at
-            FROM public.address_suggestions_cache
-            WHERE provider_code = $1
-              AND lower(query_input) = lower($2)
-              AND coalesce(query_country_bias,'') = coalesce($3,'')
-              AND coalesce(query_language,'en') = coalesce($4,'en')
-              AND cache_expires_at > now()
-            ORDER BY response_received_at DESC
-            LIMIT 1
-            """,
-            provider,
-            body.query,
-            body.country_iso2_bias,
-            body.language,
-        )
-        if cached:
-            # Bump cache hit counter (best effort, ignore failures)
-            try:
-                await conn.execute(
-                    "UPDATE public.address_suggestions_cache "
-                    "SET cache_hits = cache_hits + 1, "
-                    "    cache_last_used_at = now() "
-                    "WHERE id = $1",
-                    cached["id"],
-                )
-            except Exception:
-                logger.warning("cache hit counter bump failed", exc_info=True)
-
-            sugg_raw = cached["suggestions"]
-            if isinstance(sugg_raw, str):
-                sugg_raw = json.loads(sugg_raw)
-            return AutocompleteResponse(
-                source="cache",
-                provider=provider,
-                suggestion_count=cached["suggestion_count"],
-                suggestions=[AutocompleteSuggestion(**s) for s in sugg_raw],
-                cache_hits=cached["cache_hits"] + 1,
-                cache_expires_at=cached["cache_expires_at"],
+            # Cache lookup
+            cached = await conn.fetchrow(
+                """
+                SELECT id, suggestions, suggestion_count, cache_hits,
+                       cache_expires_at, response_received_at
+                FROM public.address_suggestions_cache
+                WHERE provider_code = $1
+                  AND lower(query_input) = lower($2)
+                  AND coalesce(query_country_bias,'') = coalesce($3,'')
+                  AND coalesce(query_language,'en') = coalesce($4,'en')
+                  AND cache_expires_at > now()
+                ORDER BY response_received_at DESC
+                LIMIT 1
+                """,
+                provider,
+                body.query,
+                body.country_iso2_bias,
+                body.language,
             )
+            if cached:
+                # Bump cache hit counter (best effort, ignore failures)
+                try:
+                    await conn.execute(
+                        "UPDATE public.address_suggestions_cache "
+                        "SET cache_hits = cache_hits + 1, "
+                        "    cache_last_used_at = now() "
+                        "WHERE id = $1",
+                        cached["id"],
+                    )
+                except Exception:
+                    logger.warning("cache hit counter bump failed", exc_info=True)
+
+                sugg_raw = cached["suggestions"]
+                if isinstance(sugg_raw, str):
+                    sugg_raw = json.loads(sugg_raw)
+                return AutocompleteResponse(
+                    source="cache",
+                    provider=provider,
+                    suggestion_count=cached["suggestion_count"],
+                    suggestions=[AutocompleteSuggestion(**s) for s in sugg_raw],
+                    cache_hits=cached["cache_hits"] + 1,
+                    cache_expires_at=cached["cache_expires_at"],
+                )
 
     # Cache miss -> call Google Places live
     raw = await _gplaces_autocomplete(
@@ -367,29 +382,30 @@ async def addresses_autocomplete(
 
     # Persist to cache
     async with pool.acquire() as conn:
-        await _set_tenant_context(conn, auth.tenant_id)
-        try:
-            await conn.execute(
-                """
-                INSERT INTO public.address_suggestions_cache (
-                    tenant_id, provider_code, query_input, query_country_bias,
-                    query_language, query_session_token, suggestions,
-                    suggestion_count, created_by
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
-                """,
-                auth.tenant_id,
-                provider,
-                body.query,
-                body.country_iso2_bias,
-                body.language,
-                body.session_token,
-                json.dumps([s.model_dump() for s in suggestions]),
-                len(suggestions),
-                auth.user_id,
-            )
-        except asyncpg.UniqueViolationError:
-            # Concurrent insert beat us — fine
-            pass
+        async with conn.transaction():
+            await _bind_tenant(conn, auth.tenant_id)
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO public.address_suggestions_cache (
+                        tenant_id, provider_code, query_input, query_country_bias,
+                        query_language, query_session_token, suggestions,
+                        suggestion_count, created_by
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
+                    """,
+                    auth.tenant_id,
+                    provider,
+                    body.query,
+                    body.country_iso2_bias,
+                    body.language,
+                    body.session_token,
+                    json.dumps([s.model_dump() for s in suggestions]),
+                    len(suggestions),
+                    auth.user_id,
+                )
+            except asyncpg.UniqueViolationError:
+                # Concurrent insert beat us — fine
+                pass
 
     return AutocompleteResponse(
         source="live" if suggestions else "no_results",
@@ -412,71 +428,72 @@ async def addresses_validate(
     pool: asyncpg.Pool = request.app.state.pool
 
     async with pool.acquire() as conn:
-        await _set_tenant_context(conn, auth.tenant_id)
+        async with conn.transaction():
+            await _bind_tenant(conn, auth.tenant_id)
 
-        addr = await conn.fetchrow(
-            """
-            SELECT id, student_id, tenant_id, country_iso2, country, place_id,
-                   street_address, street_address_line_2, street_address_line_3,
-                   building_or_district, city_town, state_province,
-                   subdivision_iso, zip_postal_code, validation_status
-            FROM public.student_addresses
-            WHERE id = $1 AND deleted_at IS NULL
-            """,
-            address_id,
-        )
-        if not addr:
-            raise HTTPException(404, f"address {address_id} not found")
-
-        # If already verified and not forcing, return the latest validation row.
-        if (
-            not body.force_revalidate
-            and addr["validation_status"] in ("verified", "geocoded")
-        ):
-            existing = await conn.fetchrow(
+            addr = await conn.fetchrow(
                 """
-                SELECT id, is_valid, is_deliverable, provider_code,
-                       standardized_formatted_address, standardized_street_line_1,
-                       standardized_city, standardized_subdivision_iso,
-                       standardized_postal_code, standardized_country_iso2,
-                       lat, lng, confidence_score, was_cached_response
-                FROM public.address_validations
-                WHERE source_table = 'student_addresses'
-                  AND source_record_id = $1
-                ORDER BY created_at DESC LIMIT 1
+                SELECT id, student_id, tenant_id, country_iso2, country, place_id,
+                       street_address, street_address_line_2, street_address_line_3,
+                       building_or_district, city_town, state_province,
+                       subdivision_iso, zip_postal_code, validation_status
+                FROM public.student_addresses
+                WHERE id = $1 AND deleted_at IS NULL
                 """,
                 address_id,
             )
-            if existing:
-                return ValidateAddressResponse(
-                    validation_id=existing["id"],
-                    is_valid=existing["is_valid"],
-                    is_deliverable=existing["is_deliverable"],
-                    provider=existing["provider_code"],
-                    standardized={
-                        "street_line_1": existing["standardized_street_line_1"],
-                        "city": existing["standardized_city"],
-                        "subdivision_iso": existing["standardized_subdivision_iso"],
-                        "postal_code": existing["standardized_postal_code"],
-                        "country_iso2": existing["standardized_country_iso2"],
-                        "formatted_address": existing["standardized_formatted_address"],
-                        "lat": float(existing["lat"]) if existing["lat"] is not None else None,
-                        "lng": float(existing["lng"]) if existing["lng"] is not None else None,
-                    },
-                    confidence_score=float(existing["confidence_score"])
-                        if existing["confidence_score"] is not None else None,
-                    messages=["already verified; pass force_revalidate=true to re-run"],
-                    was_cached_response=True,
-                )
+            if not addr:
+                raise HTTPException(404, f"address {address_id} not found")
 
-        # Resolve provider
-        provider = body.provider
-        if not provider:
-            country = (addr["country_iso2"] or "").upper()
-            provider = (
-                DEFAULT_VALIDATE_PROVIDER_US if country == "US"
-                else DEFAULT_VALIDATE_PROVIDER_INTERNATIONAL
-            )
+            # If already verified and not forcing, return the latest validation row.
+            if (
+                not body.force_revalidate
+                and addr["validation_status"] in ("verified", "geocoded")
+            ):
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id, is_valid, is_deliverable, provider_code,
+                           standardized_formatted_address, standardized_street_line_1,
+                           standardized_city, standardized_subdivision_iso,
+                           standardized_postal_code, standardized_country_iso2,
+                           lat, lng, confidence_score, was_cached_response
+                    FROM public.address_validations
+                    WHERE source_table = 'student_addresses'
+                      AND source_record_id = $1
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    address_id,
+                )
+                if existing:
+                    return ValidateAddressResponse(
+                        validation_id=existing["id"],
+                        is_valid=existing["is_valid"],
+                        is_deliverable=existing["is_deliverable"],
+                        provider=existing["provider_code"],
+                        standardized={
+                            "street_line_1": existing["standardized_street_line_1"],
+                            "city": existing["standardized_city"],
+                            "subdivision_iso": existing["standardized_subdivision_iso"],
+                            "postal_code": existing["standardized_postal_code"],
+                            "country_iso2": existing["standardized_country_iso2"],
+                            "formatted_address": existing["standardized_formatted_address"],
+                            "lat": float(existing["lat"]) if existing["lat"] is not None else None,
+                            "lng": float(existing["lng"]) if existing["lng"] is not None else None,
+                        },
+                        confidence_score=float(existing["confidence_score"])
+                            if existing["confidence_score"] is not None else None,
+                        messages=["already verified; pass force_revalidate=true to re-run"],
+                        was_cached_response=True,
+                    )
+
+            # Resolve provider
+            provider = body.provider
+            if not provider:
+                country = (addr["country_iso2"] or "").upper()
+                provider = (
+                    DEFAULT_VALIDATE_PROVIDER_US if country == "US"
+                    else DEFAULT_VALIDATE_PROVIDER_INTERNATIONAL
+                )
 
     # Currently only google_places is wired live. USPS v3 deferred; SmartyStreets US deferred.
     if provider != "google_places":
@@ -500,36 +517,37 @@ async def addresses_validate(
         if not suggestions:
             # Persist a validation row anyway (no match)
             async with pool.acquire() as conn:
-                await _set_tenant_context(conn, auth.tenant_id)
-                vid = await conn.fetchval(
-                    """
-                    INSERT INTO public.address_validations (
-                        tenant_id, student_id, source_table, source_record_id,
-                        provider_code, validation_kind, request_input,
-                        response_status_code, response_received_at,
-                        is_valid, is_deliverable, validation_messages,
-                        was_cached_response, created_by
-                    ) VALUES (
-                        $1, $2, 'student_addresses', $3,
-                        $4, 'validate', $5::jsonb,
-                        200, now(),
-                        false, false, $6::jsonb,
-                        false, $7
+                async with conn.transaction():
+                    await _bind_tenant(conn, auth.tenant_id)
+                    vid = await conn.fetchval(
+                        """
+                        INSERT INTO public.address_validations (
+                            tenant_id, student_id, source_table, source_record_id,
+                            provider_code, validation_kind, request_input,
+                            response_status_code, response_received_at,
+                            is_valid, is_deliverable, validation_messages,
+                            was_cached_response, created_by
+                        ) VALUES (
+                            $1, $2, 'student_addresses', $3,
+                            $4, 'validate', $5::jsonb,
+                            200, now(),
+                            false, false, $6::jsonb,
+                            false, $7
+                        )
+                        RETURNING id
+                        """,
+                        auth.tenant_id, addr["student_id"], address_id, provider,
+                        json.dumps({"query": query}),
+                        json.dumps(["google places returned no suggestions for this query"]),
+                        auth.user_id,
                     )
-                    RETURNING id
-                    """,
-                    auth.tenant_id, addr["student_id"], address_id, provider,
-                    json.dumps({"query": query}),
-                    json.dumps(["google places returned no suggestions for this query"]),
-                    auth.user_id,
-                )
-                await conn.execute(
-                    "UPDATE public.student_addresses "
-                    "SET validation_status='rejected', validation_source=$2, "
-                    "    validated_at=now(), updated_at=now() "
-                    "WHERE id=$1",
-                    address_id, provider,
-                )
+                    await conn.execute(
+                        "UPDATE public.student_addresses "
+                        "SET validation_status='rejected', validation_source=$2, "
+                        "    validated_at=now(), updated_at=now() "
+                        "WHERE id=$1",
+                        address_id, provider,
+                    )
             return ValidateAddressResponse(
                 validation_id=vid,
                 is_valid=False,
@@ -566,83 +584,84 @@ async def addresses_validate(
     }
 
     async with pool.acquire() as conn:
-        await _set_tenant_context(conn, auth.tenant_id)
+        async with conn.transaction():
+            await _bind_tenant(conn, auth.tenant_id)
 
-        validation_id = await conn.fetchval(
-            """
-            INSERT INTO public.address_validations (
-                tenant_id, student_id, source_table, source_record_id,
-                provider_code, validation_kind,
-                request_input, response_raw,
-                response_status_code, response_received_at,
+            validation_id = await conn.fetchval(
+                """
+                INSERT INTO public.address_validations (
+                    tenant_id, student_id, source_table, source_record_id,
+                    provider_code, validation_kind,
+                    request_input, response_raw,
+                    response_status_code, response_received_at,
+                    is_valid, is_deliverable,
+                    standardized_street_line_1, standardized_street_line_2,
+                    standardized_city, standardized_subdivision_iso,
+                    standardized_postal_code, standardized_country_iso2,
+                    standardized_formatted_address,
+                    lat, lng,
+                    external_place_id, confidence_score,
+                    was_cached_response, created_by
+                ) VALUES (
+                    $1, $2, 'student_addresses', $3,
+                    $4, 'validate',
+                    $5::jsonb, $6::jsonb,
+                    200, now(),
+                    $7, $8,
+                    $9, $10, $11, $12, $13, $14, $15,
+                    $16, $17,
+                    $18, $19,
+                    false, $20
+                )
+                RETURNING id
+                """,
+                auth.tenant_id, addr["student_id"], address_id,
+                provider,
+                json.dumps({"place_id": place_id}), json.dumps(details),
                 is_valid, is_deliverable,
-                standardized_street_line_1, standardized_street_line_2,
-                standardized_city, standardized_subdivision_iso,
-                standardized_postal_code, standardized_country_iso2,
-                standardized_formatted_address,
+                parsed.get("street_line_1"), parsed.get("street_line_2"),
+                parsed.get("city"), parsed.get("subdivision_iso"),
+                parsed.get("postal_code"), parsed.get("country_iso2"),
+                formatted,
                 lat, lng,
-                external_place_id, confidence_score,
-                was_cached_response, created_by
-            ) VALUES (
-                $1, $2, 'student_addresses', $3,
-                $4, 'validate',
-                $5::jsonb, $6::jsonb,
-                200, now(),
-                $7, $8,
-                $9, $10, $11, $12, $13, $14, $15,
-                $16, $17,
-                $18, $19,
-                false, $20
+                place_id, 1.0 if is_valid else 0.0,
+                auth.user_id,
             )
-            RETURNING id
-            """,
-            auth.tenant_id, addr["student_id"], address_id,
-            provider,
-            json.dumps({"place_id": place_id}), json.dumps(details),
-            is_valid, is_deliverable,
-            parsed.get("street_line_1"), parsed.get("street_line_2"),
-            parsed.get("city"), parsed.get("subdivision_iso"),
-            parsed.get("postal_code"), parsed.get("country_iso2"),
-            formatted,
-            lat, lng,
-            place_id, 1.0 if is_valid else 0.0,
-            auth.user_id,
-        )
 
-        # Update the student_addresses row with standardized + verified fields
-        await conn.execute(
-            """
-            UPDATE public.student_addresses
-            SET street_address = COALESCE($2, street_address),
-                street_address_line_2 = COALESCE($3, street_address_line_2),
-                building_or_district = COALESCE($4, building_or_district),
-                city_town = COALESCE($5, city_town),
-                state_province = COALESCE($6, state_province),
-                subdivision_iso = COALESCE($7, subdivision_iso),
-                subdivision_name = COALESCE($8, subdivision_name),
-                zip_postal_code = COALESCE($9, zip_postal_code),
-                country = COALESCE($10, country),
-                country_iso2 = COALESCE($11, country_iso2),
-                formatted_address = COALESCE($12, formatted_address),
-                lat = COALESCE($13, lat),
-                lng = COALESCE($14, lng),
-                validation_status = $15,
-                validation_source = $16,
-                validated_at = now(),
-                updated_at = now()
-            WHERE id = $1
-            """,
-            address_id,
-            parsed.get("street_line_1"), parsed.get("street_line_2"),
-            parsed.get("building_or_district"),
-            parsed.get("city"), parsed.get("subdivision_name"),
-            parsed.get("subdivision_iso"), parsed.get("subdivision_name"),
-            parsed.get("postal_code"), parsed.get("country_name"),
-            parsed.get("country_iso2"),
-            formatted, lat, lng,
-            "verified" if is_valid else "rejected",
-            provider,
-        )
+            # Update the student_addresses row with standardized + verified fields
+            await conn.execute(
+                """
+                UPDATE public.student_addresses
+                SET street_address = COALESCE($2, street_address),
+                    street_address_line_2 = COALESCE($3, street_address_line_2),
+                    building_or_district = COALESCE($4, building_or_district),
+                    city_town = COALESCE($5, city_town),
+                    state_province = COALESCE($6, state_province),
+                    subdivision_iso = COALESCE($7, subdivision_iso),
+                    subdivision_name = COALESCE($8, subdivision_name),
+                    zip_postal_code = COALESCE($9, zip_postal_code),
+                    country = COALESCE($10, country),
+                    country_iso2 = COALESCE($11, country_iso2),
+                    formatted_address = COALESCE($12, formatted_address),
+                    lat = COALESCE($13, lat),
+                    lng = COALESCE($14, lng),
+                    validation_status = $15,
+                    validation_source = $16,
+                    validated_at = now(),
+                    updated_at = now()
+                WHERE id = $1
+                """,
+                address_id,
+                parsed.get("street_line_1"), parsed.get("street_line_2"),
+                parsed.get("building_or_district"),
+                parsed.get("city"), parsed.get("subdivision_name"),
+                parsed.get("subdivision_iso"), parsed.get("subdivision_name"),
+                parsed.get("postal_code"), parsed.get("country_name"),
+                parsed.get("country_iso2"),
+                formatted, lat, lng,
+                "verified" if is_valid else "rejected",
+                provider,
+            )
 
     return ValidateAddressResponse(
         validation_id=validation_id,
@@ -673,11 +692,12 @@ async def phones_validate(
     """
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
-        await _set_tenant_context(conn, auth.tenant_id)
-        result = await conn.fetchval(
-            "SELECT public.fn_validate_phone($1, $2)",
-            body.phone_text, body.country_iso2.upper(),
-        )
+        async with conn.transaction():
+            await _bind_tenant(conn, auth.tenant_id)
+            result = await conn.fetchval(
+                "SELECT public.fn_validate_phone($1, $2)",
+                body.phone_text, body.country_iso2.upper(),
+            )
     if isinstance(result, str):
         result = json.loads(result)
     return result
