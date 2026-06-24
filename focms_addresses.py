@@ -6,6 +6,13 @@ Drops in alongside focms_api.py. Wired up by adding 3 lines to focms_api.py:
     # ...inside app creation:
     app.include_router(addresses_router)
 
+v0.5.0b (2026-06-24):
+- Hotfix #2: cast jsonb returns to text in SQL (fn_validate_phone()::text,
+  suggestions::text) so asyncpg can decode them. PgBouncer transaction mode
+  + statement_cache_size=0 disables asyncpg's binary jsonb codec; without the
+  text cast, every fetchval/fetchrow against a jsonb-returning query crashes.
+  Same pattern documented in focms_api.py at the get_records endpoint.
+
 v0.5.0a (2026-06-24):
 - Hotfix: every DB acquire wrapped in `async with conn.transaction():` and
   tenant binding moved to parameterized `SELECT set_config('app.current_tenant_id',
@@ -333,7 +340,7 @@ async def addresses_autocomplete(
             # Cache lookup
             cached = await conn.fetchrow(
                 """
-                SELECT id, suggestions, suggestion_count, cache_hits,
+                SELECT id, suggestions::text AS suggestions, suggestion_count, cache_hits,
                        cache_expires_at, response_received_at
                 FROM public.address_suggestions_cache
                 WHERE provider_code = $1
@@ -695,7 +702,7 @@ async def phones_validate(
         async with conn.transaction():
             await _bind_tenant(conn, auth.tenant_id)
             result = await conn.fetchval(
-                "SELECT public.fn_validate_phone($1, $2)",
+                "SELECT public.fn_validate_phone($1, $2)::text",
                 body.phone_text, body.country_iso2.upper(),
             )
     if isinstance(result, str):
