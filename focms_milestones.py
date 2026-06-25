@@ -1,6 +1,9 @@
 """focms_milestones.py - Life milestones tracking for the FOCMS parent portal.
 
-v0.8.0 (2026-06-25) - Millstones and Milestones pillar.
+v0.8.1 (2026-06-25) - Millstones and Milestones pillar.
+  - v0.8.1: corrected imports to use _require_parent_token (FastAPI Depends pattern),
+            request.app.state.pool for DB acquisition, _bind_tenant for RLS context.
+            v0.8.0 had wrong import names (_resolve_parent_token / _get_conn).
 
 Endpoints (all on /focms/v1/parent/students/{student_id}/milestones):
 
@@ -27,21 +30,17 @@ Data destinations:
   - Custom catalog rows:  life_milestones_catalog (tenant_id = ctx.tenant_id)
   - Audit trail:          audit_log (actor_role='tenant_admin', actor_user_id=NULL)
 
-Token verification re-uses the parent portal's _resolve_parent_token. The audit_log
-write is wrapped in a SAVEPOINT so FK violations on actor_user_id (which we
-intentionally pass as NULL, since parent tokens are not users.id principals) do
-not poison the parent INSERT transaction. Pattern established in v0.7.5.
+Token verification re-uses _require_parent_token from focms_parent_portal as a
+FastAPI dependency. The audit_log write is wrapped in a SAVEPOINT so FK violations
+on actor_user_id (which we intentionally pass as NULL, since parent tokens are not
+users.id principals) do not poison the parent INSERT transaction. Pattern
+established in v0.7.5.
 
 Deployment:
   1. Upload this file alongside focms_parent_portal.py and focms_api.py at repo root.
   2. In focms_api.py add (near the other include_router calls):
          from focms_milestones import router as milestones_router
          app.include_router(milestones_router)
-  3. Manual Build on Render (Web Services auto-deploy, but explicit Build is safer).
-
-Carry-forward from v0.7.5:
-  - audit_log writes use NULL actor_user_id when actor is a parent_access_tokens UUID
-  - SAVEPOINT-wrapped audit_log inserts
 """
 from __future__ import annotations
 
@@ -53,12 +52,13 @@ from typing import Any, Optional
 from uuid import UUID
 
 import asyncpg
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
-# Re-use the existing parent portal token resolver and DB connection helper.
-# These were added in v0.7.0 and are stable across v0.7.x.
-from focms_parent_portal import _resolve_parent_token, _get_conn, ParentContext
+# Re-use the existing parent portal token resolver, RLS binder, and context type.
+# v0.7.0 names: _require_parent_token (FastAPI dependency), _bind_tenant (RLS),
+# ParentContext (dataclass with tenant_id, student_id, token_id, ...).
+from focms_parent_portal import _require_parent_token, _bind_tenant, ParentContext
 
 logger = logging.getLogger("focms.milestones")
 
@@ -136,11 +136,17 @@ class CustomMilestoneRequest(BaseModel):
 
 _SLUG_RE = re.compile(r"[^a-z0-9_]+")
 
+
 def _slugify(s: str, max_len: int = 50) -> str:
     """Lowercase, replace non-alphanumerics with _, trim length, dedupe underscores."""
     slug = _SLUG_RE.sub("_", s.lower()).strip("_")
     slug = re.sub(r"_+", "_", slug)
     return slug[:max_len] if len(slug) > max_len else slug
+
+
+def _assert_student_match(ctx: ParentContext, student_id: UUID) -> None:
+    if str(ctx.student_id) != str(student_id):
+        raise HTTPException(403, "Token does not authorize access to this student.")
 
 
 async def _audit_log_milestone(
@@ -174,16 +180,10 @@ async def _audit_log_milestone(
                 json.dumps(details, default=str),
             )
     except Exception as e:
-        # Non-blocking: audit failures must not fail the parent's milestone write.
         logger.warning(
             "milestone audit_log failed (action=%s target=%s/%s): %s",
             action, target_table, target_id, e,
         )
-
-
-def _assert_student_match(ctx: ParentContext, student_id: UUID) -> None:
-    if str(ctx.student_id) != str(student_id):
-        raise HTTPException(403, "Token does not authorize access to this student.")
 
 
 # ============================================================================
@@ -197,88 +197,90 @@ def _assert_student_match(ctx: ParentContext, student_id: UUID) -> None:
 async def get_milestone_picker(
     student_id: UUID,
     request: Request,
-    t: Optional[str] = Query(default=None),
-    authorization: Optional[str] = Header(default=None),
+    ctx: ParentContext = Depends(_require_parent_token),
 ) -> MilestonePickerResponse:
     """Return the full milestone picker payload: catalog + custom events for this student."""
-    ctx = await _resolve_parent_token(request, t, authorization)
     _assert_student_match(ctx, student_id)
 
-    async with _get_conn(ctx.tenant_id) as conn:
-        bd_row = await conn.fetchrow(
-            "SELECT birth_date FROM students WHERE id = $1",
-            student_id,
-        )
-        if not bd_row:
-            raise HTTPException(404, "Student not found.")
-        birth_date = bd_row["birth_date"]
-        student_age: Optional[float] = None
-        if birth_date:
-            student_age = round((date.today() - birth_date).days / 365.25, 2)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _bind_tenant(conn, ctx.tenant_id)
 
-        # Picker query — catalog × this student's hits
-        catalog_rows = await conn.fetch(
-            """
-            WITH hit AS (
+            bd_row = await conn.fetchrow(
+                "SELECT birth_date FROM students WHERE id = $1",
+                student_id,
+            )
+            if not bd_row:
+                raise HTTPException(404, "Student not found.")
+            birth_date = bd_row["birth_date"]
+            student_age: Optional[float] = None
+            if birth_date:
+                student_age = round((date.today() - birth_date).days / 365.25, 2)
+
+            # Picker query — catalog × this student's hits
+            catalog_rows = await conn.fetch(
+                """
+                WITH hit AS (
+                    SELECT
+                        milestone_code AS code,
+                        MIN(event_date) AS first_hit,
+                        COUNT(*)        AS event_count,
+                        MIN(id)         AS milestone_id
+                    FROM student_life_milestones
+                    WHERE student_id = $1
+                      AND tenant_id  = $2
+                      AND deleted_at IS NULL
+                      AND milestone_code IS NOT NULL
+                    GROUP BY milestone_code
+                )
                 SELECT
-                    milestone_code AS code,
-                    MIN(event_date) AS first_hit,
-                    COUNT(*)        AS event_count,
-                    MIN(id)         AS milestone_id
+                    c.code, c.title, c.description, c.age_band,
+                    c.typical_age_min, c.typical_age_max,
+                    c.pillar, c.sub_pillar, c.category, c.universality,
+                    c.admission_traits_developed AS traits,
+                    CASE WHEN c.tenant_id IS NULL THEN 'platform' ELSE 'tenant_custom' END AS source_kind,
+                    CASE
+                        WHEN h.code IS NOT NULL THEN 'achieved'
+                        WHEN $3::numeric IS NULL THEN 'available'
+                        WHEN c.typical_age_max < $3::numeric THEN 'backfill_candidate'
+                        WHEN c.typical_age_min <= $3::numeric AND c.typical_age_max >= $3::numeric THEN 'now'
+                        WHEN c.typical_age_min > $3::numeric THEN 'upcoming'
+                        ELSE 'available'
+                    END AS status,
+                    h.first_hit,
+                    COALESCE(h.event_count, 0) AS event_count,
+                    h.milestone_id
+                FROM life_milestones_catalog c
+                LEFT JOIN hit h ON h.code = c.code
+                WHERE c.deleted_at IS NULL
+                  AND c.is_active = true
+                  AND (c.tenant_id IS NULL OR c.tenant_id = $2)
+                ORDER BY
+                    c.sort_order NULLS LAST,
+                    c.typical_age_min NULLS LAST,
+                    c.code
+                """,
+                student_id,
+                ctx.tenant_id,
+                student_age,
+            )
+
+            # Custom (non-catalog) events for this student
+            custom_rows = await conn.fetch(
+                """
+                SELECT id, custom_title, custom_category, event_date, event_notes,
+                       artifact_url, visibility
                 FROM student_life_milestones
                 WHERE student_id = $1
                   AND tenant_id  = $2
                   AND deleted_at IS NULL
-                  AND milestone_code IS NOT NULL
-                GROUP BY milestone_code
+                  AND milestone_code IS NULL
+                ORDER BY event_date DESC NULLS LAST, created_at DESC
+                """,
+                student_id,
+                ctx.tenant_id,
             )
-            SELECT
-                c.code, c.title, c.description, c.age_band,
-                c.typical_age_min, c.typical_age_max,
-                c.pillar, c.sub_pillar, c.category, c.universality,
-                c.admission_traits_developed AS traits,
-                CASE WHEN c.tenant_id IS NULL THEN 'platform' ELSE 'tenant_custom' END AS source_kind,
-                CASE
-                    WHEN h.code IS NOT NULL THEN 'achieved'
-                    WHEN $3::numeric IS NULL THEN 'available'
-                    WHEN c.typical_age_max < $3::numeric THEN 'backfill_candidate'
-                    WHEN c.typical_age_min <= $3::numeric AND c.typical_age_max >= $3::numeric THEN 'now'
-                    WHEN c.typical_age_min > $3::numeric THEN 'upcoming'
-                    ELSE 'available'
-                END AS status,
-                h.first_hit,
-                COALESCE(h.event_count, 0) AS event_count,
-                h.milestone_id
-            FROM life_milestones_catalog c
-            LEFT JOIN hit h ON h.code = c.code
-            WHERE c.deleted_at IS NULL
-              AND c.is_active = true
-              AND (c.tenant_id IS NULL OR c.tenant_id = $2)
-            ORDER BY
-                c.sort_order NULLS LAST,
-                c.typical_age_min NULLS LAST,
-                c.code
-            """,
-            student_id,
-            ctx.tenant_id,
-            student_age,
-        )
-
-        # Custom (non-catalog) events for this student
-        custom_rows = await conn.fetch(
-            """
-            SELECT id, custom_title, custom_category, event_date, event_notes,
-                   artifact_url, visibility
-            FROM student_life_milestones
-            WHERE student_id = $1
-              AND tenant_id  = $2
-              AND deleted_at IS NULL
-              AND milestone_code IS NULL
-            ORDER BY event_date DESC NULLS LAST, created_at DESC
-            """,
-            student_id,
-            ctx.tenant_id,
-        )
 
     catalog = []
     for r in catalog_rows:
@@ -344,15 +346,16 @@ async def capture_milestone(
     student_id: UUID,
     body: MilestoneCaptureRequest,
     request: Request,
-    t: Optional[str] = Query(default=None),
-    authorization: Optional[str] = Header(default=None),
+    ctx: ParentContext = Depends(_require_parent_token),
 ) -> dict[str, Any]:
     """Log an achievement against a known catalog milestone code."""
-    ctx = await _resolve_parent_token(request, t, authorization)
     _assert_student_match(ctx, student_id)
 
-    async with _get_conn(ctx.tenant_id) as conn:
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
         async with conn.transaction():
+            await _bind_tenant(conn, ctx.tenant_id)
+
             exists = await conn.fetchval(
                 """
                 SELECT 1 FROM life_milestones_catalog
@@ -417,17 +420,17 @@ async def capture_custom_milestone(
     student_id: UUID,
     body: CustomMilestoneRequest,
     request: Request,
-    t: Optional[str] = Query(default=None),
-    authorization: Optional[str] = Header(default=None),
+    ctx: ParentContext = Depends(_require_parent_token),
 ) -> dict[str, Any]:
     """Log a custom (free-text) life event. Optionally promotes it into the
     tenant-scoped catalog for future reuse."""
-    ctx = await _resolve_parent_token(request, t, authorization)
     _assert_student_match(ctx, student_id)
 
     catalog_code: Optional[str] = None
-    async with _get_conn(ctx.tenant_id) as conn:
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
         async with conn.transaction():
+            await _bind_tenant(conn, ctx.tenant_id)
 
             # Optional catalog promotion
             if body.add_to_catalog:
@@ -441,7 +444,6 @@ async def capture_custom_milestone(
                 if not base_code:
                     raise HTTPException(400, "custom_title produced an empty slug.")
 
-                # Find a code that doesn't collide under this tenant
                 candidate = base_code
                 for attempt in range(2, 50):
                     collision = await conn.fetchval(
@@ -480,7 +482,6 @@ async def capture_custom_milestone(
                     ctx.token_id,
                 )
 
-            # Achievement record (with or without catalog_code link)
             inserted = await conn.fetchrow(
                 """
                 INSERT INTO student_life_milestones (
@@ -493,7 +494,7 @@ async def capture_custom_milestone(
                 """,
                 ctx.tenant_id,
                 student_id,
-                catalog_code,            # None unless add_to_catalog was true
+                catalog_code,
                 body.custom_title,
                 body.custom_category,
                 body.event_date,
@@ -534,15 +535,16 @@ async def delete_milestone(
     student_id: UUID,
     milestone_id: UUID,
     request: Request,
-    t: Optional[str] = Query(default=None),
-    authorization: Optional[str] = Header(default=None),
+    ctx: ParentContext = Depends(_require_parent_token),
 ) -> dict[str, Any]:
     """Soft-delete an achievement record. Catalog rows are not deleted by this endpoint."""
-    ctx = await _resolve_parent_token(request, t, authorization)
     _assert_student_match(ctx, student_id)
 
-    async with _get_conn(ctx.tenant_id) as conn:
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
         async with conn.transaction():
+            await _bind_tenant(conn, ctx.tenant_id)
+
             status = await conn.execute(
                 """
                 UPDATE student_life_milestones
@@ -557,7 +559,6 @@ async def delete_milestone(
                 ctx.tenant_id,
                 ctx.token_id,
             )
-            # asyncpg returns "UPDATE n" — parse the count
             try:
                 affected = int(status.split()[-1])
             except (ValueError, IndexError):
