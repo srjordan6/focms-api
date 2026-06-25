@@ -1,6 +1,11 @@
 """focms_milestones.py - Life milestones tracking for the FOCMS parent portal.
 
-v0.8.1 (2026-06-25) - Millstones and Milestones pillar.
+v0.8.2 (2026-06-25) - Millstones and Milestones pillar.
+  - v0.8.2: fixed audit_log INSERT — schema has no 'details' column; action is an
+            enum (audit_action_enum) restricted to {create, update, delete,
+            visibility_change, login, logout, export, consent_grant, consent_revoke,
+            role_assign, role_revoke}. Semantic action names now go in target_label
+            and the payload jsonb goes in new_value.
   - v0.8.1: corrected imports to use _require_parent_token (FastAPI Depends pattern),
             request.app.state.pool for DB acquisition, _bind_tenant for RLS context.
             v0.8.0 had wrong import names (_resolve_parent_token / _get_conn).
@@ -149,6 +154,18 @@ def _assert_student_match(ctx: ParentContext, student_id: UUID) -> None:
         raise HTTPException(403, "Token does not authorize access to this student.")
 
 
+# audit_log.action is restricted to the audit_action_enum values
+# (create / update / delete / visibility_change / login / logout / export / ...).
+# Milestone events map onto this set; the semantic milestone action name is preserved
+# in audit_log.target_label so it remains queryable.
+_AUDIT_ACTION_MAP: dict[str, str] = {
+    "milestone_captured":        "create",
+    "custom_milestone_captured": "create",
+    "milestone_deleted":         "delete",
+    "milestone_updated":         "update",
+}
+
+
 async def _audit_log_milestone(
     conn: asyncpg.Connection,
     ctx: ParentContext,
@@ -159,24 +176,37 @@ async def _audit_log_milestone(
 ) -> None:
     """SAVEPOINT-wrapped audit_log insert. Never raises out of the parent transaction.
 
-    Parent tokens are not users.id principals, so actor_user_id is intentionally NULL.
-    actor_role is 'tenant_admin' (the role granted by the access token).
-    session_id carries the token UUID as the identity correlation key.
+    Schema notes:
+      - actor_user_id is NULL because parent tokens are not users.id principals
+        (FK violation would otherwise poison the transaction; v0.7.5 pattern).
+      - actor_role is 'tenant_admin' (the role granted by the access token).
+      - session_id carries the token UUID as the identity correlation key.
+      - audit_log.action is an enum (audit_action_enum); we map semantic milestone
+        action names to one of {create, update, delete, ...} and keep the
+        semantic name in target_label for downstream filtering.
+      - audit_log has no generic 'details' column — the payload jsonb goes in
+        new_value (a column meant for the post-change value of the row).
     """
+    enum_action = _AUDIT_ACTION_MAP.get(action, "create")
     try:
         async with conn.transaction():  # SAVEPOINT
             await conn.execute(
                 """
                 INSERT INTO audit_log (
-                    tenant_id, actor_user_id, actor_role, session_id,
-                    action, target_table, target_id, details, occurred_at
-                ) VALUES ($1, NULL, 'tenant_admin', $2, $3, $4, $5, $6, now())
+                    tenant_id, student_id, actor_user_id, actor_role, session_id,
+                    action, target_table, target_id, target_label, new_value, occurred_at
+                ) VALUES (
+                    $1, $2, NULL, 'tenant_admin', $3,
+                    $4::audit_action_enum, $5, $6, $7, $8::jsonb, now()
+                )
                 """,
                 ctx.tenant_id,
+                ctx.student_id,
                 str(ctx.token_id),
-                action,
+                enum_action,
                 target_table,
                 target_id,
+                action,  # semantic milestone action name preserved here
                 json.dumps(details, default=str),
             )
     except Exception as e:
