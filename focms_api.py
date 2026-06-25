@@ -150,6 +150,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from focms_addresses import router as addresses_router
 from focms_i18n import router as i18n_router
 from focms_parent_portal import router as parent_portal_router
+from focms_milestones import router as milestones_router
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -560,6 +561,7 @@ app.add_middleware(
 app.include_router(addresses_router)
 app.include_router(i18n_router)
 app.include_router(parent_portal_router)
+app.include_router(milestones_router)
 
 # ---------------------------------------------------------------------------
 # Auth
