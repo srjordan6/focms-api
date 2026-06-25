@@ -1,6 +1,9 @@
 """focms_milestones.py - Life milestones tracking for the FOCMS parent portal.
 
-v0.8.2 (2026-06-25) - Millstones and Milestones pillar.
+v0.8.3 (2026-06-25) - Millstones and Milestones pillar.
+  - v0.8.3: fixed picker SQL — MIN(id) doesn't work on UUID columns (no MIN aggregator
+            for UUID type). Replaced with (array_agg(id ORDER BY event_date))[1] to
+            return the milestone_id of the earliest hit per code.
   - v0.8.2: fixed audit_log INSERT — schema has no 'details' column; action is an
             enum (audit_action_enum) restricted to {create, update, delete,
             visibility_change, login, logout, export, consent_grant, consent_revoke,
@@ -256,7 +259,7 @@ async def get_milestone_picker(
                         milestone_code AS code,
                         MIN(event_date) AS first_hit,
                         COUNT(*)        AS event_count,
-                        MIN(id)         AS milestone_id
+                        (array_agg(id ORDER BY event_date NULLS LAST))[1] AS milestone_id
                     FROM student_life_milestones
                     WHERE student_id = $1
                       AND tenant_id  = $2
