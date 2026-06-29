@@ -1,9 +1,20 @@
 ﻿from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.7.0
+"""focms_api.py - FOCMS Data Provider REST API v0.8.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.8.0 (2026-06-29):
+- Cloudflare R2 object storage for media files. New module focms_storage.py
+  provides r2_enabled(), upload_bytes(), get_presigned_url(), delete_object().
+  media_files table gets storage_kind ('inline_bytea' | 'r2') + storage_uri
+  columns + CHECK constraint to enforce that R2 rows have a key and bytea
+  rows have content. POST /media uploads to R2 when env vars present, falls
+  back to bytea otherwise. GET /media/{id} returns 302 to a 5-minute
+  presigned URL for R2 rows, streams bytes for bytea rows. DELETE /media/{id}
+  removes the R2 object before DB soft-delete (best-effort). Architecture
+  archived as artifact_storage_r2_v1_0. Cost: $0.015/GB/month, zero egress.
 
 v0.7.0 (2026-06-24):
 - Parent portal endpoints. New module focms_parent_portal.py defines:
@@ -145,12 +156,12 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 from focms_addresses import router as addresses_router
 from focms_i18n import router as i18n_router
 from focms_parent_portal import router as parent_portal_router
-from focms_milestones import router as milestones_router
+import focms_storage
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -312,6 +323,50 @@ MIGRATIONS: list[tuple[str, str]] = [
                     );
             END IF;
         END $do$""",
+    ),
+    # ----------------------------------------------------------------------
+    # v0.8.0 — R2 object storage columns on media_files
+    # ----------------------------------------------------------------------
+    # storage_kind discriminates between inline bytea ('inline_bytea') and
+    # R2 object storage ('r2'). storage_uri holds the R2 object key for
+    # 'r2' rows. content becomes nullable so 'r2' rows can leave it NULL.
+    # The CHECK constraint enforces invariants: bytea rows must have content,
+    # r2 rows must have a storage_uri. Migration already applied to prod via
+    # migrate_r2_schema.py (2026-06-29); these are kept idempotent so a
+    # fresh deployment lands at the same state.
+    (
+        "media_files_content_nullable",
+        "ALTER TABLE media_files ALTER COLUMN content DROP NOT NULL",
+    ),
+    (
+        "media_files_add_storage_kind",
+        "ALTER TABLE media_files ADD COLUMN IF NOT EXISTS storage_kind text "
+        "NOT NULL DEFAULT 'inline_bytea'",
+    ),
+    (
+        "media_files_add_storage_uri",
+        "ALTER TABLE media_files ADD COLUMN IF NOT EXISTS storage_uri text",
+    ),
+    (
+        "media_files_storage_check",
+        """DO $do$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'media_files_storage_check'
+                  AND conrelid = 'media_files'::regclass
+            ) THEN
+                ALTER TABLE media_files
+                ADD CONSTRAINT media_files_storage_check CHECK (
+                    (storage_kind = 'inline_bytea' AND content IS NOT NULL)
+                 OR (storage_kind = 'r2' AND storage_uri IS NOT NULL)
+                );
+            END IF;
+        END $do$""",
+    ),
+    (
+        "media_files_storage_kind_idx",
+        "CREATE INDEX IF NOT EXISTS media_files_storage_kind_idx "
+        "ON media_files (storage_kind)",
     ),
     (
         "seed_john_showcase",
@@ -545,7 +600,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.8.0", lifespan=lifespan)
 # CORS - parent portal frontend at outcomestar.app
 app.add_middleware(
     CORSMiddleware,
@@ -561,7 +616,6 @@ app.add_middleware(
 app.include_router(addresses_router)
 app.include_router(i18n_router)
 app.include_router(parent_portal_router)
-app.include_router(milestones_router)
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -701,7 +755,7 @@ async def health(request: Request) -> dict[str, Any]:
     is configured and per-tenant DEKs are in place. Returns counts only Ã¢â‚¬â€
     never any key material.
     """
-    payload: dict[str, Any] = {"status": "ok", "version": "0.4.3"}
+    payload: dict[str, Any] = {"status": "ok", "version": "0.8.0"}
     crypto: dict[str, Any] = {"kek_set": FOCMS_KEK_MASTER is not None}
     try:
         async with request.app.state.pool.acquire() as conn:
@@ -719,6 +773,11 @@ async def health(request: Request) -> dict[str, Any]:
     except Exception as exc:
         crypto["error"] = f"{type(exc).__name__}: {exc}"
     payload["crypto"] = crypto
+    # v0.8.0: R2 storage health
+    try:
+        payload["storage"] = focms_storage.health_check()
+    except Exception as exc:
+        payload["storage"] = {"error": f"{type(exc).__name__}: {exc}"}
     return payload
 
 
@@ -2912,7 +2971,7 @@ async def get_swim_race_log_feed(
     }
 
 
-# v0.4.1 Ã¢â‚¬â€ media storage (binary blobs in Postgres)
+# v0.8.0 — media storage (R2 object store with bytea fallback)
 # ===========================================================================
 
 import base64 as _b64
@@ -2948,6 +3007,11 @@ async def upload_media(
 ) -> dict[str, Any]:
     """Upload a binary file (image, document, etc).
 
+    v0.8.0: When R2 env vars are configured, uploads to Cloudflare R2 with
+    object key `{tenant_id}/{artifact_id}`. Stores storage_kind='r2' +
+    storage_uri=key on the row, content=NULL. When R2 is not configured,
+    falls back to inline bytea (storage_kind='inline_bytea', content=bytes).
+
     JSON body: { filename, mime_type, content_base64, kind?, visibility?, student_id? }
     Returns the media id and a URL that can be used in image src etc.
     Size cap: 10 MB after base64 decode. Kinds: image, document, video, other.
@@ -2964,31 +3028,74 @@ async def upload_media(
 
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
+
+    # Generate the artifact id up front so we can use it as the R2 object key
+    # before the row is inserted.
     async with tx(request, tenant_id) as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO media_files (
-                tenant_id, student_id, kind, mime_type, original_filename,
-                byte_size, content, visibility, sha256_hex, created_by
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            RETURNING id, byte_size, mime_type, kind, visibility, sha256_hex
-            """,
-            UUID(tenant_id),
-            body.student_id,
-            body.kind or "image",
-            body.mime_type,
-            body.filename,
-            len(content),
-            content,
-            body.visibility or "public",
-            sha,
-            UUID(user_id),
+        artifact_id = await conn.fetchval("SELECT gen_random_uuid_v7()")
+
+    # Upload to R2 (or get inline_bytea sentinel if R2 disabled)
+    try:
+        storage = focms_storage.upload_bytes(
+            tenant_id=tenant_id,
+            artifact_id=str(artifact_id),
+            data=content,
+            content_type=body.mime_type,
         )
+    except Exception as exc:
+        log.error("media upload to R2 failed: %r", exc)
+        raise HTTPException(502, f"R2 upload failed: {exc}") from exc
+
+    storage_kind = storage["storage_kind"]
+    storage_uri = storage["storage_uri"]
+    # Content bytes are stored in the row ONLY when we're using bytea.
+    # When R2 stored the bytes, content is NULL (CHECK constraint enforces this).
+    db_content = content if storage_kind == "inline_bytea" else None
+
+    async with tx(request, tenant_id) as conn:
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO media_files (
+                    id, tenant_id, student_id, kind, mime_type, original_filename,
+                    byte_size, content, storage_kind, storage_uri,
+                    visibility, sha256_hex, created_by
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                RETURNING id, byte_size, mime_type, kind, visibility, sha256_hex,
+                          storage_kind, storage_uri
+                """,
+                artifact_id,
+                UUID(tenant_id),
+                body.student_id,
+                body.kind or "image",
+                body.mime_type,
+                body.filename,
+                len(content),
+                db_content,
+                storage_kind,
+                storage_uri,
+                body.visibility or "public",
+                sha,
+                UUID(user_id),
+            )
+        except Exception as exc:
+            # If we already uploaded to R2 but the DB insert failed, try to
+            # clean up the orphan R2 object so we don't pay for ghost bytes.
+            if storage_kind == "r2" and storage_uri:
+                try:
+                    focms_storage.delete_object(storage_uri)
+                except Exception:
+                    log.warning("orphan R2 object left behind: %s", storage_uri)
+            raise HTTPException(500, f"DB insert failed: {exc}") from exc
         await write_audit(
             conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id, action="create", target_table="media_files",
             target_id=str(row["id"]), target_label=body.filename,
-            new_value={"mime_type": row["mime_type"], "bytes": row["byte_size"]},
+            new_value={
+                "mime_type": row["mime_type"],
+                "bytes": row["byte_size"],
+                "storage_kind": row["storage_kind"],
+            },
         )
     return {
         "id": str(row["id"]),
@@ -2998,12 +3105,18 @@ async def upload_media(
         "kind": row["kind"],
         "visibility": row["visibility"],
         "sha256": row["sha256_hex"],
+        "storage_kind": row["storage_kind"],
     }
 
 
 @app.get("/focms/v1/media/{media_id}")
 async def serve_media(media_id: UUID, request: Request):
-    """Return the raw binary content of a media file with appropriate MIME type.
+    """Serve a media file.
+
+    v0.8.0: For storage_kind='r2' rows, returns a 302 redirect to a 5-minute
+    presigned URL so the client downloads directly from R2 (zero egress cost
+    on our side, no proxy bandwidth). For storage_kind='inline_bytea' rows,
+    streams the bytes from Postgres with the appropriate MIME type.
 
     No auth required for public files; private/unlisted return 404 to
     unauthenticated callers. (For simplicity, treat unlisted same as public.)
@@ -3011,7 +3124,8 @@ async def serve_media(media_id: UUID, request: Request):
     async with request.app.state.pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT content, mime_type, byte_size, visibility
+            SELECT content, mime_type, byte_size, visibility,
+                   storage_kind, storage_uri
             FROM media_files
             WHERE id = $1 AND deleted_at IS NULL
             """,
@@ -3020,8 +3134,27 @@ async def serve_media(media_id: UUID, request: Request):
         if not row:
             raise HTTPException(404, "Media not found")
         if row["visibility"] == "private":
-            # In a future iteration: check bearer, allow if tenant matches
             raise HTTPException(404, "Media not found")
+
+    if row["storage_kind"] == "r2":
+        if not row["storage_uri"]:
+            log.error("media row %s has storage_kind=r2 but no storage_uri", media_id)
+            raise HTTPException(500, "Media metadata inconsistent")
+        try:
+            presigned_url = focms_storage.get_presigned_url(
+                row["storage_uri"], expiry_seconds=300
+            )
+        except Exception as exc:
+            log.error("presigned URL generation failed for %s: %r", media_id, exc)
+            raise HTTPException(502, "Cannot generate download URL") from exc
+        # 302 (not 301) so browsers don't cache the redirect past the
+        # presigned URL's 5-minute expiry.
+        return RedirectResponse(url=presigned_url, status_code=302)
+
+    # storage_kind == 'inline_bytea' - stream bytes from Postgres
+    if row["content"] is None:
+        log.error("media row %s is inline_bytea but content is NULL", media_id)
+        raise HTTPException(500, "Media metadata inconsistent")
     return Response(
         content=bytes(row["content"]),
         media_type=row["mime_type"],
@@ -3034,9 +3167,39 @@ async def delete_media(
     media_id: UUID, request: Request,
     principal: dict = Depends(require_write),
 ):
+    """Soft-delete a media file.
+
+    v0.8.0: When storage_kind='r2', removes the R2 object before the DB
+    soft-delete. R2 cleanup is best-effort - if it fails, the DB row is
+    still marked deleted and a warning is logged. The orphan R2 object can
+    be swept later by a janitor job.
+    """
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     async with tx(request, tenant_id) as conn:
+        # Fetch storage_kind + storage_uri before the soft-delete so we can
+        # clean up R2.
+        meta = await conn.fetchrow(
+            """
+            SELECT storage_kind, storage_uri
+            FROM media_files
+            WHERE id = $1 AND deleted_at IS NULL
+            """,
+            media_id,
+        )
+        if not meta:
+            raise HTTPException(404, "Media not found or already deleted")
+
+        # Best-effort R2 cleanup. Don't block the DB delete on R2 failures.
+        if meta["storage_kind"] == "r2" and meta["storage_uri"]:
+            try:
+                focms_storage.delete_object(meta["storage_uri"])
+            except Exception as exc:
+                log.warning(
+                    "R2 delete failed for media %s key=%s err=%r (DB delete will proceed)",
+                    media_id, meta["storage_uri"], exc,
+                )
+
         row = await conn.fetchrow(
             """
             UPDATE media_files SET deleted_at = now()
@@ -3051,6 +3214,7 @@ async def delete_media(
             conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id, action="delete", target_table="media_files",
             target_id=str(media_id),
+            new_value={"storage_kind": meta["storage_kind"]},
         )
     return JSONResponse(status_code=204, content=None)
 
