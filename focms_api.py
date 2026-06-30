@@ -1,9 +1,26 @@
-﻿from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.8.0
+from fastapi.middleware.cors import CORSMiddleware
+"""focms_api.py - FOCMS Data Provider REST API v0.9.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.9.0 (2026-06-29):
+- Per-tenant storage quota enforcement. POST /focms/v1/media now rejects
+  uploads that would push tenants.storage_used_bytes past
+  tenants.storage_quota_bytes (413 with structured detail). Tenants with
+  NULL quota are unlimited.
+- New endpoint GET /focms/v1/tenant/storage returns used/quota/pct + human
+  strings for the calling tenant. Powered by the storage_used_bytes column
+  that the media_files trigger keeps in lockstep with active rows.
+- MIGRATIONS now includes the storage_quota schema (storage_used_bytes +
+  storage_quota_bytes columns on tenants, CHECK constraint, recompute
+  function, trigger function, and the AFTER INSERT/UPDATE/DELETE trigger
+  on media_files). Migrations were originally applied via
+  migrate_storage_quota.py running as focms_user; the entries here exist
+  for fresh-deploy parity. The migration runner catches insufficient_privilege
+  errors and continues, so subsequent runs as focms_app are no-ops when
+  focms_user already owns the function/trigger.
 
 v0.8.0 (2026-06-29):
 - Cloudflare R2 object storage for media files. New module focms_storage.py
@@ -65,7 +82,7 @@ v0.4.3 (2026-06-23):
   `first_name_ciphertext`, `middle_name_ciphertext`, `last_name_ciphertext`,
   `birth_date_ciphertext` added to `students`. Existing tenant DEKs are
   provisioned and existing student PII is encrypted on startup (idempotent
-  Ã¢â‚¬â€ only encrypts where ciphertext column is NULL). Plaintext columns
+  - only encrypts where ciphertext column is NULL). Plaintext columns
   preserved during transition; v0.4.4 will route reads/writes through the
   encrypted columns; v0.4.5 drops the plaintext columns once stable.
 - Helper SQL functions exposed: focms_encrypt_pii(tenant, plaintext, kek),
@@ -125,6 +142,7 @@ v0.3.1 (2026-06-22):
 Read endpoints:
     GET    /focms/v1/health
     GET    /focms/v1/types
+    GET    /focms/v1/tenant/storage                                  [NEW v0.9.0]
     GET    /focms/v1/student/{student_id}
     GET    /focms/v1/student/{student_id}/records?type=type
     GET    /focms/v1/student/{student_id}/target-universities
@@ -185,7 +203,7 @@ log = logging.getLogger("focms-api")
 MIGRATIONS: list[tuple[str, str]] = [
     # Grant focms_app schema CREATE privilege so Claude can do DDL via MCP.
     # This is the one-time bootstrap that ends the "Stephen runs DDL via Render
-    # Postgres console" pain. Idempotent Ã¢â‚¬â€ re-running is a no-op.
+    # Postgres console" pain. Idempotent - re-running is a no-op.
     (
         "grant_schema_create_to_focms_app",
         "GRANT CREATE, USAGE ON SCHEMA public TO focms_app",
@@ -202,7 +220,7 @@ MIGRATIONS: list[tuple[str, str]] = [
         "ALTER DEFAULT PRIVILEGES FOR ROLE focms_user IN SCHEMA public "
         "GRANT USAGE, SELECT, UPDATE ON SEQUENCES TO focms_app",
     ),
-    # public_showcases Ã¢â‚¬â€ per-student public showcase configuration.
+    # public_showcases - per-student public showcase configuration.
     # Each row maps a URL slug (e.g. "john") to a tenant + student plus
     # display config (theme, photo, tagline). Adding a new student becomes
     # a one-row INSERT instead of a code change + deploy.
@@ -266,12 +284,8 @@ MIGRATIONS: list[tuple[str, str]] = [
             END IF;
         END $do$""",
     ),
-    # Seed John's showcase row (idempotent Ã¢â‚¬â€ ON CONFLICT DO NOTHING).
-    # This is what makes outcomestar.app/john keep working after page.tsx
-    # drops its hardcoded TENANTS constant.
     # Media storage: bytea blobs with MIME type. Sized for portraits and small
-    # PDFs (Mindprint reports, transcripts, etc). Larger artifacts later move
-    # to S3/R2 via a separate code path.
+    # PDFs (Mindprint reports, transcripts, etc).
     (
         "create_media_files",
         """CREATE TABLE IF NOT EXISTS media_files (
@@ -325,15 +339,8 @@ MIGRATIONS: list[tuple[str, str]] = [
         END $do$""",
     ),
     # ----------------------------------------------------------------------
-    # v0.8.0 — R2 object storage columns on media_files
+    # v0.8.0 - R2 object storage columns on media_files
     # ----------------------------------------------------------------------
-    # storage_kind discriminates between inline bytea ('inline_bytea') and
-    # R2 object storage ('r2'). storage_uri holds the R2 object key for
-    # 'r2' rows. content becomes nullable so 'r2' rows can leave it NULL.
-    # The CHECK constraint enforces invariants: bytea rows must have content,
-    # r2 rows must have a storage_uri. Migration already applied to prod via
-    # migrate_r2_schema.py (2026-06-29); these are kept idempotent so a
-    # fresh deployment lands at the same state.
     (
         "media_files_content_nullable",
         "ALTER TABLE media_files ALTER COLUMN content DROP NOT NULL",
@@ -379,17 +386,14 @@ MIGRATIONS: list[tuple[str, str]] = [
             'john',
             'mission-control',
             'John Ray Jordan',
-            'Future astronaut Ã‚Â· breaststroke specialist',
+            'Future astronaut - breaststroke specialist',
             'https://johnrjordan.com/wp-content/uploads/2026/05/john-at-the-cotillion-Ball-03292026-2-2-scaled.jpg',
             'public'
         ) ON CONFLICT DO NOTHING""",
     ),
     # ----------------------------------------------------------------------
-    # v0.4.3 Ã¢â‚¬â€ per-tenant envelope encryption for PII at rest
+    # v0.4.3 - per-tenant envelope encryption for PII at rest
     # ----------------------------------------------------------------------
-    # tenant_data_keys: stores per-tenant DEKs (data encryption keys) wrapped
-    # with the master KEK (key encryption key). One row per tenant. The
-    # wrapped DEK is useless without the KEK which lives only in env vars.
     (
         "crypto_pgcrypto_extension",
         "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -413,10 +417,6 @@ MIGRATIONS: list[tuple[str, str]] = [
         "crypto_grant_app_dml_tenant_data_keys",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON tenant_data_keys TO focms_app",
     ),
-    # Helper functions. All SECURITY DEFINER so the calling role doesn't need
-    # direct grants on tenant_data_keys Ã¢â‚¬â€ only EXECUTE on the function.
-    # KEK is passed explicitly on every call (no session GUC dependency) so
-    # the helpers work identically from API, MCP, or psql.
     (
         "crypto_fn_tenant_dek",
         """CREATE OR REPLACE FUNCTION focms_tenant_dek(p_tenant_id uuid, p_kek text)
@@ -470,9 +470,6 @@ MIGRATIONS: list[tuple[str, str]] = [
           RETURNING tenant_id
         $crypto_fn$""",
     ),
-    # Students PII ciphertext columns. Plaintext columns kept during transition.
-    # v0.4.4 will route API reads/writes through the ciphertext columns;
-    # v0.4.5 drops the plaintext columns once stable.
     (
         "crypto_alter_students_add_first_name_ct",
         "ALTER TABLE students ADD COLUMN IF NOT EXISTS first_name_ciphertext bytea",
@@ -489,6 +486,125 @@ MIGRATIONS: list[tuple[str, str]] = [
         "crypto_alter_students_add_birth_date_ct",
         "ALTER TABLE students ADD COLUMN IF NOT EXISTS birth_date_ciphertext bytea",
     ),
+    # ----------------------------------------------------------------------
+    # v0.9.0 - per-tenant storage quota tracking
+    # ----------------------------------------------------------------------
+    # Schema lives on tenants; trigger keeps it in sync with media_files.
+    # Originally applied via migrate_storage_quota.py running as focms_user
+    # (see archive_entries source_id='storage_quota_tracking_live_2026_06_29').
+    # Idempotent so a fresh deployment lands at the same state. CREATE OR
+    # REPLACE FUNCTION will fail with insufficient_privilege on subsequent
+    # runs as focms_app because existing functions are owned by focms_user;
+    # the migration runner catches that and logs as skipped (the existing
+    # function is preserved and works).
+    (
+        "storage_quota_col_used",
+        "ALTER TABLE tenants "
+        "ADD COLUMN IF NOT EXISTS storage_used_bytes BIGINT NOT NULL DEFAULT 0",
+    ),
+    (
+        "storage_quota_col_quota",
+        "ALTER TABLE tenants "
+        "ADD COLUMN IF NOT EXISTS storage_quota_bytes BIGINT NULL",
+    ),
+    (
+        "storage_quota_check_nonneg",
+        """DO $do$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'tenants_storage_used_bytes_nonneg'
+            ) THEN
+                ALTER TABLE tenants
+                    ADD CONSTRAINT tenants_storage_used_bytes_nonneg
+                    CHECK (storage_used_bytes >= 0);
+            END IF;
+        END $do$""",
+    ),
+    (
+        "storage_quota_fn_recompute",
+        """CREATE OR REPLACE FUNCTION focms_recompute_tenant_storage(p_tenant_id uuid)
+        RETURNS bigint
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = public, pg_catalog
+        AS $storage_fn$
+        DECLARE total bigint;
+        BEGIN
+            SELECT COALESCE(SUM(byte_size), 0) INTO total
+              FROM media_files
+             WHERE tenant_id = p_tenant_id AND deleted_at IS NULL;
+            UPDATE tenants SET storage_used_bytes = total WHERE id = p_tenant_id;
+            RETURN total;
+        END
+        $storage_fn$""",
+    ),
+    (
+        "storage_quota_fn_trigger_body",
+        """CREATE OR REPLACE FUNCTION focms_media_files_storage_quota_trigger()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = public, pg_catalog
+        AS $storage_fn$
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                IF NEW.deleted_at IS NULL THEN
+                    UPDATE tenants
+                       SET storage_used_bytes = storage_used_bytes + NEW.byte_size
+                     WHERE id = NEW.tenant_id;
+                END IF;
+                RETURN NEW;
+            ELSIF TG_OP = 'UPDATE' THEN
+                IF OLD.deleted_at IS NULL AND NEW.deleted_at IS NULL THEN
+                    IF OLD.tenant_id IS DISTINCT FROM NEW.tenant_id THEN
+                        UPDATE tenants
+                           SET storage_used_bytes = GREATEST(0, storage_used_bytes - OLD.byte_size)
+                         WHERE id = OLD.tenant_id;
+                        UPDATE tenants
+                           SET storage_used_bytes = storage_used_bytes + NEW.byte_size
+                         WHERE id = NEW.tenant_id;
+                    ELSIF OLD.byte_size IS DISTINCT FROM NEW.byte_size THEN
+                        UPDATE tenants
+                           SET storage_used_bytes = GREATEST(0, storage_used_bytes - OLD.byte_size + NEW.byte_size)
+                         WHERE id = NEW.tenant_id;
+                    END IF;
+                ELSIF OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL THEN
+                    UPDATE tenants
+                       SET storage_used_bytes = GREATEST(0, storage_used_bytes - OLD.byte_size)
+                     WHERE id = OLD.tenant_id;
+                ELSIF OLD.deleted_at IS NOT NULL AND NEW.deleted_at IS NULL THEN
+                    UPDATE tenants
+                       SET storage_used_bytes = storage_used_bytes + NEW.byte_size
+                     WHERE id = NEW.tenant_id;
+                END IF;
+                RETURN NEW;
+            ELSIF TG_OP = 'DELETE' THEN
+                IF OLD.deleted_at IS NULL THEN
+                    UPDATE tenants
+                       SET storage_used_bytes = GREATEST(0, storage_used_bytes - OLD.byte_size)
+                     WHERE id = OLD.tenant_id;
+                END IF;
+                RETURN OLD;
+            END IF;
+            RETURN NULL;
+        END
+        $storage_fn$""",
+    ),
+    (
+        "storage_quota_trigger_install",
+        """DO $do$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_trigger
+                WHERE tgname = 'media_files_storage_quota_trigger'
+                  AND NOT tgisinternal
+            ) THEN
+                CREATE TRIGGER media_files_storage_quota_trigger
+                AFTER INSERT OR UPDATE OR DELETE ON media_files
+                FOR EACH ROW
+                EXECUTE FUNCTION focms_media_files_storage_quota_trigger();
+            END IF;
+        END $do$""",
+    ),
 ]
 
 
@@ -497,11 +613,10 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
 
     Each statement is wrapped in its own try/except so one failure does not
     block the rest from running. Failures are logged at WARNING level. The
-    service continues to start even if migrations partially fail Ã¢â‚¬â€ the
+    service continues to start even if migrations partially fail - the
     existing endpoints still work against the existing schema.
     """
     async with pool.acquire() as conn:
-        # Detect what user we are so we know whether DDL is expected to work.
         try:
             current = await conn.fetchval("SELECT current_user")
             log.info("migrations: running as user=%s", current)
@@ -517,30 +632,18 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
                 log.info("migration ok: %s", name)
                 success_count += 1
             except Exception as exc:
-                # Common skip causes: insufficient privilege (when running as
-                # a non-owner role), or object already exists in a non-IF-NOT-EXISTS
-                # form. Log and continue.
                 log.warning("migration skipped: %s: %s", name, exc)
                 skip_count += 1
         log.info("migrations complete: %d ok, %d skipped", success_count, skip_count)
 
 
 async def run_crypto_setup(pool: asyncpg.Pool) -> None:
-    """v0.4.3: provision per-tenant DEKs and backfill students PII ciphertext.
-
-    Idempotent. Only does work where ciphertext is NULL or the tenant has no
-    DEK yet. Safe to re-run on every deploy. If FOCMS_KEK_MASTER is not set,
-    this skips entirely (and logs a warning); the rest of the API still
-    starts and serves traffic against the plaintext columns.
-    """
+    """v0.4.3: provision per-tenant DEKs and backfill students PII ciphertext."""
     if not FOCMS_KEK_MASTER:
         log.warning("crypto: FOCMS_KEK_MASTER not set; skipping DEK provisioning + PII backfill")
         return
 
     async with pool.acquire() as conn:
-        # Provision DEKs for any tenants without one. created_by is Stephen
-        # for now (the platform admin); when a self-serve onboarding flow
-        # exists, that user_id will replace this.
         try:
             stephen_uuid = "019ed384-56d8-77fb-bfe6-00b1d064da18"
             tenants_needing = await conn.fetch("""
@@ -550,8 +653,6 @@ async def run_crypto_setup(pool: asyncpg.Pool) -> None:
             """)
             provisioned = 0
             for r in tenants_needing:
-                # Use the provision function so the algorithm + key length
-                # stay consistent with any future call sites.
                 res = await conn.fetchval(
                     "SELECT focms_provision_tenant_dek($1, $2, $3::uuid)",
                     r["id"], FOCMS_KEK_MASTER, stephen_uuid,
@@ -563,11 +664,6 @@ async def run_crypto_setup(pool: asyncpg.Pool) -> None:
             log.warning("crypto: DEK provisioning failed: %s", exc)
             return
 
-        # Backfill students PII ciphertext for any rows where the ciphertext
-        # column is NULL. One UPDATE handles all four columns; cast the date
-        # to text before encrypting so we can round-trip through pgp_sym.
-        # The WHERE clause makes this idempotent Ã¢â‚¬â€ re-runs are no-ops once
-        # ciphertext is populated.
         try:
             result = await conn.execute("""
                 UPDATE students SET
@@ -600,8 +696,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.8.0", lifespan=lifespan)
-# CORS - parent portal frontend at outcomestar.app
+app = FastAPI(title="FOCMS Data Provider API", version="0.9.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -621,14 +716,11 @@ app.include_router(parent_portal_router)
 # Auth
 # ---------------------------------------------------------------------------
 
-# Roles that may write. Accepts back-compat token shapes (role unset or
-# 'admin' / 'writer') as well as the canonical tenant_role_enum values.
 WRITE_ROLES = {
-    "admin", "writer",                            # back-compat aliases
-    "tenant_owner", "tenant_admin", "platform_admin",  # canonical
+    "admin", "writer",
+    "tenant_owner", "tenant_admin", "platform_admin",
 }
 
-# Map any incoming role string to a valid tenant_role_enum for audit_log.
 _ROLE_TO_ENUM = {
     "admin": "tenant_admin",
     "writer": "tenant_admin",
@@ -643,9 +735,6 @@ _ROLE_TO_ENUM = {
 
 
 def role_to_enum(role: Optional[str]) -> str:
-    """Resolve a role label to a valid tenant_role_enum value.
-    Defaults to tenant_admin for unknown or missing roles (back-compat
-    with v0.2.0 tokens that did not carry a role)."""
     if not role:
         return "tenant_admin"
     return _ROLE_TO_ENUM.get(role, "tenant_admin")
@@ -658,7 +747,6 @@ def authenticate(authorization: str = Header(None)) -> dict[str, Any]:
     principal = TOKENS.get(token)
     if not principal:
         raise HTTPException(401, "Invalid bearer token")
-    # Normalize the principal so callers can rely on these keys.
     if "tenant_id" not in principal:
         raise HTTPException(500, "Token misconfigured: tenant_id missing")
     principal.setdefault("role", "tenant_admin")
@@ -666,8 +754,6 @@ def authenticate(authorization: str = Header(None)) -> dict[str, Any]:
 
 
 def require_write(principal: dict = Depends(authenticate)) -> dict[str, Any]:
-    """Authenticate AND require a role permitted to write.
-    Also requires user_id on the principal so writes can be attributed."""
     role = principal.get("role", "")
     if role not in WRITE_ROLES:
         raise HTTPException(403, f"Role '{role}' is not permitted to write")
@@ -687,8 +773,7 @@ def require_write(principal: dict = Depends(authenticate)) -> dict[str, Any]:
 
 @asynccontextmanager
 async def tx(request: Request, tenant_id: str) -> AsyncIterator[asyncpg.Connection]:
-    """Acquire a pooled connection, start a tx, SET LOCAL the tenant id.
-    All RLS-protected reads and writes go through this helper."""
+    """Acquire a pooled connection, start a tx, SET LOCAL the tenant id."""
     pool = request.app.state.pool
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -738,24 +823,36 @@ async def write_audit(
             request_id,
         )
     except Exception as exc:
-        # Audit failure is observable but never blocks the write.
         log.warning("audit_log write failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
-# Health + types (unchanged)
+# Misc helpers
+# ---------------------------------------------------------------------------
+
+
+def _human_bytes(n: Optional[int]) -> Optional[str]:
+    """1234567 -> '1.2 MB'. Returns None for None input."""
+    if n is None:
+        return None
+    if n < 1024:
+        return f"{n} B"
+    val = float(n)
+    for u in ("KB", "MB", "GB", "TB"):
+        val /= 1024.0
+        if val < 1024.0:
+            return f"{val:.1f} {u}"
+    return f"{val:.1f} PB"
+
+
+# ---------------------------------------------------------------------------
+# Health + types
 # ---------------------------------------------------------------------------
 
 
 @app.get("/focms/v1/health")
 async def health(request: Request) -> dict[str, Any]:
-    """Service health + crypto wiring sanity check.
-
-    The crypto subsection lets ops verify after deploy that the KEK env var
-    is configured and per-tenant DEKs are in place. Returns counts only Ã¢â‚¬â€
-    never any key material.
-    """
-    payload: dict[str, Any] = {"status": "ok", "version": "0.8.0"}
+    payload: dict[str, Any] = {"status": "ok", "version": "0.9.0"}
     crypto: dict[str, Any] = {"kek_set": FOCMS_KEK_MASTER is not None}
     try:
         async with request.app.state.pool.acquire() as conn:
@@ -773,7 +870,6 @@ async def health(request: Request) -> dict[str, Any]:
     except Exception as exc:
         crypto["error"] = f"{type(exc).__name__}: {exc}"
     payload["crypto"] = crypto
-    # v0.8.0: R2 storage health
     try:
         payload["storage"] = focms_storage.health_check()
     except Exception as exc:
@@ -785,7 +881,6 @@ async def health(request: Request) -> dict[str, Any]:
 async def list_types(
     request: Request, principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Capturable types and their row counts for the authenticated tenant."""
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch("""
             SELECT 'events' AS type_name, count(*) AS n FROM events
@@ -803,7 +898,48 @@ async def list_types(
 
 
 # ---------------------------------------------------------------------------
-# Student reads (unchanged)
+# v0.9.0 - per-tenant storage usage / quota
+# ---------------------------------------------------------------------------
+
+
+@app.get("/focms/v1/tenant/storage")
+async def get_tenant_storage(
+    request: Request,
+    principal: dict = Depends(authenticate),
+) -> dict[str, Any]:
+    """Return the calling tenant's storage usage and quota."""
+    tenant_id = principal["tenant_id"]
+    async with tx(request, tenant_id) as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id::text                AS tenant_id,
+                   storage_used_bytes,
+                   storage_quota_bytes
+              FROM tenants
+             WHERE id = $1
+            """,
+            UUID(tenant_id),
+        )
+    if row is None:
+        raise HTTPException(404, "tenant_not_found")
+
+    used = row["storage_used_bytes"] or 0
+    quota = row["storage_quota_bytes"]
+    pct_used = round(100.0 * used / quota, 2) if (quota and quota > 0) else None
+
+    return {
+        "tenant_id":   row["tenant_id"],
+        "used_bytes":  used,
+        "quota_bytes": quota,
+        "pct_used":    pct_used,
+        "unlimited":   quota is None,
+        "used_human":  _human_bytes(used),
+        "quota_human": _human_bytes(quota) if quota is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Student reads
 # ---------------------------------------------------------------------------
 
 
@@ -812,7 +948,6 @@ async def get_student(
     student_id: UUID, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Return the student identity profile."""
     async with tx(request, principal["tenant_id"]) as conn:
         row = await conn.fetchrow("""
             SELECT id, preferred_name, current_grade, residence_state,
@@ -848,7 +983,6 @@ async def get_records(
     student_id: UUID, request: Request, type: str, limit: int = 100,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Return records of the requested type for the student."""
     if type not in RECORD_TABLES:
         raise HTTPException(400, f"Unknown record type: {type}")
     table = RECORD_TABLES[type]
@@ -862,9 +996,6 @@ async def get_records(
             """,
             student_id, limit,
         )
-        # to_jsonb()::text returns a JSON string; parse client-side. This is
-        # necessary because PgBouncer transaction mode + statement_cache_size=0
-        # prevents asyncpg from auto-decoding JSONB type values.
         return {
             "type": type,
             "student_id": str(student_id),
@@ -878,8 +1009,6 @@ async def get_target_universities(
     student_id: UUID, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Return target universities for the student, with the universities row
-    and CDS facts hydrated."""
     async with tx(request, principal["tenant_id"]) as conn:
         targets = await conn.fetch("""
             SELECT t.id, t.university_leaid, t.priority, t.notes,
@@ -931,7 +1060,7 @@ async def get_target_universities(
 
 
 # ---------------------------------------------------------------------------
-# Power Index (unchanged from v0.2.0)
+# Power Index
 # ---------------------------------------------------------------------------
 
 PI_WEIGHTS = [1.00, 1.00, 0.25, 0.05]
@@ -962,7 +1091,6 @@ async def get_power_index(
     student_id: UUID, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Compute Swimcloud-style Power Index for the student."""
     async with tx(request, principal["tenant_id"]) as conn:
         base_row = await conn.fetchrow("""
             SELECT detail, source_url, archive_date, source_id
@@ -1028,18 +1156,17 @@ async def get_power_index(
 
 
 # ===========================================================================
-# v0.3.0 Ã¢â‚¬â€ Write surface
+# v0.3.0 - Write surface
 # ===========================================================================
 
 
 class ArchiveEntryCreate(BaseModel):
-    """Request body for POST /focms/v1/archive_entries."""
     model_config = ConfigDict(extra="forbid")
 
     archive_type: str = Field(..., min_length=1)
     title: str = Field(..., min_length=1)
     summary: str = Field(..., min_length=1)
-    archive_date: Optional[date] = None         # defaults to CURRENT_DATE
+    archive_date: Optional[date] = None
     version: Optional[str] = None
     pillar: Optional[str] = None
     detail: Optional[str] = None
@@ -1051,15 +1178,14 @@ class ArchiveEntryCreate(BaseModel):
     related_records: Optional[list[str]] = None
     related_entity_table: Optional[str] = None
     related_entity_id: Optional[UUID] = None
-    source: Optional[str] = None                # defaults to 'native_postgres'
+    source: Optional[str] = None
     source_url: Optional[str] = None
     source_system: Optional[str] = None
     source_id: Optional[str] = None
-    visibility: Optional[str] = None            # defaults to 'private'
+    visibility: Optional[str] = None
 
 
 class ArchiveEntryPatch(BaseModel):
-    """Request body for PATCH /focms/v1/archive_entries/{id}. All fields optional."""
     model_config = ConfigDict(extra="forbid")
 
     archive_type: Optional[str] = None
@@ -1084,13 +1210,11 @@ class ArchiveEntryPatch(BaseModel):
 
 
 class AppendDetail(BaseModel):
-    """Request body for POST /focms/v1/archive_entries/{id}/append-detail."""
     model_config = ConfigDict(extra="forbid")
     text: str = Field(..., min_length=1)
 
 
 def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
-    """Convert an asyncpg Record into a JSON-safe dict."""
     out = {}
     for k, v in dict(row).items():
         if isinstance(v, UUID):
@@ -1103,10 +1227,6 @@ def _row_to_dict(row: asyncpg.Record) -> dict[str, Any]:
 
 
 def _pop_audit_action(result: dict[str, Any]) -> str:
-    """Pop the `_was_insert` marker from a RETURNING dict and translate it
-    to an audit action string. Insert -> 'create'. Update (via ON CONFLICT)
-    -> 'update'. Defaults to 'create' when the marker is absent so
-    non-upsert paths keep their existing behavior."""
     was_insert = result.pop("_was_insert", True)
     return "create" if was_insert else "update"
 
@@ -1118,12 +1238,6 @@ async def create_archive_entry(
     upsert: bool = Query(False, description="If true and source_id+source_system are set, upsert on (source_system, source_id)."),
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Insert a new archive entry. Returns the row.
-
-    If ?upsert=true and both source_system + source_id are provided, the
-    insert becomes an upsert on the existing partial unique index, returning
-    the updated row.
-    """
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     archive_date_val = body.archive_date or date.today()
@@ -1232,8 +1346,6 @@ async def patch_archive_entry(
     request: Request,
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Update fields on an archive entry. Only fields present in the body are
-    written. Returns the updated row."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
 
@@ -1241,7 +1353,6 @@ async def patch_archive_entry(
     if not fields:
         raise HTTPException(400, "No fields to update")
 
-    # Build SET clause dynamically with $N positional params
     type_casts = {
         "pillar": "::pillar_enum",
         "visibility": "::visibility_enum",
@@ -1251,7 +1362,6 @@ async def patch_archive_entry(
     for i, (col, val) in enumerate(fields.items(), start=1):
         cast = type_casts.get(col, "")
         set_parts.append(f"{col} = ${i}{cast}")
-        # date and UUID values pass through asyncpg cleanly
         params.append(val)
     set_parts.append(f"updated_by = ${len(params) + 1}")
     params.append(UUID(user_id))
@@ -1294,9 +1404,6 @@ async def append_detail(
     request: Request,
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Append text to the entry's `detail` column. Lets a client grow a doc
-    without round-tripping the current value through the network. Returns
-    {id, new_bytes, new_sha256}."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
 
@@ -1340,7 +1447,6 @@ async def delete_archive_entry(
     entry_id: UUID, request: Request,
     principal: dict = Depends(require_write),
 ):
-    """Soft-delete: sets deleted_at and deleted_by. Returns 204."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     async with tx(request, tenant_id) as conn:
@@ -2166,19 +2272,12 @@ async def create_digital_presence(
     return result
 
 
-
-
 # ===========================================================================
-# v0.4.0 Ã¢â‚¬â€ public_showcases endpoints
+# v0.4.0 - public_showcases endpoints
 # ===========================================================================
 
 
 class PublicShowcaseCreate(BaseModel):
-    """Body for POST /focms/v1/public_showcases.
-
-    `slug` becomes the URL segment in outcomestar.app/{slug}.
-    Constrained to lowercase alphanumeric + hyphen to keep URLs clean.
-    """
     model_config = ConfigDict(extra="forbid")
 
     student_id: UUID
@@ -2191,7 +2290,6 @@ class PublicShowcaseCreate(BaseModel):
 
 
 class PublicShowcasePatch(BaseModel):
-    """Body for PATCH /focms/v1/public_showcases/{id}. All fields optional."""
     model_config = ConfigDict(extra="forbid")
 
     slug: Optional[str] = Field(None, min_length=1, max_length=64, pattern=r"^[a-z0-9-]+$")
@@ -2207,11 +2305,6 @@ async def list_public_showcases(
     request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """List all showcase configs for the authenticated tenant. Used by the
-    admin UI to show what's currently published.
-
-    Includes private+unlisted+public, since the admin needs full visibility.
-    """
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch(
             """
@@ -2251,7 +2344,6 @@ async def list_students(
     request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """List all students for the authenticated tenant. Used by the admin UI."""
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch(
             """
@@ -2289,17 +2381,6 @@ async def get_showcase_by_slug(
     slug: str, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Look up a public showcase config by URL slug.
-
-    Used by the outcomestar Next.js page router. Slug lookup is the entry
-    point for the public showcase Ã¢â‚¬â€ the returned tenant_id + student_id is
-    then used to fetch the rest of the student data via tenant-scoped
-    endpoints.
-
-    Unlike most endpoints this does not set the tenant context (slug is the
-    lookup key, not tenant). RLS policy allows lookup when no context is
-    set. Returns 404 when the showcase is private or missing.
-    """
     async with request.app.state.pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -2333,11 +2414,6 @@ async def create_public_showcase(
     request: Request,
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Create a public showcase row for a student.
-
-    The slug must be globally unique (URL keys cannot collide across
-    tenants). Returns 409 on conflict.
-    """
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
 
@@ -2393,8 +2469,6 @@ async def patch_public_showcase(
     request: Request,
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Update fields on a showcase. Only fields present in the body are
-    written. Returns the updated row."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
 
@@ -2446,7 +2520,6 @@ async def delete_public_showcase(
     showcase_id: UUID, request: Request,
     principal: dict = Depends(require_write),
 ):
-    """Soft-delete a showcase. Returns 204."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     async with tx(request, tenant_id) as conn:
@@ -2469,15 +2542,12 @@ async def delete_public_showcase(
     return JSONResponse(status_code=204, content=None)
 
 
-
 # ===========================================================================
-# v0.4.1 Ã¢â‚¬â€ students CRUD
+# v0.4.1 - students CRUD
 # ===========================================================================
 
 
 class StudentCreate(BaseModel):
-    """Body for POST /focms/v1/students. Mirrors the students table's required
-    columns plus the common optional ones."""
     model_config = ConfigDict(extra="forbid")
 
     first_name: str = Field(..., min_length=1)
@@ -2500,7 +2570,6 @@ class StudentCreate(BaseModel):
 
 
 class StudentPatch(BaseModel):
-    """Body for PATCH /focms/v1/students/{id}. All fields optional."""
     model_config = ConfigDict(extra="forbid")
 
     first_name: Optional[str] = None
@@ -2525,7 +2594,6 @@ async def create_student(
     request: Request,
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Create a new student record under the authenticated tenant."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     async with tx(request, tenant_id) as conn:
@@ -2576,7 +2644,6 @@ async def patch_student(
     request: Request,
     principal: dict = Depends(require_write),
 ) -> dict[str, Any]:
-    """Update fields on a student. Only fields present in the body are written."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
 
@@ -2624,8 +2691,6 @@ async def delete_student(
     student_id: UUID, request: Request,
     principal: dict = Depends(require_write),
 ):
-    """Soft-delete a student. Also soft-deletes any public_showcases pointing
-    at the student so URLs go to 404 immediately."""
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     async with tx(request, tenant_id) as conn:
@@ -2640,7 +2705,6 @@ async def delete_student(
         )
         if not row:
             raise HTTPException(404, "Student not found or already deleted")
-        # Cascade to showcases
         await conn.execute(
             "UPDATE public_showcases SET deleted_at = now() WHERE student_id = $1 AND deleted_at IS NULL",
             student_id,
@@ -2654,14 +2718,10 @@ async def delete_student(
 
 
 # ===========================================================================
-# v0.4.1 Ã¢â‚¬â€ student-scoped swim bests feed (replaces hardcoded WP feed)
+# v0.4.1 - student-scoped swim bests feed (replaces hardcoded WP feed)
 # ===========================================================================
 
 USA_SWIMMING_TIERS_2024_2028_BOYS_11_12 = {
-    # Time standards in seconds. SCY = Short Course Yards, LCM = Long Course Meters.
-    # Tiers: AAAA (elite) > AAA > AA > A > BB > B (slowest)
-    # Used by Mission Control performance log and the recompute() logic in the
-    # WP-era hydrator. Embedded here so the feed is self-contained.
     "SCY": {
         "50 Free":   {"AAAA": 25.69, "AAA": 26.39, "AA": 27.39, "A": 28.49, "BB": 30.09, "B": 32.49},
         "100 Free":  {"AAAA": 56.49, "AAA": 58.09, "AA": 60.39, "A": 62.69, "BB": 66.29, "B": 71.69},
@@ -2695,11 +2755,9 @@ USA_SWIMMING_TIERS_2024_2028_BOYS_11_12 = {
 
 
 def _next_standard(seconds: float, standards: dict[str, float]) -> tuple[Optional[str], Optional[float]]:
-    """Return the next-faster tier above the current achieved tier."""
     tier_order = ["B", "BB", "A", "AA", "AAA", "AAAA"]
-    # Sort standards from slowest to fastest (highest seconds to lowest)
     sorted_tiers = [(t, standards.get(t)) for t in tier_order if standards.get(t)]
-    sorted_tiers.sort(key=lambda x: -x[1])  # slowest first
+    sorted_tiers.sort(key=lambda x: -x[1])
     achieved = None
     next_std = None
     next_time = None
@@ -2707,13 +2765,11 @@ def _next_standard(seconds: float, standards: dict[str, float]) -> tuple[Optiona
         if seconds <= std_time:
             achieved = tier
         else:
-            # Faster than current; next standard up
             if achieved is None:
                 next_std = tier
                 next_time = std_time
                 break
     if achieved:
-        # Find next tier faster than achieved
         for tier, std_time in [(t, standards.get(t)) for t in tier_order if standards.get(t)]:
             if std_time < (standards.get(achieved) or float("inf")):
                 if next_std is None or std_time > (next_time or 0):
@@ -2727,13 +2783,6 @@ async def get_swim_bests_feed(
     student_id: UUID, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
-    """Return the swim feed payload for the student (replaces the WP feed).
-
-    Same JSON schema as johnrjordan.com/focms-feed-swim-bests/ so the outcomestar
-    theme code doesn't need to change: a `bests` dict keyed by "DIST STROKE COURSE",
-    optional `power_index`, and `standards` reference. Computed from
-    `personal_records` where record_kind='swim_best'.
-    """
     async with tx(request, principal["tenant_id"]) as conn:
         records = await conn.fetch("""
             SELECT title, value_numeric, achieved_date,
@@ -2750,7 +2799,6 @@ async def get_swim_bests_feed(
     for r in records:
         title = r["title"]
         seconds = float(r["value_numeric"])
-        # Parse title like "100 Breast SCY"
         parts = title.rsplit(" ", 1)
         if len(parts) != 2:
             continue
@@ -2769,10 +2817,8 @@ async def get_swim_bests_feed(
             "next_time_seconds": next_time,
         }
 
-    # Also call into the existing power-index logic for the same student
     pi_payload: Optional[dict] = None
     try:
-        # Re-use the same logic the dedicated endpoint uses
         async with tx(request, principal["tenant_id"]) as conn:
             base_row = await conn.fetchrow("""
                 SELECT detail, source_url, archive_date, source_id
@@ -2844,7 +2890,6 @@ async def get_swim_bests_feed(
 
 
 def _format_time(seconds: float) -> str:
-    """Format seconds as MM:SS.HH if >= 60, else SS.HH."""
     if seconds >= 60:
         m = int(seconds // 60)
         s = seconds - m * 60
@@ -2853,11 +2898,8 @@ def _format_time(seconds: float) -> str:
 
 
 def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optional[str]:
-    """Given the current tier label, return the next-faster tier label that's
-    actually defined in the standards table."""
     tier_order = ["B", "BB", "A", "AA", "AAA", "AAAA"]
     if not achieved:
-        # Return slowest defined
         for t in tier_order:
             if standards.get(t):
                 return t
@@ -2873,7 +2915,10 @@ def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optiona
 
 
 # ===========================================================================
-# v0.4.2 Ã¢â‚¬â€ student-scoped swim race log feed (replaces WP jrj_swim_race CPT)
+# v0.4.2 - student-scoped swim race log feed (replaces WP jrj_swim_race CPT)
+# ===========================================================================
+
+
 @app.get("/focms/v1/student/{student_id}/computed/swim-race-log")
 async def get_swim_race_log_feed(
     student_id: UUID, request: Request,
@@ -2883,17 +2928,6 @@ async def get_swim_race_log_feed(
     stroke: Optional[str] = None,
     since: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Return the swim race log feed for the student (replaces WP jrj_swim_race CPT).
-
-    Returns all swim_race events sorted by event_date desc, with parsed details
-    (distance, stroke, course, time, meet, team, points, time standard, relay flag).
-
-    Optional query params:
-      - limit: max rows (default 1000)
-      - course: filter by SCY / SCM / LCM
-      - stroke: filter by FR / BK / BR / FL / IM
-      - since: ISO date (YYYY-MM-DD), only races on or after this date
-    """
     where_clauses = [
         "student_id = $1",
         "event_type = 'swim_race'",
@@ -2971,7 +3005,9 @@ async def get_swim_race_log_feed(
     }
 
 
-# v0.8.0 — media storage (R2 object store with bytea fallback)
+# ===========================================================================
+# v0.8.0 - media storage (R2 object store with bytea fallback)
+# v0.9.0 - quota enforcement on POST /media
 # ===========================================================================
 
 import base64 as _b64
@@ -3012,6 +3048,10 @@ async def upload_media(
     storage_uri=key on the row, content=NULL. When R2 is not configured,
     falls back to inline bytea (storage_kind='inline_bytea', content=bytes).
 
+    v0.9.0: Quota enforcement. Tenants with storage_quota_bytes set get a
+    413 storage_quota_exceeded if this upload would push storage_used_bytes
+    past the quota. Tenants with NULL quota are unlimited.
+
     JSON body: { filename, mime_type, content_base64, kind?, visibility?, student_id? }
     Returns the media id and a URL that can be used in image src etc.
     Size cap: 10 MB after base64 decode. Kinds: image, document, video, other.
@@ -3029,9 +3069,38 @@ async def upload_media(
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
 
-    # Generate the artifact id up front so we can use it as the R2 object key
-    # before the row is inserted.
+    # v0.9.0: Quota check + artifact_id generation in one DB round trip.
+    # The trigger on media_files keeps storage_used_bytes accurate. There
+    # is a small race between this check and the INSERT below where two
+    # concurrent uploads can both pass the check; acceptable for pilot
+    # scale, the next over-quota upload gets blocked.
     async with tx(request, tenant_id) as conn:
+        quota_row = await conn.fetchrow(
+            "SELECT storage_used_bytes, storage_quota_bytes "
+            "  FROM tenants WHERE id = $1",
+            UUID(tenant_id),
+        )
+        if quota_row is None:
+            raise HTTPException(404, "tenant_not_found")
+        used = quota_row["storage_used_bytes"] or 0
+        quota = quota_row["storage_quota_bytes"]
+        if quota is not None and (used + len(content)) > quota:
+            log.info(
+                "media_upload_rejected_quota tenant=%s used=%d quota=%d incoming=%d",
+                tenant_id, used, quota, len(content),
+            )
+            raise HTTPException(
+                status_code=413,
+                detail={
+                    "error": "storage_quota_exceeded",
+                    "used_bytes": used,
+                    "quota_bytes": quota,
+                    "incoming_bytes": len(content),
+                    "would_be_bytes": used + len(content),
+                },
+            )
+        # Generate the artifact id up front so we can use it as the R2
+        # object key before the row is inserted.
         artifact_id = await conn.fetchval("SELECT gen_random_uuid_v7()")
 
     # Upload to R2 (or get inline_bytea sentinel if R2 disabled)
@@ -3048,8 +3117,6 @@ async def upload_media(
 
     storage_kind = storage["storage_kind"]
     storage_uri = storage["storage_uri"]
-    # Content bytes are stored in the row ONLY when we're using bytea.
-    # When R2 stored the bytes, content is NULL (CHECK constraint enforces this).
     db_content = content if storage_kind == "inline_bytea" else None
 
     async with tx(request, tenant_id) as conn:
@@ -3079,8 +3146,7 @@ async def upload_media(
                 UUID(user_id),
             )
         except Exception as exc:
-            # If we already uploaded to R2 but the DB insert failed, try to
-            # clean up the orphan R2 object so we don't pay for ghost bytes.
+            # Orphan R2 cleanup if DB insert failed.
             if storage_kind == "r2" and storage_uri:
                 try:
                     focms_storage.delete_object(storage_uri)
@@ -3113,13 +3179,10 @@ async def upload_media(
 async def serve_media(media_id: UUID, request: Request):
     """Serve a media file.
 
-    v0.8.0: For storage_kind='r2' rows, returns a 302 redirect to a 5-minute
-    presigned URL so the client downloads directly from R2 (zero egress cost
-    on our side, no proxy bandwidth). For storage_kind='inline_bytea' rows,
-    streams the bytes from Postgres with the appropriate MIME type.
-
-    No auth required for public files; private/unlisted return 404 to
-    unauthenticated callers. (For simplicity, treat unlisted same as public.)
+    For storage_kind='r2' rows: returns 302 redirect to a 5-minute presigned
+    URL (zero egress cost on our side). For 'inline_bytea': streams bytes
+    from Postgres. No auth required for public/unlisted files; private
+    returns 404 to unauthenticated callers.
     """
     async with request.app.state.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -3147,11 +3210,8 @@ async def serve_media(media_id: UUID, request: Request):
         except Exception as exc:
             log.error("presigned URL generation failed for %s: %r", media_id, exc)
             raise HTTPException(502, "Cannot generate download URL") from exc
-        # 302 (not 301) so browsers don't cache the redirect past the
-        # presigned URL's 5-minute expiry.
         return RedirectResponse(url=presigned_url, status_code=302)
 
-    # storage_kind == 'inline_bytea' - stream bytes from Postgres
     if row["content"] is None:
         log.error("media row %s is inline_bytea but content is NULL", media_id)
         raise HTTPException(500, "Media metadata inconsistent")
@@ -3169,16 +3229,14 @@ async def delete_media(
 ):
     """Soft-delete a media file.
 
-    v0.8.0: When storage_kind='r2', removes the R2 object before the DB
-    soft-delete. R2 cleanup is best-effort - if it fails, the DB row is
-    still marked deleted and a warning is logged. The orphan R2 object can
-    be swept later by a janitor job.
+    For storage_kind='r2': removes the R2 object before the DB soft-delete.
+    R2 cleanup is best-effort - if it fails, the DB row is still marked
+    deleted and a warning is logged. The orphan R2 object can be swept
+    later by a janitor job.
     """
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
     async with tx(request, tenant_id) as conn:
-        # Fetch storage_kind + storage_uri before the soft-delete so we can
-        # clean up R2.
         meta = await conn.fetchrow(
             """
             SELECT storage_kind, storage_uri
@@ -3190,7 +3248,6 @@ async def delete_media(
         if not meta:
             raise HTTPException(404, "Media not found or already deleted")
 
-        # Best-effort R2 cleanup. Don't block the DB delete on R2 failures.
         if meta["storage_kind"] == "r2" and meta["storage_uri"]:
             try:
                 focms_storage.delete_object(meta["storage_uri"])
@@ -3219,12 +3276,12 @@ async def delete_media(
     return JSONResponse(status_code=204, content=None)
 
 
-# Helper exposed for tests: list media for a student
 @app.get("/focms/v1/student/{student_id}/media")
 async def list_student_media(
     student_id: UUID, request: Request,
     principal: dict = Depends(authenticate),
 ) -> dict[str, Any]:
+    """List media for a student."""
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch(
             """
@@ -3253,6 +3310,7 @@ async def list_student_media(
             for r in rows
         ],
     }
+
 
 # ---------------------------------------------------------------------------
 # Error handlers
