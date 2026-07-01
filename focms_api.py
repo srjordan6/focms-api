@@ -1,4 +1,4 @@
-from fastapi.middleware.cors import CORSMiddleware
+﻿from fastapi.middleware.cors import CORSMiddleware
 """focms_api.py - FOCMS Data Provider REST API v0.10.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
@@ -737,7 +737,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.10.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.11.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -752,6 +752,8 @@ app.add_middleware(
 app.include_router(addresses_router)
 app.include_router(i18n_router)
 app.include_router(parent_portal_router)
+from focms_cohort_signup import router as cohort_signup_router
+app.include_router(cohort_signup_router)
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -893,7 +895,7 @@ def _human_bytes(n: Optional[int]) -> Optional[str]:
 
 @app.get("/focms/v1/health")
 async def health(request: Request) -> dict[str, Any]:
-    payload: dict[str, Any] = {"status": "ok", "version": "0.10.0"}
+    payload: dict[str, Any] = {"status": "ok", "version": "0.11.0"}
     crypto: dict[str, Any] = {"kek_set": FOCMS_KEK_MASTER is not None}
     try:
         async with request.app.state.pool.acquire() as conn:
