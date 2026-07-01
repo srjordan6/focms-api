@@ -1,9 +1,28 @@
 from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.9.0
+"""focms_api.py - FOCMS Data Provider REST API v0.10.0
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
 Service behind PgBouncer in transaction mode.
+
+v0.10.0 (2026-07-01):
+- Hybrid A+B artifact serving. Two-bucket R2 architecture: public assets
+  land in R2_BUCKET_PUBLIC (served directly via PUBLIC_ARTIFACT_URL CDN
+  edge domain - zero egress, no API round trip), private assets stay in
+  R2_BUCKET (served via short-lived presigned URLs through
+  /focms/v1/media/{id} as in v0.8+). Which bucket is chosen at upload
+  time based on visibility ('public' -> public bucket, everything else
+  -> private bucket).
+- Schema: media_files gains bucket text NOT NULL DEFAULT 'private'
+  CHECK (bucket IN ('public','private')). Separates parent intent
+  (visibility) from physical storage (bucket) so they can evolve
+  independently. Migration added via ALTER TABLE ADD COLUMN IF NOT
+  EXISTS + idempotent CHECK constraint entry in MIGRATIONS.
+- New env vars: R2_BUCKET_PUBLIC (public bucket name),
+  PUBLIC_ARTIFACT_URL (CDN base URL). Both optional; if unset the
+  storage module falls back to v0.9.0 single-bucket behavior.
+- Architecture: archive_entries source_id
+  'v0_10_0_artifact_serving_design_v0_1'.
 
 v0.9.0 (2026-06-29):
 - Per-tenant storage quota enforcement. POST /focms/v1/media now rejects
@@ -375,6 +394,28 @@ MIGRATIONS: list[tuple[str, str]] = [
         "CREATE INDEX IF NOT EXISTS media_files_storage_kind_idx "
         "ON media_files (storage_kind)",
     ),
+    # ----------------------------------------------------------------------
+    # v0.10.0 - two-bucket routing column (Hybrid A+B artifact serving)
+    # ----------------------------------------------------------------------
+    (
+        "media_files_add_bucket",
+        "ALTER TABLE media_files ADD COLUMN IF NOT EXISTS bucket text "
+        "NOT NULL DEFAULT 'private'",
+    ),
+    (
+        "media_files_bucket_check",
+        """DO $do$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conname = 'media_files_bucket_check'
+                  AND conrelid = 'media_files'::regclass
+            ) THEN
+                ALTER TABLE media_files
+                ADD CONSTRAINT media_files_bucket_check
+                CHECK (bucket IN ('public', 'private'));
+            END IF;
+        END $do$""",
+    ),
     (
         "seed_john_showcase",
         """INSERT INTO public_showcases (
@@ -696,7 +737,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.9.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.10.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -3052,6 +3093,11 @@ async def upload_media(
     413 storage_quota_exceeded if this upload would push storage_used_bytes
     past the quota. Tenants with NULL quota are unlimited.
 
+    v0.10.0: Two-bucket routing. If visibility='public', upload targets the
+    R2_BUCKET_PUBLIC bucket and stores bucket='public' on the row so
+    serve_media can 302 straight to the CDN edge URL. Otherwise the object
+    lands in the private bucket (R2_BUCKET) served via presigned URL.
+
     JSON body: { filename, mime_type, content_base64, kind?, visibility?, student_id? }
     Returns the media id and a URL that can be used in image src etc.
     Size cap: 10 MB after base64 decode. Kinds: image, document, video, other.
@@ -3068,6 +3114,15 @@ async def upload_media(
 
     tenant_id = principal["tenant_id"]
     user_id = principal["user_id"]
+
+    # v0.10.0: derive physical bucket from parent-intent visibility.
+    # Only 'public' visibility routes to the public bucket. 'unlisted' and
+    # 'private' stay in the private bucket (serve_media still 404s on
+    # visibility='private'; 'unlisted' gets a presigned URL).
+    visibility = body.visibility or "public"
+    if visibility not in ("public", "unlisted", "private"):
+        raise HTTPException(400, f"Invalid visibility: {visibility!r}")
+    bucket_kind = "public" if visibility == "public" else "private"
 
     # v0.9.0: Quota check + artifact_id generation in one DB round trip.
     # The trigger on media_files keeps storage_used_bytes accurate. There
@@ -3103,13 +3158,15 @@ async def upload_media(
         # object key before the row is inserted.
         artifact_id = await conn.fetchval("SELECT gen_random_uuid_v7()")
 
-    # Upload to R2 (or get inline_bytea sentinel if R2 disabled)
+    # Upload to R2 (or get inline_bytea sentinel if R2 disabled).
+    # v0.10.0: bucket_kind selects the target R2 bucket.
     try:
         storage = focms_storage.upload_bytes(
             tenant_id=tenant_id,
             artifact_id=str(artifact_id),
             data=content,
             content_type=body.mime_type,
+            bucket_kind=bucket_kind,
         )
     except Exception as exc:
         log.error("media upload to R2 failed: %r", exc)
@@ -3117,6 +3174,10 @@ async def upload_media(
 
     storage_kind = storage["storage_kind"]
     storage_uri = storage["storage_uri"]
+    # v0.10.0: bucket returned by storage module reflects actual routing
+    # (may be 'private' even when bucket_kind='public' was requested, if
+    # R2_BUCKET_PUBLIC is unset and the module fell back).
+    bucket = storage["bucket"]
     db_content = content if storage_kind == "inline_bytea" else None
 
     async with tx(request, tenant_id) as conn:
@@ -3125,11 +3186,11 @@ async def upload_media(
                 """
                 INSERT INTO media_files (
                     id, tenant_id, student_id, kind, mime_type, original_filename,
-                    byte_size, content, storage_kind, storage_uri,
+                    byte_size, content, storage_kind, storage_uri, bucket,
                     visibility, sha256_hex, created_by
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 RETURNING id, byte_size, mime_type, kind, visibility, sha256_hex,
-                          storage_kind, storage_uri
+                          storage_kind, storage_uri, bucket
                 """,
                 artifact_id,
                 UUID(tenant_id),
@@ -3141,17 +3202,20 @@ async def upload_media(
                 db_content,
                 storage_kind,
                 storage_uri,
-                body.visibility or "public",
+                bucket,
+                visibility,
                 sha,
                 UUID(user_id),
             )
         except Exception as exc:
             # Orphan R2 cleanup if DB insert failed.
+            # v0.10.0: pass bucket_kind so cleanup targets the right bucket.
             if storage_kind == "r2" and storage_uri:
                 try:
-                    focms_storage.delete_object(storage_uri)
+                    focms_storage.delete_object(storage_uri, bucket_kind=bucket)
                 except Exception:
-                    log.warning("orphan R2 object left behind: %s", storage_uri)
+                    log.warning("orphan R2 object left behind: %s (bucket=%s)",
+                                storage_uri, bucket)
             raise HTTPException(500, f"DB insert failed: {exc}") from exc
         await write_audit(
             conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
@@ -3161,6 +3225,7 @@ async def upload_media(
                 "mime_type": row["mime_type"],
                 "bytes": row["byte_size"],
                 "storage_kind": row["storage_kind"],
+                "bucket": row["bucket"],
             },
         )
     return {
@@ -3172,6 +3237,7 @@ async def upload_media(
         "visibility": row["visibility"],
         "sha256": row["sha256_hex"],
         "storage_kind": row["storage_kind"],
+        "bucket": row["bucket"],
     }
 
 
@@ -3179,16 +3245,19 @@ async def upload_media(
 async def serve_media(media_id: UUID, request: Request):
     """Serve a media file.
 
-    For storage_kind='r2' rows: returns 302 redirect to a 5-minute presigned
-    URL (zero egress cost on our side). For 'inline_bytea': streams bytes
-    from Postgres. No auth required for public/unlisted files; private
-    returns 404 to unauthenticated callers.
+    v0.10.0: two-bucket routing.
+      - bucket='public' + storage_kind='r2' -> 302 to PUBLIC_ARTIFACT_URL
+        CDN edge URL (zero egress, edge-cached, no presign overhead).
+      - bucket='private' + storage_kind='r2' -> 302 to short-lived presigned
+        URL against R2_BUCKET (as in v0.8.0-v0.9.0).
+      - storage_kind='inline_bytea' -> stream bytes from Postgres (legacy).
+      - visibility='private' -> 404 (no anonymous access, unchanged).
     """
     async with request.app.state.pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT content, mime_type, byte_size, visibility,
-                   storage_kind, storage_uri
+                   storage_kind, storage_uri, bucket
             FROM media_files
             WHERE id = $1 AND deleted_at IS NULL
             """,
@@ -3203,9 +3272,39 @@ async def serve_media(media_id: UUID, request: Request):
         if not row["storage_uri"]:
             log.error("media row %s has storage_kind=r2 but no storage_uri", media_id)
             raise HTTPException(500, "Media metadata inconsistent")
+
+        # v0.10.0: public bucket goes straight to CDN; private bucket presigns.
+        if row["bucket"] == "public":
+            try:
+                cdn_url = focms_storage.get_public_url(row["storage_uri"])
+                return RedirectResponse(url=cdn_url, status_code=302)
+            except RuntimeError as exc:
+                # PUBLIC_ARTIFACT_URL not configured. Fall through to
+                # presigned URL against the public bucket so serving still
+                # works even without CDN wiring.
+                log.warning(
+                    "media %s bucket=public but PUBLIC_ARTIFACT_URL unset, "
+                    "falling back to presigned URL: %r",
+                    media_id, exc,
+                )
+                try:
+                    presigned_url = focms_storage.get_presigned_url(
+                        row["storage_uri"], expiry_seconds=300,
+                        bucket_kind="public",
+                    )
+                    return RedirectResponse(url=presigned_url, status_code=302)
+                except Exception as exc2:
+                    log.error(
+                        "presigned URL fallback failed for %s: %r",
+                        media_id, exc2,
+                    )
+                    raise HTTPException(502, "Cannot generate download URL") from exc2
+
+        # Private bucket path (matches v0.9.0 behavior exactly).
         try:
             presigned_url = focms_storage.get_presigned_url(
-                row["storage_uri"], expiry_seconds=300
+                row["storage_uri"], expiry_seconds=300,
+                bucket_kind="private",
             )
         except Exception as exc:
             log.error("presigned URL generation failed for %s: %r", media_id, exc)
@@ -3239,7 +3338,7 @@ async def delete_media(
     async with tx(request, tenant_id) as conn:
         meta = await conn.fetchrow(
             """
-            SELECT storage_kind, storage_uri
+            SELECT storage_kind, storage_uri, bucket
             FROM media_files
             WHERE id = $1 AND deleted_at IS NULL
             """,
@@ -3248,13 +3347,18 @@ async def delete_media(
         if not meta:
             raise HTTPException(404, "Media not found or already deleted")
 
+        # v0.10.0: pass bucket_kind so cleanup targets the right R2 bucket.
         if meta["storage_kind"] == "r2" and meta["storage_uri"]:
             try:
-                focms_storage.delete_object(meta["storage_uri"])
+                focms_storage.delete_object(
+                    meta["storage_uri"],
+                    bucket_kind=meta["bucket"],
+                )
             except Exception as exc:
                 log.warning(
-                    "R2 delete failed for media %s key=%s err=%r (DB delete will proceed)",
-                    media_id, meta["storage_uri"], exc,
+                    "R2 delete failed for media %s key=%s bucket=%s err=%r "
+                    "(DB delete will proceed)",
+                    media_id, meta["storage_uri"], meta["bucket"], exc,
                 )
 
         row = await conn.fetchrow(
@@ -3271,7 +3375,10 @@ async def delete_media(
             conn, actor_user_id=user_id, actor_role=principal.get("role", "admin"),
             tenant_id=tenant_id, action="delete", target_table="media_files",
             target_id=str(media_id),
-            new_value={"storage_kind": meta["storage_kind"]},
+            new_value={
+                "storage_kind": meta["storage_kind"],
+                "bucket": meta["bucket"],
+            },
         )
     return JSONResponse(status_code=204, content=None)
 
