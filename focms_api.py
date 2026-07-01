@@ -893,7 +893,7 @@ def _human_bytes(n: Optional[int]) -> Optional[str]:
 
 @app.get("/focms/v1/health")
 async def health(request: Request) -> dict[str, Any]:
-    payload: dict[str, Any] = {"status": "ok", "version": "0.9.0"}
+    payload: dict[str, Any] = {"status": "ok", "version": "0.10.0"}
     crypto: dict[str, Any] = {"kek_set": FOCMS_KEK_MASTER is not None}
     try:
         async with request.app.state.pool.acquire() as conn:
