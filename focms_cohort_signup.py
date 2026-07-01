@@ -368,24 +368,6 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 cohort["id"],
             )
 
-            # Step 10: audit log (best-effort; do not roll back on audit failure)
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO audit_log (
-                        tenant_id, actor_user_id, actor_role, action,
-                        target_table, target_id, target_label, new_value
-                    ) VALUES ($1, $2, 'tenant_owner', 'cohort_signup',
-                              'tenants', $1::text, $3, $4::jsonb)
-                    """,
-                    family_tenant_id,
-                    parent_user_id,
-                    f"{body.parent_last_name} Family",
-                    f'{{"cohort_id": "{cohort["id"]}", "cohort_code": "{body.code}", "client_ip": "{client_ip}"}}',
-                )
-            except Exception as exc:
-                log.warning("audit_log insert failed (non-fatal): %r", exc)
-
 
     # v0.11.1: audit_log MUST run on a fresh connection outside the main
     # transaction. Any error inside a Postgres transaction poisons it, and
@@ -399,12 +381,13 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                     tenant_id, actor_user_id, actor_role, action,
                     target_table, target_id, target_label, new_value
                 ) VALUES ($1, $2, 'tenant_owner', 'create',
-                          'tenants', $1::text, $3, $4::jsonb)
+                          'tenants', $5, $3, $4::jsonb)
                 """,
                 family_tenant_id,
                 parent_user_id,
                 f"{body.parent_last_name} Family",
                 f'{{"cohort_id": "{cohort["id"]}", "cohort_code": "{body.code}", "client_ip": "{client_ip}", "event_type": "cohort_signup"}}',
+                str(family_tenant_id),
             )
     except Exception as exc:
         log.warning("audit_log insert failed (non-fatal): %r", exc)
