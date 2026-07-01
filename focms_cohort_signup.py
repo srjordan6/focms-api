@@ -1,4 +1,4 @@
-"""
+﻿"""
 focms_cohort_signup.py - Anonymous cohort-based parent signup for
 outcomestar.app. Provisions a family tenant, parent user, student
 record, tenant_owner role, and API token in one atomic transaction.
@@ -386,6 +386,28 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             except Exception as exc:
                 log.warning("audit_log insert failed (non-fatal): %r", exc)
 
+
+    # v0.11.1: audit_log MUST run on a fresh connection outside the main
+    # transaction. Any error inside a Postgres transaction poisons it, and
+    # try/except at Python level cannot unpoison. Moved out means audit
+    # failure does not undo the completed signup.
+    try:
+        async with pool.acquire() as audit_conn:
+            await audit_conn.execute(
+                """
+                INSERT INTO audit_log (
+                    tenant_id, actor_user_id, actor_role, action,
+                    target_table, target_id, target_label, new_value
+                ) VALUES ($1, $2, 'tenant_owner', 'create',
+                          'tenants', $1::text, $3, $4::jsonb)
+                """,
+                family_tenant_id,
+                parent_user_id,
+                f"{body.parent_last_name} Family",
+                f'{{"cohort_id": "{cohort["id"]}", "cohort_code": "{body.code}", "client_ip": "{client_ip}", "event_type": "cohort_signup"}}',
+            )
+    except Exception as exc:
+        log.warning("audit_log insert failed (non-fatal): %r", exc)
     # Transaction committed. Build welcome URL.
     welcome_url = f"https://app.outcomestar.app/welcome?t={raw_token}"
 
