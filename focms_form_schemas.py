@@ -520,21 +520,23 @@ async def post_entries(request: Request, body: EntriesRequest):
                     )
                     placeholders = placeholders + ", " + extra_placeholders
 
-                sql = f"""
+                                total_cols = len(cols) + len(defaults_cols)
+                user_id_ph = f\"${total_cols + 3}\"
+                sql = f\"\"\"
                     INSERT INTO veteran_military_status
                         (student_id, tenant_id, {col_list},
                          created_by, updated_by, visibility)
                     VALUES ($1, $2, {placeholders},
-                            ${len(cols) + 3}, ${len(cols) + 3}, 'private')
+                            {user_id_ph}, {user_id_ph}, 'private')
                     ON CONFLICT (student_id) DO UPDATE
                        SET {update_clause},
                            updated_at = now(),
                            updated_by = EXCLUDED.updated_by
                     RETURNING student_id
                 """
-                all_vals = list(vals) + defaults_vals
                 row = await conn.fetchrow(
-                    sql, body.student_id, tenant_id, *all_vals, user_id
+                    sql, body.student_id, tenant_id,
+                    *vals, *defaults_vals, user_id
                 )
                 if row:
                     saved_count += len(cols)
