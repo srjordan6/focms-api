@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.0 · Session 1 of the schema-driven parent portal build.
+v0.12.1 · Session 1 of the schema-driven parent portal build.
+         v0.12.1 fixes veteran_military_status placeholder alignment.
 
 Endpoints:
   GET  /focms/v1/form-schemas               Full catalog for form rendering
@@ -217,7 +218,7 @@ async def get_form_schemas(
                 catalogs[name] = [_row_to_dict(r) for r in rows]
 
     return {
-        "version": "0.12.0",
+        "version": "0.12.1",
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "field_count": len(fields),
         "fields": fields,
@@ -493,17 +494,10 @@ async def post_entries(request: Request, body: EntriesRequest):
             if buckets["veteran_military_status"]:
                 cols = [b["col"] for b in buckets["veteran_military_status"]]
                 vals = [b["val"] for b in buckets["veteran_military_status"]]
-                col_list = ", ".join(cols)
-                placeholders = ", ".join(
-                    f"${i + 3}" for i in range(len(cols))
-                )
                 update_clause = ", ".join(
                     f"{c} = EXCLUDED.{c}" for c in cols
                 )
-                # Non-null defaults for required cols not being written
-                # is_veteran, is_active_us_military, is_dependent_of_us_veteran,
-                # is_national_guard_or_active_reserve default to false.
-                # service_branches defaults to empty array.
+                # Non-null defaults for required cols not being written.
                 required_defaults = {
                     "is_veteran": False,
                     "is_active_us_military": False,
@@ -513,28 +507,30 @@ async def post_entries(request: Request, body: EntriesRequest):
                 }
                 defaults_cols = [c for c in required_defaults if c not in cols]
                 defaults_vals = [required_defaults[c] for c in defaults_cols]
-                if defaults_cols:
-                    col_list = col_list + ", " + ", ".join(defaults_cols)
-                    extra_placeholders = ", ".join(
-                        f"${len(cols) + 4 + i}" for i in range(len(defaults_cols))
-                    )
-                    placeholders = placeholders + ", " + extra_placeholders
+
+                # Layout: $1=student_id, $2=tenant_id, then vals, then defaults, then user_id.
+                all_cols = cols + defaults_cols
+                col_list = ", ".join(all_cols)
+                placeholders = ", ".join(
+                    f"${i + 3}" for i in range(len(all_cols))
+                )
+                user_id_ph = f"${3 + len(all_cols)}"
 
                 sql = f"""
                     INSERT INTO veteran_military_status
                         (student_id, tenant_id, {col_list},
                          created_by, updated_by, visibility)
                     VALUES ($1, $2, {placeholders},
-                            ${len(cols) + 3}, ${len(cols) + 3}, 'private')
+                            {user_id_ph}, {user_id_ph}, 'private')
                     ON CONFLICT (student_id) DO UPDATE
                        SET {update_clause},
                            updated_at = now(),
                            updated_by = EXCLUDED.updated_by
                     RETURNING student_id
                 """
-                all_vals = list(vals) + defaults_vals
                 row = await conn.fetchrow(
-                    sql, body.student_id, tenant_id, *all_vals, user_id
+                    sql, body.student_id, tenant_id,
+                    *vals, *defaults_vals, user_id
                 )
                 if row:
                     saved_count += len(cols)
