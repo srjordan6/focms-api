@@ -198,6 +198,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from focms_addresses import router as addresses_router
 from focms_i18n import router as i18n_router
 from focms_parent_portal import router as parent_portal_router
+from focms_form_schemas import router as form_schemas_router
 import focms_storage
 
 DATABASE_URL = os.environ.get("DATABASE_URL_POOLED") or os.environ.get("DATABASE_URL")
@@ -737,7 +738,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.11.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -752,6 +753,7 @@ app.add_middleware(
 app.include_router(addresses_router)
 app.include_router(i18n_router)
 app.include_router(parent_portal_router)
+app.include_router(form_schemas_router)
 from focms_cohort_signup import router as cohort_signup_router
 app.include_router(cohort_signup_router)
 
@@ -895,7 +897,7 @@ def _human_bytes(n: Optional[int]) -> Optional[str]:
 
 @app.get("/focms/v1/health")
 async def health(request: Request) -> dict[str, Any]:
-    payload: dict[str, Any] = {"status": "ok", "version": "0.11.0"}
+    payload: dict[str, Any] = {"status": "ok", "version": "0.12.0"}
     crypto: dict[str, Any] = {"kek_set": FOCMS_KEK_MASTER is not None}
     try:
         async with request.app.state.pool.acquire() as conn:
