@@ -777,8 +777,8 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.8)
-#   milestones(+media) . academics . courses . tests . family . religion
+# Parent-portal capture endpoints (v0.12.12)
+#   ... family now stores per-field public map (email/phone/DOB/sex/marital locked)
 # ===========================================================================
 from datetime import date as _pp_date
 
@@ -886,7 +886,9 @@ async def _pp_current_school_name(conn, student_id: str):
 # ------------------------- Millstones & Milestones -------------------------
 
 class MilestoneItem(BaseModel):
-    milestone_code: str
+    milestone_code: Optional[str] = None
+    custom_title: Optional[str] = None
+    custom_category: Optional[str] = None
     happened: bool = True
     event_date: Optional[str] = None
     event_notes: Optional[str] = None
@@ -904,14 +906,17 @@ async def get_student_milestones(request: Request, student_id: str):
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
         rows = await conn.fetch(
-            "SELECT milestone_code, happened, event_date, event_notes, artifact_url "
-            "FROM student_life_milestones WHERE student_id=$1::uuid AND deleted_at IS NULL",
-            student_id,
-        )
-    return {"student_id": student_id, "milestones": [
-        {"milestone_code": r["milestone_code"], "happened": r["happened"],
-         "event_date": r["event_date"].isoformat() if r["event_date"] else None,
-         "event_notes": r["event_notes"], "artifact_url": r["artifact_url"]} for r in rows]}
+            "SELECT milestone_code, custom_title, custom_category, happened, event_date, event_notes, "
+            "artifact_url FROM student_life_milestones WHERE student_id=$1::uuid AND deleted_at IS NULL",
+            student_id)
+    catalog, custom = [], []
+    for r in rows:
+        d = {"milestone_code": r["milestone_code"], "custom_title": r["custom_title"],
+             "custom_category": r["custom_category"], "happened": r["happened"],
+             "event_date": r["event_date"].isoformat() if r["event_date"] else None,
+             "event_notes": r["event_notes"], "artifact_url": r["artifact_url"]}
+        (catalog if r["milestone_code"] else custom).append(d)
+    return {"student_id": student_id, "milestones": catalog, "custom": custom}
 
 
 @router.post("/student/{student_id}/milestones")
@@ -923,26 +928,40 @@ async def post_student_milestones(request: Request, student_id: str, body: Miles
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            # replace all parent-entered CUSTOM rows (no catalog code) up front
+            await conn.execute(
+                "DELETE FROM student_life_milestones WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                "AND source_system='parent_portal' AND milestone_code IS NULL", tenant_id, student_id)
             for item in body.items:
                 code = (item.milestone_code or "").strip()
-                if not code:
-                    continue
-                await conn.execute(
-                    "DELETE FROM student_life_milestones WHERE tenant_id=$1::uuid "
-                    "AND student_id=$2::uuid AND milestone_code=$3",
-                    tenant_id, student_id, code)
                 notes = item.event_notes.strip() if item.event_notes and item.event_notes.strip() else None
                 art = (item.artifact_url or "").strip() or None
-                if not item.happened and not item.event_date and not notes and not art:
-                    cleared += 1
-                    continue
-                await conn.execute(
-                    "INSERT INTO student_life_milestones (tenant_id, student_id, milestone_code, "
-                    "happened, event_date, event_notes, artifact_url, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,'parent_portal',$8::uuid,$8::uuid)",
-                    tenant_id, student_id, code, bool(item.happened),
-                    _pp_parse_date(item.event_date), notes, art, user_id)
-                saved += 1
+                d = _pp_parse_date(item.event_date)
+                if code:
+                    await conn.execute(
+                        "DELETE FROM student_life_milestones WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                        "AND milestone_code=$3", tenant_id, student_id, code)
+                    if not item.happened and not d and not notes and not art:
+                        cleared += 1
+                        continue
+                    await conn.execute(
+                        "INSERT INTO student_life_milestones (tenant_id, student_id, milestone_code, "
+                        "happened, event_date, event_notes, artifact_url, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,'parent_portal',$8::uuid,$8::uuid)",
+                        tenant_id, student_id, code, bool(item.happened), d, notes, art, user_id)
+                    saved += 1
+                else:
+                    title = (item.custom_title or "").strip()
+                    if not title:
+                        continue
+                    await conn.execute(
+                        "INSERT INTO student_life_milestones (tenant_id, student_id, milestone_code, "
+                        "custom_title, custom_category, happened, event_date, event_notes, artifact_url, "
+                        "source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,NULL,$3,$4,$5,$6,$7,$8,'parent_portal',$9::uuid,$9::uuid)",
+                        tenant_id, student_id, title, (item.custom_category or None),
+                        bool(item.happened), d, notes, art, user_id)
+                    saved += 1
     return {"student_id": student_id, "saved": saved, "cleared": cleared}
 
 
@@ -1235,12 +1254,13 @@ async def post_student_tests(request: Request, student_id: str, body: TestsReque
 
 
 # -------------------------------- Family -----------------------------------
-# Names + email are envelope-encrypted at rest (focms_encrypt_pii / _decrypt_pii,
-# SECURITY DEFINER). KEK from FOCMS_KEK_MASTER. Structured Father / Mother via
-# relationship + guardian_order.
+# Names + email are envelope-encrypted (focms_encrypt_pii / _decrypt_pii).
+# Per-field public choice stored in details->'public_fields'. A parent's email,
+# phone, DOB, legal sex, and marital status are LOCKED (forced non-public).
 
 import os as _pp_os
 _PP_KEK = _pp_os.environ.get("FOCMS_KEK_MASTER")
+_FAMILY_LOCKED = {"email", "phone", "date_of_birth", "legal_sex", "marital_relationship"}
 
 
 class FamilyMember(BaseModel):
@@ -1267,6 +1287,7 @@ class FamilyMember(BaseModel):
     resides_with_student: Optional[bool] = None
     is_legal_guardian: Optional[bool] = True
     notes: Optional[str] = None
+    public: dict = Field(default_factory=dict)
 
 
 class FamilyRequest(BaseModel):
@@ -1279,6 +1300,8 @@ def _fm_has_data(m: FamilyMember) -> bool:
 
 
 async def _insert_family_member(conn, tenant_id, student_id, user_id, relationship, order, m: FamilyMember):
+    public = {k: (False if k in _FAMILY_LOCKED else bool(v)) for k, v in (m.public or {}).items()}
+    pub_json = json.dumps(public)
     await conn.execute(
         """
         INSERT INTO family_members
@@ -1288,7 +1311,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              profession, position_title, employer,
              undergrad_institution, undergrad_degree, undergrad_year,
              grad_institution, grad_degree, grad_year,
-             marital_relationship, resides_with_student, notes,
+             marital_relationship, resides_with_student, notes, details,
              source_system, created_by, updated_by)
         VALUES
             ($1::uuid,$2::uuid,$3,$4,$5,
@@ -1298,7 +1321,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              $16,$17,$18,
              $19,$20,$21,
              $22,$23,$24,
-             $25,$26,$27,
+             $25,$26,$27, jsonb_build_object('public_fields', $30::jsonb),
              'parent_portal',$28::uuid,$28::uuid)
         """,
         tenant_id, student_id, relationship, order,
@@ -1312,7 +1335,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
         (m.undergrad_institution or None), (m.undergrad_degree or None), _pp_int(m.undergrad_year),
         (m.grad_institution or None), (m.grad_degree or None), _pp_int(m.grad_year),
         (m.marital_relationship or None), m.resides_with_student, (m.notes or None),
-        user_id, _PP_KEK,
+        user_id, _PP_KEK, pub_json,
     )
 
 
@@ -1333,7 +1356,8 @@ async def get_student_family(request: Request, student_id: str):
                    phone, profession, position_title, employer,
                    undergrad_institution, undergrad_degree, undergrad_year,
                    grad_institution, grad_degree, grad_year,
-                   marital_relationship, resides_with_student, notes
+                   marital_relationship, resides_with_student, notes,
+                   details->'public_fields' AS public_fields
               FROM family_members
              WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal'
              ORDER BY guardian_order NULLS LAST
@@ -1342,6 +1366,12 @@ async def get_student_family(request: Request, student_id: str):
         )
     out = {"father": {}, "mother": {}}
     for r in rows:
+        pf = r["public_fields"]
+        if isinstance(pf, str):
+            try:
+                pf = json.loads(pf)
+            except Exception:
+                pf = {}
         d = {
             "prefix": r["prefix"], "first_name": r["first_name"], "middle_name": r["middle_name"],
             "last_name": r["last_name"], "suffix": r["suffix"], "legal_sex": r["legal_sex"],
@@ -1352,12 +1382,12 @@ async def get_student_family(request: Request, student_id: str):
             "undergrad_year": r["undergrad_year"], "grad_institution": r["grad_institution"],
             "grad_degree": r["grad_degree"], "grad_year": r["grad_year"],
             "marital_relationship": r["marital_relationship"], "resides_with_student": r["resides_with_student"],
-            "is_legal_guardian": r["is_legal_guardian"], "notes": r["notes"],
+            "is_legal_guardian": r["is_legal_guardian"], "notes": r["notes"], "public": pf or {},
         }
         rel = (r["relationship"] or "").lower()
         if rel in ("father", "mother"):
             out[rel] = d
-    return {"student_id": student_id, "father": out["father"], "mother": out["mother"]}
+    return {"student_id": student_id, "father": out["father"], "mother": out["mother"], "locked": sorted(_FAMILY_LOCKED)}
 
 
 @router.post("/student/{student_id}/family")
@@ -1453,3 +1483,227 @@ async def post_student_religion(request: Request, student_id: str, body: Religio
                     "'parent_portal', $4::uuid, $4::uuid)",
                     tenant_id, student_id, rel_json, user_id)
     return {"student_id": student_id, "saved": True}
+
+
+# ---------------------------- Personal details -----------------------------
+# Identity + demographics on student_personal_details (direct columns).
+# Per-field public choice in details->'public_fields'. Fields that cannot be
+# public for a minor under privacy / anti-discrimination / child-safety law are
+# LOCKED: their public flag is forced false server-side regardless of input,
+# and the client renders them non-toggleable.
+
+_PERSONAL_LOCKED = {
+    "gender_identity", "legal_sex_at_birth", "email_primary", "phone_primary",
+    "citizenship_status", "place_of_birth_country", "is_hispanic_or_latino", "racial_background",
+}
+
+
+class PersonalDetailsRequest(BaseModel):
+    chosen_name: Optional[str] = None
+    pronouns: list[str] = Field(default_factory=list)
+    gender_identity: list[str] = Field(default_factory=list)
+    legal_sex_at_birth: Optional[str] = None
+    email_primary: Optional[str] = None
+    phone_primary: Optional[str] = None
+    citizenship_status: Optional[str] = None
+    place_of_birth_country: Optional[str] = None
+    is_hispanic_or_latino: Optional[bool] = None
+    racial_background: list[str] = Field(default_factory=list)
+    language_spoken_at_home: Optional[str] = None
+    first_language_native: Optional[str] = None
+    public: dict = Field(default_factory=dict)
+
+
+@router.get("/student/{student_id}/personal-details")
+async def get_student_personal_details(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        row = await conn.fetchrow(
+            "SELECT chosen_name, pronouns, gender_identity, legal_sex_at_birth, email_primary, "
+            "phone_primary, citizenship_status, place_of_birth_country, is_hispanic_or_latino, "
+            "racial_background, language_spoken_at_home, first_language_native, "
+            "details->'public_fields' AS public_fields "
+            "FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+    locked = sorted(_PERSONAL_LOCKED)
+    if not row:
+        return {"student_id": student_id, "personal": {}, "locked": locked}
+    pf = row["public_fields"]
+    if isinstance(pf, str):
+        try:
+            pf = json.loads(pf)
+        except Exception:
+            pf = {}
+    return {"student_id": student_id, "locked": locked, "personal": {
+        "chosen_name": row["chosen_name"],
+        "pronouns": list(row["pronouns"] or []),
+        "gender_identity": list(row["gender_identity"] or []),
+        "legal_sex_at_birth": row["legal_sex_at_birth"],
+        "email_primary": row["email_primary"],
+        "phone_primary": row["phone_primary"],
+        "citizenship_status": row["citizenship_status"],
+        "place_of_birth_country": row["place_of_birth_country"],
+        "is_hispanic_or_latino": row["is_hispanic_or_latino"],
+        "racial_background": list(row["racial_background"] or []),
+        "language_spoken_at_home": row["language_spoken_at_home"],
+        "first_language_native": row["first_language_native"],
+        "public": pf or {},
+    }}
+
+
+@router.post("/student/{student_id}/personal-details")
+async def post_student_personal_details(request: Request, student_id: str, body: PersonalDetailsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    public = {k: (False if k in _PERSONAL_LOCKED else bool(v)) for k, v in (body.public or {}).items()}
+    pf_json = json.dumps(public)
+
+    def arr(x):
+        return [s.strip() for s in (x or []) if str(s).strip()]
+
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            exists = await conn.fetchrow(
+                "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
+                student_id)
+            args = (
+                student_id,
+                (body.chosen_name or None), arr(body.pronouns), arr(body.gender_identity),
+                (body.legal_sex_at_birth or None), (body.email_primary or None), (body.phone_primary or None),
+                (body.citizenship_status or None), (body.place_of_birth_country or None),
+                body.is_hispanic_or_latino, arr(body.racial_background),
+                (body.language_spoken_at_home or None), (body.first_language_native or None),
+                pf_json, user_id,
+            )
+            if exists:
+                await conn.execute(
+                    "UPDATE student_personal_details SET "
+                    "chosen_name=$2, pronouns=$3::text[], gender_identity=$4::text[], legal_sex_at_birth=$5, "
+                    "email_primary=$6, phone_primary=$7, citizenship_status=$8, place_of_birth_country=$9, "
+                    "is_hispanic_or_latino=$10, racial_background=$11::text[], language_spoken_at_home=$12, "
+                    "first_language_native=$13, "
+                    "details = COALESCE(details,'{}'::jsonb) || jsonb_build_object('public_fields', $14::jsonb), "
+                    "updated_by=$15::uuid, updated_at=now() "
+                    "WHERE student_id=$1::uuid AND deleted_at IS NULL",
+                    *args)
+            else:
+                await conn.execute(
+                    "INSERT INTO student_personal_details "
+                    "(student_id, chosen_name, pronouns, gender_identity, legal_sex_at_birth, email_primary, "
+                    "phone_primary, citizenship_status, place_of_birth_country, is_hispanic_or_latino, "
+                    "racial_background, language_spoken_at_home, first_language_native, details, "
+                    "tenant_id, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2,$3::text[],$4::text[],$5,$6,$7,$8,$9,$10,$11::text[],$12,$13, "
+                    "jsonb_build_object('public_fields', $14::jsonb), "
+                    "$16::uuid, 'parent_portal', "
+                    "COALESCE($15::uuid,'019ed384-56d8-77fb-bfe6-00b1d064da18'::uuid), "
+                    "COALESCE($15::uuid,'019ed384-56d8-77fb-bfe6-00b1d064da18'::uuid))",
+                    *args, tenant_id)
+    return {"student_id": student_id, "saved": True}
+
+
+# --------------------------------- Skills ----------------------------------
+# skills_catalog (global, 500-skill taxonomy) + student_skills (per-student,
+# RLS). Catalog skills keyed by skill_code; custom skills use custom_title.
+
+_PROF = {"emerging", "developing", "proficient", "mastered"}
+
+
+@router.get("/skills-catalog")
+async def get_skills_catalog(request: Request):
+    await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT code, title, stage, domain, typical_age_min, typical_age_max, sort_order "
+            "FROM skills_catalog WHERE is_active ORDER BY sort_order")
+    return {"skills": [
+        {"code": r["code"], "title": r["title"], "stage": r["stage"], "domain": r["domain"],
+         "age_min": float(r["typical_age_min"]) if r["typical_age_min"] is not None else None,
+         "age_max": float(r["typical_age_max"]) if r["typical_age_max"] is not None else None,
+         "sort_order": r["sort_order"]} for r in rows]}
+
+
+class SkillItem(BaseModel):
+    skill_code: Optional[str] = None
+    custom_title: Optional[str] = None
+    custom_domain: Optional[str] = None
+    acquired: bool = True
+    acquired_date: Optional[str] = None
+    proficiency: Optional[str] = None
+    notes: Optional[str] = None
+    artifact_url: Optional[str] = None
+
+
+class SkillsRequest(BaseModel):
+    items: list[SkillItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/skills")
+async def get_student_skills(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            "SELECT skill_code, custom_title, custom_domain, acquired, acquired_date, proficiency, "
+            "notes, artifact_url FROM student_skills WHERE student_id=$1::uuid AND deleted_at IS NULL",
+            student_id)
+    catalog, custom = [], []
+    for r in rows:
+        d = {"skill_code": r["skill_code"], "custom_title": r["custom_title"],
+             "custom_domain": r["custom_domain"], "acquired": r["acquired"],
+             "acquired_date": r["acquired_date"].isoformat() if r["acquired_date"] else None,
+             "proficiency": r["proficiency"], "notes": r["notes"], "artifact_url": r["artifact_url"]}
+        (catalog if r["skill_code"] else custom).append(d)
+    return {"student_id": student_id, "skills": catalog, "custom": custom}
+
+
+@router.post("/student/{student_id}/skills")
+async def post_student_skills(request: Request, student_id: str, body: SkillsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(
+                "DELETE FROM student_skills WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                "AND source_system='parent_portal' AND skill_code IS NULL", tenant_id, student_id)
+            for it in body.items:
+                code = (it.skill_code or "").strip()
+                prof = (it.proficiency or "").strip().lower()
+                if prof not in _PROF:
+                    prof = None
+                d = _pp_parse_date(it.acquired_date)
+                notes = (it.notes or "").strip() or None
+                art = (it.artifact_url or "").strip() or None
+                if code:
+                    await conn.execute(
+                        "DELETE FROM student_skills WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                        "AND skill_code=$3", tenant_id, student_id, code)
+                    if not it.acquired and not prof and not notes and not art:
+                        continue
+                    await conn.execute(
+                        "INSERT INTO student_skills (tenant_id, student_id, skill_code, acquired, "
+                        "acquired_date, proficiency, notes, artifact_url, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,'parent_portal',$9::uuid,$9::uuid)",
+                        tenant_id, student_id, code, bool(it.acquired), d, prof, notes, art, user_id)
+                    saved += 1
+                else:
+                    title = (it.custom_title or "").strip()
+                    if not title:
+                        continue
+                    await conn.execute(
+                        "INSERT INTO student_skills (tenant_id, student_id, skill_code, custom_title, "
+                        "custom_domain, acquired, acquired_date, proficiency, notes, artifact_url, "
+                        "source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,NULL,$3,$4,$5,$6,$7,$8,$9,'parent_portal',$10::uuid,$10::uuid)",
+                        tenant_id, student_id, title, (it.custom_domain or None), bool(it.acquired),
+                        d, prof, notes, art, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved}
