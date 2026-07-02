@@ -777,11 +777,9 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.5)
-#   milestones · academics (school/GPA/rank + estimated GPA) · courses · tests
-#   GPA auto-calc from coursework (+1.0 AP/IB/dual, +0.5 honors).
-#   notes / skills / evidence-artifact ids on course & test rows.
-# Reuses this module's existing router, _resolve_context, json, and imports.
+# Parent-portal capture endpoints (v0.12.6)
+#   milestones (+ media) . academics (school/GPA/rank + est GPA) . courses . tests
+#   GPA auto-calc; notes/skills/evidence on course & test rows.
 # ===========================================================================
 from datetime import date as _pp_date
 
@@ -893,6 +891,7 @@ class MilestoneItem(BaseModel):
     happened: bool = True
     event_date: Optional[str] = None
     event_notes: Optional[str] = None
+    artifact_url: Optional[str] = None
 
 
 class MilestonesRequest(BaseModel):
@@ -906,14 +905,14 @@ async def get_student_milestones(request: Request, student_id: str):
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
         rows = await conn.fetch(
-            "SELECT milestone_code, happened, event_date, event_notes "
+            "SELECT milestone_code, happened, event_date, event_notes, artifact_url "
             "FROM student_life_milestones WHERE student_id=$1::uuid AND deleted_at IS NULL",
             student_id,
         )
     return {"student_id": student_id, "milestones": [
         {"milestone_code": r["milestone_code"], "happened": r["happened"],
          "event_date": r["event_date"].isoformat() if r["event_date"] else None,
-         "event_notes": r["event_notes"]} for r in rows]}
+         "event_notes": r["event_notes"], "artifact_url": r["artifact_url"]} for r in rows]}
 
 
 @router.post("/student/{student_id}/milestones")
@@ -934,15 +933,16 @@ async def post_student_milestones(request: Request, student_id: str, body: Miles
                     "AND student_id=$2::uuid AND milestone_code=$3",
                     tenant_id, student_id, code)
                 notes = item.event_notes.strip() if item.event_notes and item.event_notes.strip() else None
-                if not item.happened and not item.event_date and not notes:
+                art = (item.artifact_url or "").strip() or None
+                if not item.happened and not item.event_date and not notes and not art:
                     cleared += 1
                     continue
                 await conn.execute(
                     "INSERT INTO student_life_milestones (tenant_id, student_id, milestone_code, "
-                    "happened, event_date, event_notes, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,'parent_portal',$7::uuid,$7::uuid)",
+                    "happened, event_date, event_notes, artifact_url, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,'parent_portal',$8::uuid,$8::uuid)",
                     tenant_id, student_id, code, bool(item.happened),
-                    _pp_parse_date(item.event_date), notes, user_id)
+                    _pp_parse_date(item.event_date), notes, art, user_id)
                 saved += 1
     return {"student_id": student_id, "saved": saved, "cleared": cleared}
 
