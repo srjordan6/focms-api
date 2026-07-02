@@ -1,8 +1,9 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.1 · Session 1 of the schema-driven parent portal build.
+v0.12.2 · Session 1 of the schema-driven parent portal build.
          v0.12.1 fixes veteran_military_status placeholder alignment.
+         v0.12.2 adds GET /entries/{student_id} for form pre-population.
 
 Endpoints:
   GET  /focms/v1/form-schemas               Full catalog for form rendering
@@ -218,11 +219,129 @@ async def get_form_schemas(
                 catalogs[name] = [_row_to_dict(r) for r in rows]
 
     return {
-        "version": "0.12.1",
+        "version": "0.12.2",
         "generated_at": datetime.utcnow().isoformat() + "Z",
         "field_count": len(fields),
         "fields": fields,
         "catalogs": catalogs if include_catalogs else None,
+    }
+
+
+# ===========================================================================
+# GET /focms/v1/entries/{student_id}
+# ===========================================================================
+# Read-back: returns a { field_code: value } map for a given student, so the
+# parent portal can pre-populate the form with what's already saved. Only
+# reads Session 1 tables. Ciphertext columns are omitted.
+
+@router.get("/entries/{student_id}")
+async def get_entries(
+    request: Request,
+    student_id: str,
+    pillar: Optional[str] = None,
+):
+    """Return existing field values keyed by field_code, for form pre-population."""
+    context = await _resolve_context(request)
+    tenant_id = context["tenant_id"]
+
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "SELECT set_config('app.current_tenant_id', $1, true)",
+            str(tenant_id),
+        )
+
+        # Fetch all catalog fields (optionally filtered by pillar)
+        where = ["is_active = true", "shown_in_parent_form = true"]
+        args: list[Any] = []
+        if pillar:
+            args.append(pillar)
+            where.append(f"pillar = ${len(args)}")
+
+        catalog_rows = await conn.fetch(
+            f"""SELECT field_code, source_table, source_column, is_encrypted_at_rest
+                  FROM field_capture_catalog
+                 WHERE {' AND '.join(where)}""",
+            *args,
+        )
+
+        # Pre-fetch the singleton rows we might read from
+        students_row = await conn.fetchrow(
+            "SELECT * FROM students WHERE id = $1", student_id
+        )
+        spd_row = await conn.fetchrow(
+            "SELECT * FROM student_personal_details WHERE student_id = $1",
+            student_id,
+        )
+        vet_row = await conn.fetchrow(
+            "SELECT * FROM veteran_military_status WHERE student_id = $1",
+            student_id,
+        )
+        addr_rows = await conn.fetch(
+            """SELECT * FROM student_addresses
+                WHERE student_id = $1
+                  AND is_current = true
+                  AND deleted_at IS NULL""",
+            student_id,
+        )
+        # Bucket addresses by kind
+        addr_by_kind: dict[str, dict] = {}
+        for r in addr_rows:
+            addr_by_kind[r["address_kind"]] = dict(r)
+
+    # Reverse the COLUMN_ALIASES for reads (catalog code -> physical col already
+    # in COLUMN_ALIASES; we look up by (table, catalog_col) -> physical_col below).
+
+    values: dict[str, Any] = {}
+    for cat in catalog_rows:
+        code = cat["field_code"]
+        table = cat["source_table"]
+        col = cat["source_column"]
+
+        # Skip ciphertext columns (Session 3 will handle)
+        if cat["is_encrypted_at_rest"] or (col and col.endswith("_ciphertext")):
+            continue
+
+        # Apply alias for read
+        real_col = COLUMN_ALIASES.get((table, col), col)
+
+        # Route to the appropriate row source
+        row_source: Optional[dict] = None
+        if table in ("students", "student"):
+            row_source = dict(students_row) if students_row else None
+        elif table == "student_personal_details":
+            row_source = dict(spd_row) if spd_row else None
+        elif table == "veteran_military_status":
+            row_source = dict(vet_row) if vet_row else None
+        elif table == "student_addresses":
+            # Parse the address_kind out of field_code: 'student_addresses.<kind>.<col>'
+            parts = code.split(".")
+            if len(parts) == 3:
+                kind = parts[1]
+                col_read = parts[2]
+                real_col = ADDR_ALIASES.get(col_read, col_read)
+                row_source = addr_by_kind.get(kind)
+
+        if row_source is None:
+            continue
+
+        if real_col in row_source:
+            v = row_source[real_col]
+            # asyncpg date/UUID → JSON-friendly string
+            if isinstance(v, (datetime,)):
+                values[code] = v.isoformat()
+            elif isinstance(v, UUID):
+                values[code] = str(v)
+            elif hasattr(v, "isoformat"):  # date, time
+                values[code] = v.isoformat()
+            else:
+                values[code] = v
+
+    return {
+        "student_id": student_id,
+        "pillar": pillar,
+        "field_count": len(values),
+        "values": values,
     }
 
 
