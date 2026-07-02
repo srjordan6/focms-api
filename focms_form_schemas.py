@@ -777,8 +777,8 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.13)
-#   skills: age presumption from encrypted DOB; overrides stored, presumed not
+# Parent-portal capture endpoints (v0.12.14)
+#   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
 
@@ -1755,3 +1755,80 @@ async def post_student_skills(request: Request, student_id: str, body: SkillsReq
                         d, prof, notes, art, user_id)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "presumption_overrides": overrides, "cleared": cleared}
+
+
+# --------------------------- Identity documents -----------------------------
+# Proof of age (birth_certificate | passport | government_id) and SS card.
+# Soft requirement: the child record exists without documents, but
+#   - age_verified is true only when an age-proof document is VERIFIED
+#   - free access (age 10 and under) applies only when age is verified
+# Documents upload through /media; this registers type + artifact + status.
+
+_AGE_PROOF = {"birth_certificate", "passport", "government_id"}
+_DOC_TYPES = _AGE_PROOF | {"ss_card"}
+
+
+class IdentityDocItem(BaseModel):
+    doc_type: str
+    artifact_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class IdentityDocsRequest(BaseModel):
+    items: list[IdentityDocItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/identity-documents")
+async def get_identity_documents(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            "SELECT doc_type, artifact_id, status, verified_at, notes "
+            "FROM student_identity_documents WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY created_at", student_id)
+        age = await _pp_student_age(conn, student_id)
+    docs = [{"doc_type": r["doc_type"],
+             "artifact_id": str(r["artifact_id"]) if r["artifact_id"] else None,
+             "status": r["status"],
+             "verified_at": r["verified_at"].isoformat() if r["verified_at"] else None,
+             "notes": r["notes"]} for r in rows]
+    age_verified = any(d["doc_type"] in _AGE_PROOF and d["status"] == "verified" for d in docs)
+    age_submitted = any(d["doc_type"] in _AGE_PROOF and d["status"] in ("submitted", "verified") for d in docs)
+    ssn_documented = any(d["doc_type"] == "ss_card" and d["status"] in ("submitted", "verified") for d in docs)
+    return {
+        "student_id": student_id,
+        "documents": docs,
+        "student_age": age,
+        "age_proof_submitted": age_submitted,
+        "age_verified": age_verified,
+        "ssn_documented": ssn_documented,
+        "free_access_eligible": bool(age_verified and age is not None and age <= 10),
+    }
+
+
+@router.post("/student/{student_id}/identity-documents")
+async def post_identity_documents(request: Request, student_id: str, body: IdentityDocsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            for it in body.items:
+                dt = (it.doc_type or "").strip().lower()
+                if dt not in _DOC_TYPES or not (it.artifact_id or "").strip():
+                    continue
+                # one live row per doc_type; re-upload replaces (and resets to submitted)
+                await conn.execute(
+                    "DELETE FROM student_identity_documents WHERE tenant_id=$1::uuid "
+                    "AND student_id=$2::uuid AND doc_type=$3", tenant_id, student_id, dt)
+                await conn.execute(
+                    "INSERT INTO student_identity_documents (tenant_id, student_id, doc_type, "
+                    "artifact_id, status, notes, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4::uuid,'submitted',$5,'parent_portal',$6::uuid,$6::uuid)",
+                    tenant_id, student_id, dt, it.artifact_id.strip(), (it.notes or None), user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved}
