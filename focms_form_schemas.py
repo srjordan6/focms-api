@@ -777,8 +777,8 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.7)
-#   milestones(+media) . academics . courses . tests . family(Father/Mother, encrypted)
+# Parent-portal capture endpoints (v0.12.8)
+#   milestones(+media) . academics . courses . tests . family . religion
 # ===========================================================================
 from datetime import date as _pp_date
 
@@ -1382,3 +1382,74 @@ async def post_student_family(request: Request, student_id: str, body: FamilyReq
                 await _insert_family_member(conn, tenant_id, student_id, user_id, "mother", 2, body.mother)
                 written.append("mother")
     return {"student_id": student_id, "written": written}
+
+
+# -------------------------------- Religion ---------------------------------
+# Stored in student_personal_details.details->'religion' (no schema change).
+# Structured on Pew's three dimensions: affiliation, behavior, belief.
+# Per-field public choices live in religion.public {field_key: bool}; the row's
+# own `visibility` stays private (it also holds SSN/race), so the public site
+# must honor the per-field map rather than the row flag.
+
+class ReligionRequest(BaseModel):
+    affiliation: Optional[str] = None
+    affiliation_other: Optional[str] = None
+    attendance: Optional[str] = None
+    observance_needs: Optional[str] = None
+    importance: Optional[str] = None
+    public: dict = Field(default_factory=dict)
+
+
+@router.get("/student/{student_id}/religion")
+async def get_student_religion(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        row = await conn.fetchrow(
+            "SELECT details->'religion' AS religion FROM student_personal_details "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+    rel = row["religion"] if row and row["religion"] is not None else {}
+    if isinstance(rel, str):
+        try:
+            rel = json.loads(rel)
+        except Exception:
+            rel = {}
+    return {"student_id": student_id, "religion": rel or {}}
+
+
+@router.post("/student/{student_id}/religion")
+async def post_student_religion(request: Request, student_id: str, body: ReligionRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    rel = {
+        "affiliation": (body.affiliation or None),
+        "affiliation_other": (body.affiliation_other or None),
+        "attendance": (body.attendance or None),
+        "observance_needs": (body.observance_needs or None),
+        "importance": (body.importance or None),
+        "public": {k: bool(v) for k, v in (body.public or {}).items()},
+    }
+    rel_json = json.dumps(rel)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            exists = await conn.fetchrow(
+                "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
+                student_id)
+            if exists:
+                await conn.execute(
+                    "UPDATE student_personal_details SET "
+                    "details = COALESCE(details,'{}'::jsonb) || jsonb_build_object('religion', $2::jsonb), "
+                    "updated_by=$3::uuid, updated_at=now() "
+                    "WHERE student_id=$1::uuid AND deleted_at IS NULL",
+                    student_id, rel_json, user_id)
+            else:
+                await conn.execute(
+                    "INSERT INTO student_personal_details "
+                    "(tenant_id, student_id, details, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid, jsonb_build_object('religion', $3::jsonb), "
+                    "'parent_portal', $4::uuid, $4::uuid)",
+                    tenant_id, student_id, rel_json, user_id)
+    return {"student_id": student_id, "saved": True}
