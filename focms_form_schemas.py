@@ -39,26 +39,69 @@ log = logging.getLogger("focms-form-schemas")
 router = APIRouter(prefix="/focms/v1", tags=["form-schemas"])
 
 # ---------------------------------------------------------------------------
-# Context dependency — resolved from focms_api at import wire-up time
+# Auth dependency — validates Bearer token against api_tokens table
 # ---------------------------------------------------------------------------
-# focms_api.py exposes an async dependency `get_context(request)` that returns
-# a dict with keys: user_id, tenant_id, scope, student_ids, token_id.
-# We import it lazily in the endpoint to avoid a circular import at module load.
+import hashlib
+from typing import Any as _Any
+
+async def _require_api_token(request: Request) -> dict:
+    """
+    Verify Bearer <token> against api_tokens.token_hash (SHA-256).
+    Returns dict: {token_id, tenant_id, scope, student_ids}.
+    Also verifies X-Tenant-Id header matches token's tenant_id when present.
+    """
+    auth = request.headers.get("authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="missing_bearer_token")
+    raw = auth.split(" ", 1)[1].strip()
+    if not raw:
+        raise HTTPException(status_code=401, detail="empty_token")
+
+    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, tenant_id, scope, COALESCE(student_ids, '{}') AS student_ids
+                 FROM public.api_tokens
+                WHERE token_hash = $1
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > now())
+                LIMIT 1""",
+            token_hash,
+        )
+    if row is None:
+        raise HTTPException(status_code=401, detail="invalid_token")
+
+    header_tenant = request.headers.get("x-tenant-id")
+    if header_tenant and header_tenant != str(row["tenant_id"]):
+        raise HTTPException(status_code=403, detail="tenant_mismatch")
+
+    return {
+        "token_id":    row["id"],
+        "tenant_id":   row["tenant_id"],
+        "scope":       row["scope"],
+        "student_ids": [str(s) for s in row["student_ids"]],
+    }
+
 
 async def _resolve_context(request: Request) -> dict:
-    from focms_api import get_context  # local import to break cycle
-    return await get_context(request)
+    return await _require_api_token(request)
 
-
-# ---------------------------------------------------------------------------
-# Pool accessor — same lazy pattern
-# ---------------------------------------------------------------------------
 
 async def _get_pool() -> asyncpg.Pool:
-    from focms_api import DB_POOL  # module-level global in focms_api
-    if DB_POOL is None:
+    pool = getattr(request_state_pool_holder, "pool", None)
+    if pool is None:
         raise HTTPException(status_code=503, detail="database_not_ready")
-    return DB_POOL
+    return pool
+
+
+class _RequestStatePoolHolder:
+    """Holder so _get_pool can find app.state.pool without a Request in scope."""
+    pool: _Any = None
+
+
+request_state_pool_holder = _RequestStatePoolHolder()
 
 
 # ===========================================================================
@@ -159,7 +202,7 @@ async def get_form_schemas(
     context = await _resolve_context(request)
     tenant_id = context["tenant_id"]
 
-    pool = await _get_pool()
+    pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute(
             "SELECT set_config('app.current_tenant_id', $1, true)",
@@ -424,7 +467,7 @@ async def post_entries(request: Request, body: EntriesRequest):
     touched: dict[str, list[str]] = {}
     saved_count = 0
 
-    pool = await _get_pool()
+    pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute(
             "SELECT set_config('app.current_tenant_id', $1, true)",
