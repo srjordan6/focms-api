@@ -39,69 +39,27 @@ log = logging.getLogger("focms-form-schemas")
 router = APIRouter(prefix="/focms/v1", tags=["form-schemas"])
 
 # ---------------------------------------------------------------------------
-# Auth dependency — validates Bearer token against api_tokens table
+# Auth dependency — reuse focms_api.authenticate (validates against
+# FOCMS_API_TOKENS_JSON env var, the same mechanism every other endpoint uses)
 # ---------------------------------------------------------------------------
-import hashlib
-from typing import Any as _Any
-
-async def _require_api_token(request: Request) -> dict:
-    """
-    Verify Bearer <token> against api_tokens.token_hash (SHA-256).
-    Returns dict: {token_id, tenant_id, scope, student_ids}.
-    Also verifies X-Tenant-Id header matches token's tenant_id when present.
-    """
-    auth = request.headers.get("authorization") or ""
-    if not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="missing_bearer_token")
-    raw = auth.split(" ", 1)[1].strip()
-    if not raw:
-        raise HTTPException(status_code=401, detail="empty_token")
-
-    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """SELECT id, tenant_id, scope, COALESCE(student_ids, '{}') AS student_ids
-                 FROM public.api_tokens
-                WHERE token_hash = $1
-                  AND revoked_at IS NULL
-                  AND (expires_at IS NULL OR expires_at > now())
-                LIMIT 1""",
-            token_hash,
-        )
-    if row is None:
-        raise HTTPException(status_code=401, detail="invalid_token")
-
-    header_tenant = request.headers.get("x-tenant-id")
-    if header_tenant and header_tenant != str(row["tenant_id"]):
-        raise HTTPException(status_code=403, detail="tenant_mismatch")
-
-    return {
-        "token_id":    row["id"],
-        "tenant_id":   row["tenant_id"],
-        "scope":       row["scope"],
-        "student_ids": [str(s) for s in row["student_ids"]],
-    }
-
 
 async def _resolve_context(request: Request) -> dict:
-    return await _require_api_token(request)
-
-
-async def _get_pool() -> asyncpg.Pool:
-    pool = getattr(request_state_pool_holder, "pool", None)
-    if pool is None:
-        raise HTTPException(status_code=503, detail="database_not_ready")
-    return pool
-
-
-class _RequestStatePoolHolder:
-    """Holder so _get_pool can find app.state.pool without a Request in scope."""
-    pool: _Any = None
-
-
-request_state_pool_holder = _RequestStatePoolHolder()
+    """
+    Delegate to focms_api.authenticate. Returns dict with tenant_id, user_id,
+    role from the FOCMS_API_TOKENS_JSON mapping.
+    """
+    from focms_api import authenticate as _authenticate
+    authorization = request.headers.get("authorization")
+    ctx = _authenticate(authorization=authorization)
+    # authenticate returns {"tenant_id", "user_id", "role"} plus maybe more.
+    # Normalize to the shape the endpoints expect.
+    return {
+        "token_id":    ctx.get("token_id"),
+        "tenant_id":   ctx.get("tenant_id"),
+        "user_id":     ctx.get("user_id"),
+        "scope":       ctx.get("role") or ctx.get("scope"),
+        "student_ids": ctx.get("student_ids") or [],
+    }
 
 
 # ===========================================================================
