@@ -777,9 +777,8 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.6)
-#   milestones (+ media) . academics (school/GPA/rank + est GPA) . courses . tests
-#   GPA auto-calc; notes/skills/evidence on course & test rows.
+# Parent-portal capture endpoints (v0.12.7)
+#   milestones(+media) . academics . courses . tests . family(Father/Mother, encrypted)
 # ===========================================================================
 from datetime import date as _pp_date
 
@@ -1233,3 +1232,153 @@ async def post_student_tests(request: Request, student_id: str, body: TestsReque
                     json.dumps(_pp_skills(it.skills)), _pp_artifacts(it.artifact_ids), user_id)
                 saved += 1
     return {"student_id": student_id, "saved": saved}
+
+
+# -------------------------------- Family -----------------------------------
+# Names + email are envelope-encrypted at rest (focms_encrypt_pii / _decrypt_pii,
+# SECURITY DEFINER). KEK from FOCMS_KEK_MASTER. Structured Father / Mother via
+# relationship + guardian_order.
+
+import os as _pp_os
+_PP_KEK = _pp_os.environ.get("FOCMS_KEK_MASTER")
+
+
+class FamilyMember(BaseModel):
+    prefix: Optional[str] = None
+    first_name: Optional[str] = None
+    middle_name: Optional[str] = None
+    last_name: Optional[str] = None
+    suffix: Optional[str] = None
+    legal_sex: Optional[str] = None
+    date_of_birth: Optional[str] = None
+    is_living: Optional[bool] = True
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    profession: Optional[str] = None
+    position_title: Optional[str] = None
+    employer: Optional[str] = None
+    undergrad_institution: Optional[str] = None
+    undergrad_degree: Optional[str] = None
+    undergrad_year: Optional[int] = None
+    grad_institution: Optional[str] = None
+    grad_degree: Optional[str] = None
+    grad_year: Optional[int] = None
+    marital_relationship: Optional[str] = None
+    resides_with_student: Optional[bool] = None
+    is_legal_guardian: Optional[bool] = True
+    notes: Optional[str] = None
+
+
+class FamilyRequest(BaseModel):
+    father: FamilyMember = Field(default_factory=FamilyMember)
+    mother: FamilyMember = Field(default_factory=FamilyMember)
+
+
+def _fm_has_data(m: FamilyMember) -> bool:
+    return bool((m.first_name or "").strip() or (m.last_name or "").strip())
+
+
+async def _insert_family_member(conn, tenant_id, student_id, user_id, relationship, order, m: FamilyMember):
+    await conn.execute(
+        """
+        INSERT INTO family_members
+            (tenant_id, student_id, relationship, guardian_order, is_legal_guardian,
+             prefix, first_name_ciphertext, middle_name_ciphertext, last_name_ciphertext, suffix,
+             legal_sex, date_of_birth, is_living, email_ciphertext, phone,
+             profession, position_title, employer,
+             undergrad_institution, undergrad_degree, undergrad_year,
+             grad_institution, grad_degree, grad_year,
+             marital_relationship, resides_with_student, notes,
+             source_system, created_by, updated_by)
+        VALUES
+            ($1::uuid,$2::uuid,$3,$4,$5,
+             $6, focms_encrypt_pii($1::uuid,$7,$29), focms_encrypt_pii($1::uuid,$8,$29),
+             focms_encrypt_pii($1::uuid,$9,$29), $10,
+             $11,$12,$13, focms_encrypt_pii($1::uuid,$14,$29), $15,
+             $16,$17,$18,
+             $19,$20,$21,
+             $22,$23,$24,
+             $25,$26,$27,
+             'parent_portal',$28::uuid,$28::uuid)
+        """,
+        tenant_id, student_id, relationship, order,
+        (m.is_legal_guardian if m.is_legal_guardian is not None else True),
+        (m.prefix or None), (m.first_name or None), (m.middle_name or None),
+        (m.last_name or None), (m.suffix or None),
+        (m.legal_sex or None), _pp_parse_date(m.date_of_birth),
+        (m.is_living if m.is_living is not None else True),
+        (m.email or None), (m.phone or None),
+        (m.profession or None), (m.position_title or None), (m.employer or None),
+        (m.undergrad_institution or None), (m.undergrad_degree or None), _pp_int(m.undergrad_year),
+        (m.grad_institution or None), (m.grad_degree or None), _pp_int(m.grad_year),
+        (m.marital_relationship or None), m.resides_with_student, (m.notes or None),
+        user_id, _PP_KEK,
+    )
+
+
+@router.get("/student/{student_id}/family")
+async def get_student_family(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            """
+            SELECT relationship, is_legal_guardian, prefix,
+                   focms_decrypt_pii(tenant_id, first_name_ciphertext, $2)  AS first_name,
+                   focms_decrypt_pii(tenant_id, middle_name_ciphertext, $2) AS middle_name,
+                   focms_decrypt_pii(tenant_id, last_name_ciphertext, $2)   AS last_name,
+                   suffix, legal_sex, date_of_birth, is_living,
+                   focms_decrypt_pii(tenant_id, email_ciphertext, $2)       AS email,
+                   phone, profession, position_title, employer,
+                   undergrad_institution, undergrad_degree, undergrad_year,
+                   grad_institution, grad_degree, grad_year,
+                   marital_relationship, resides_with_student, notes
+              FROM family_members
+             WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal'
+             ORDER BY guardian_order NULLS LAST
+            """,
+            student_id, _PP_KEK,
+        )
+    out = {"father": {}, "mother": {}}
+    for r in rows:
+        d = {
+            "prefix": r["prefix"], "first_name": r["first_name"], "middle_name": r["middle_name"],
+            "last_name": r["last_name"], "suffix": r["suffix"], "legal_sex": r["legal_sex"],
+            "date_of_birth": r["date_of_birth"].isoformat() if r["date_of_birth"] else None,
+            "is_living": r["is_living"], "email": r["email"], "phone": r["phone"],
+            "profession": r["profession"], "position_title": r["position_title"], "employer": r["employer"],
+            "undergrad_institution": r["undergrad_institution"], "undergrad_degree": r["undergrad_degree"],
+            "undergrad_year": r["undergrad_year"], "grad_institution": r["grad_institution"],
+            "grad_degree": r["grad_degree"], "grad_year": r["grad_year"],
+            "marital_relationship": r["marital_relationship"], "resides_with_student": r["resides_with_student"],
+            "is_legal_guardian": r["is_legal_guardian"], "notes": r["notes"],
+        }
+        rel = (r["relationship"] or "").lower()
+        if rel in ("father", "mother"):
+            out[rel] = d
+    return {"student_id": student_id, "father": out["father"], "mother": out["mother"]}
+
+
+@router.post("/student/{student_id}/family")
+async def post_student_family(request: Request, student_id: str, body: FamilyRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    if not _PP_KEK:
+        raise HTTPException(status_code=503, detail="pii_encryption_unavailable")
+    written = []
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(
+                "DELETE FROM family_members WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                "AND source_system='parent_portal' AND relationship IN ('father','mother')",
+                tenant_id, student_id)
+            if _fm_has_data(body.father):
+                await _insert_family_member(conn, tenant_id, student_id, user_id, "father", 1, body.father)
+                written.append("father")
+            if _fm_has_data(body.mother):
+                await _insert_family_member(conn, tenant_id, student_id, user_id, "mother", 2, body.mother)
+                written.append("mother")
+    return {"student_id": student_id, "written": written}
