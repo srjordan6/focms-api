@@ -777,8 +777,8 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.12)
-#   ... family now stores per-field public map (email/phone/DOB/sex/marital locked)
+# Parent-portal capture endpoints (v0.12.13)
+#   skills: age presumption from encrypted DOB; overrides stored, presumed not
 # ===========================================================================
 from datetime import date as _pp_date
 
@@ -1606,10 +1606,34 @@ async def post_student_personal_details(request: Request, student_id: str, body:
 
 
 # --------------------------------- Skills ----------------------------------
-# skills_catalog (global, 500-skill taxonomy) + student_skills (per-student,
-# RLS). Catalog skills keyed by skill_code; custom skills use custom_title.
+# skills_catalog (500-skill taxonomy) + student_skills (per-student, RLS).
+# Three provenance tiers:
+#   presumed  - typical_age_max below the child's age; NOT stored (default-on),
+#               only explicit parent overrides (acquired=false) are stored
+#   attested  - parent-marked (source_system='parent_portal')
+#   evidenced - attached from activities via source_activity (future inference)
 
 _PROF = {"emerging", "developing", "proficient", "mastered"}
+
+
+async def _pp_student_age(conn, student_id: str):
+    """Age in years from the encrypted DOB (plaintext fallback), or None."""
+    row = await conn.fetchrow(
+        "SELECT focms_decrypt_pii(tenant_id, birth_date_ciphertext, $2) AS dob_enc, "
+        "       birth_date "
+        "FROM students WHERE id=$1::uuid AND deleted_at IS NULL",
+        student_id, _PP_KEK)
+    if not row:
+        return None
+    dob = None
+    if row["dob_enc"]:
+        dob = _pp_parse_date(str(row["dob_enc"]))
+    if dob is None and row["birth_date"]:
+        dob = row["birth_date"]
+    if dob is None:
+        return None
+    from datetime import date as _d
+    return round((_d.today() - dob).days / 365.25, 2)
 
 
 @router.get("/skills-catalog")
@@ -1648,27 +1672,34 @@ async def get_student_skills(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        age = await _pp_student_age(conn, student_id)
         rows = await conn.fetch(
             "SELECT skill_code, custom_title, custom_domain, acquired, acquired_date, proficiency, "
-            "notes, artifact_url FROM student_skills WHERE student_id=$1::uuid AND deleted_at IS NULL",
+            "notes, artifact_url, source_activity, source_system "
+            "FROM student_skills WHERE student_id=$1::uuid AND deleted_at IS NULL",
             student_id)
     catalog, custom = [], []
     for r in rows:
         d = {"skill_code": r["skill_code"], "custom_title": r["custom_title"],
              "custom_domain": r["custom_domain"], "acquired": r["acquired"],
              "acquired_date": r["acquired_date"].isoformat() if r["acquired_date"] else None,
-             "proficiency": r["proficiency"], "notes": r["notes"], "artifact_url": r["artifact_url"]}
+             "proficiency": r["proficiency"], "notes": r["notes"], "artifact_url": r["artifact_url"],
+             "source_activity": r["source_activity"], "source_system": r["source_system"]}
         (catalog if r["skill_code"] else custom).append(d)
-    return {"student_id": student_id, "skills": catalog, "custom": custom}
+    return {"student_id": student_id, "student_age": age, "skills": catalog, "custom": custom}
 
 
 @router.post("/student/{student_id}/skills")
 async def post_student_skills(request: Request, student_id: str, body: SkillsRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
-    saved = 0
+    saved = overrides = cleared = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        age = await _pp_student_age(conn, student_id)
+        age_max_by_code = {
+            r["code"]: (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None)
+            for r in await conn.fetch("SELECT code, typical_age_max FROM skills_catalog WHERE is_active")}
         async with conn.transaction():
             await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
             await conn.execute(
@@ -1683,17 +1714,34 @@ async def post_student_skills(request: Request, student_id: str, body: SkillsReq
                 notes = (it.notes or "").strip() or None
                 art = (it.artifact_url or "").strip() or None
                 if code:
+                    if code not in age_max_by_code:
+                        continue
+                    amax = age_max_by_code[code]
+                    presumed = age is not None and amax is not None and age >= amax
                     await conn.execute(
                         "DELETE FROM student_skills WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
-                        "AND skill_code=$3", tenant_id, student_id, code)
-                    if not it.acquired and not prof and not notes and not art:
-                        continue
-                    await conn.execute(
-                        "INSERT INTO student_skills (tenant_id, student_id, skill_code, acquired, "
-                        "acquired_date, proficiency, notes, artifact_url, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,'parent_portal',$9::uuid,$9::uuid)",
-                        tenant_id, student_id, code, bool(it.acquired), d, prof, notes, art, user_id)
-                    saved += 1
+                        "AND skill_code=$3 AND source_system='parent_portal'",
+                        tenant_id, student_id, code)
+                    if it.acquired:
+                        if presumed and not prof and not d and not notes and not art:
+                            cleared += 1  # matches the presumption default; no row needed
+                            continue
+                        await conn.execute(
+                            "INSERT INTO student_skills (tenant_id, student_id, skill_code, acquired, "
+                            "acquired_date, proficiency, notes, artifact_url, source_system, created_by, updated_by) "
+                            "VALUES ($1::uuid,$2::uuid,$3,true,$4,$5,$6,$7,'parent_portal',$8::uuid,$8::uuid)",
+                            tenant_id, student_id, code, d, prof, notes, art, user_id)
+                        saved += 1
+                    else:
+                        if presumed:
+                            await conn.execute(
+                                "INSERT INTO student_skills (tenant_id, student_id, skill_code, acquired, "
+                                "notes, source_system, created_by, updated_by) "
+                                "VALUES ($1::uuid,$2::uuid,$3,false,$4,'parent_portal',$5::uuid,$5::uuid)",
+                                tenant_id, student_id, code, notes, user_id)
+                            overrides += 1
+                        else:
+                            cleared += 1  # non-presumed + not acquired = default; delete was enough
                 else:
                     title = (it.custom_title or "").strip()
                     if not title:
@@ -1706,4 +1754,4 @@ async def post_student_skills(request: Request, student_id: str, body: SkillsReq
                         tenant_id, student_id, title, (it.custom_domain or None), bool(it.acquired),
                         d, prof, notes, art, user_id)
                     saved += 1
-    return {"student_id": student_id, "saved": saved}
+    return {"student_id": student_id, "saved": saved, "presumption_overrides": overrides, "cleared": cleared}
