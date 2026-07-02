@@ -774,3 +774,462 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
         else:
             out[k] = v
     return out
+
+
+# ===========================================================================
+# Parent-portal capture endpoints (v0.12.5)
+#   milestones · academics (school/GPA/rank + estimated GPA) · courses · tests
+#   GPA auto-calc from coursework (+1.0 AP/IB/dual, +0.5 honors).
+#   notes / skills / evidence-artifact ids on course & test rows.
+# Reuses this module's existing router, _resolve_context, json, and imports.
+# ===========================================================================
+from datetime import date as _pp_date
+
+
+# --------------------------------- helpers ---------------------------------
+
+def _pp_parse_date(s):
+    if not s:
+        return None
+    try:
+        return _pp_date.fromisoformat(str(s).strip())
+    except Exception:
+        return None
+
+
+def _pp_num(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _pp_int(v):
+    if v is None or v == "":
+        return None
+    try:
+        return int(v)
+    except Exception:
+        return None
+
+
+def _pp_skills(v):
+    """Normalize a skills list to a list[str]."""
+    if not v:
+        return []
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except Exception:
+            v = [v]
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
+def _pp_artifacts(v):
+    """Normalize an artifact-id list to list[str]."""
+    if not v:
+        return []
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
+_GRADE_LETTERS = {
+    "A+": 4.0, "A": 4.0, "A-": 3.7, "B+": 3.3, "B": 3.0, "B-": 2.7,
+    "C+": 2.3, "C": 2.0, "C-": 1.7, "D+": 1.3, "D": 1.0, "D-": 0.7, "F": 0.0,
+}
+_RIGOR_BONUS = {"ap": 1.0, "ib": 1.0, "dual": 1.0, "honors": 0.5, "regular": 0.0}
+
+
+def _pp_grade_points(grade):
+    """Map a letter or numeric grade to unweighted 4.0 points, or None."""
+    if grade is None:
+        return None
+    g = str(grade).strip().upper()
+    if not g:
+        return None
+    if g in _GRADE_LETTERS:
+        return _GRADE_LETTERS[g]
+    try:
+        n = float(g)
+    except Exception:
+        return None
+    if n >= 93: return 4.0
+    if n >= 90: return 3.7
+    if n >= 87: return 3.3
+    if n >= 83: return 3.0
+    if n >= 80: return 2.7
+    if n >= 77: return 2.3
+    if n >= 73: return 2.0
+    if n >= 70: return 1.7
+    if n >= 67: return 1.3
+    if n >= 63: return 1.0
+    if n >= 60: return 0.7
+    return 0.0
+
+
+async def _pp_context(request: Request, student_id: str):
+    ctx = await _resolve_context(request)
+    if ctx.get("scope") == "parent_portal" and student_id not in (ctx.get("student_ids") or []):
+        raise HTTPException(status_code=403, detail="student_not_authorized")
+    uid = ctx.get("user_id")
+    return str(ctx["tenant_id"]), (str(uid) if uid else None)
+
+
+async def _pp_current_school_name(conn, student_id: str):
+    row = await conn.fetchrow(
+        "SELECT school_name FROM student_school_enrollments "
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+        "ORDER BY is_current_school DESC, updated_at DESC NULLS LAST LIMIT 1",
+        student_id,
+    )
+    return row["school_name"] if row else None
+
+
+# ------------------------- Millstones & Milestones -------------------------
+
+class MilestoneItem(BaseModel):
+    milestone_code: str
+    happened: bool = True
+    event_date: Optional[str] = None
+    event_notes: Optional[str] = None
+
+
+class MilestonesRequest(BaseModel):
+    items: list[MilestoneItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/milestones")
+async def get_student_milestones(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            "SELECT milestone_code, happened, event_date, event_notes "
+            "FROM student_life_milestones WHERE student_id=$1::uuid AND deleted_at IS NULL",
+            student_id,
+        )
+    return {"student_id": student_id, "milestones": [
+        {"milestone_code": r["milestone_code"], "happened": r["happened"],
+         "event_date": r["event_date"].isoformat() if r["event_date"] else None,
+         "event_notes": r["event_notes"]} for r in rows]}
+
+
+@router.post("/student/{student_id}/milestones")
+async def post_student_milestones(request: Request, student_id: str, body: MilestonesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = cleared = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            for item in body.items:
+                code = (item.milestone_code or "").strip()
+                if not code:
+                    continue
+                await conn.execute(
+                    "DELETE FROM student_life_milestones WHERE tenant_id=$1::uuid "
+                    "AND student_id=$2::uuid AND milestone_code=$3",
+                    tenant_id, student_id, code)
+                notes = item.event_notes.strip() if item.event_notes and item.event_notes.strip() else None
+                if not item.happened and not item.event_date and not notes:
+                    cleared += 1
+                    continue
+                await conn.execute(
+                    "INSERT INTO student_life_milestones (tenant_id, student_id, milestone_code, "
+                    "happened, event_date, event_notes, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,'parent_portal',$7::uuid,$7::uuid)",
+                    tenant_id, student_id, code, bool(item.happened),
+                    _pp_parse_date(item.event_date), notes, user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved, "cleared": cleared}
+
+
+# ------------------------------- Academics ---------------------------------
+
+class AcademicsSchool(BaseModel):
+    school_name: Optional[str] = None
+    school_ceeb_code: Optional[str] = None
+    school_type: Optional[str] = None
+    counselor_name: Optional[str] = None
+    counselor_email: Optional[str] = None
+    start_date: Optional[str] = None
+    expected_graduation_date: Optional[str] = None
+
+
+class AcademicsGpa(BaseModel):
+    unweighted: Optional[float] = None
+    weighted: Optional[float] = None
+
+
+class AcademicsRank(BaseModel):
+    position: Optional[int] = None
+    size: Optional[int] = None
+
+
+class AcademicsRequest(BaseModel):
+    school: AcademicsSchool = Field(default_factory=AcademicsSchool)
+    gpa: AcademicsGpa = Field(default_factory=AcademicsGpa)
+    rank: AcademicsRank = Field(default_factory=AcademicsRank)
+
+
+@router.get("/student/{student_id}/academics")
+async def get_student_academics(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        school = await conn.fetchrow(
+            "SELECT school_name, school_ceeb_code, school_type, counselor_name, counselor_email, "
+            "start_date, expected_graduation_date FROM student_school_enrollments "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY is_current_school DESC, updated_at DESC NULLS LAST LIMIT 1", student_id)
+        gpa = await conn.fetchrow(
+            "SELECT unweighted_gpa_value, gpa_value, weighted_gpa_value FROM gpa_history "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal' "
+            "ORDER BY as_of_date DESC NULLS LAST, updated_at DESC NULLS LAST LIMIT 1", student_id)
+        rank = await conn.fetchrow(
+            "SELECT rank_position, class_size FROM class_rank_history "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal' "
+            "ORDER BY as_of_date DESC NULLS LAST, updated_at DESC NULLS LAST LIMIT 1", student_id)
+        est = await conn.fetchrow(
+            "SELECT sum(grade_points_4_0 * COALESCE(credit_hours,1)) "
+            "        / NULLIF(sum(COALESCE(credit_hours,1)),0) AS uw, "
+            "       sum(grade_points_weighted * COALESCE(credit_hours,1)) "
+            "        / NULLIF(sum(COALESCE(credit_hours,1)),0) AS wt "
+            "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "AND grade_points_4_0 IS NOT NULL", student_id)
+    return {
+        "student_id": student_id,
+        "school": dict(school) if school else {},
+        "gpa": {
+            "official_unweighted": float(gpa["unweighted_gpa_value"]) if gpa and gpa["unweighted_gpa_value"] is not None
+                else (float(gpa["gpa_value"]) if gpa and gpa["gpa_value"] is not None else None),
+            "official_weighted": float(gpa["weighted_gpa_value"]) if gpa and gpa["weighted_gpa_value"] is not None else None,
+            "est_unweighted": round(float(est["uw"]), 3) if est and est["uw"] is not None else None,
+            "est_weighted": round(float(est["wt"]), 3) if est and est["wt"] is not None else None,
+        },
+        "rank": {"position": rank["rank_position"] if rank else None,
+                 "size": rank["class_size"] if rank else None},
+    }
+
+
+@router.post("/student/{student_id}/academics")
+async def post_student_academics(request: Request, student_id: str, body: AcademicsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    written = []
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            sname = (body.school.school_name or "").strip()
+            if sname:
+                await conn.execute(
+                    "DELETE FROM student_school_enrollments WHERE tenant_id=$1::uuid "
+                    "AND student_id=$2::uuid AND source_system='parent_portal'", tenant_id, student_id)
+                await conn.execute(
+                    "INSERT INTO student_school_enrollments (tenant_id, student_id, school_name, "
+                    "school_ceeb_code, school_type, counselor_name, counselor_email, start_date, "
+                    "expected_graduation_date, is_current_school, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,true,'parent_portal',$10::uuid,$10::uuid)",
+                    tenant_id, student_id, sname, (body.school.school_ceeb_code or None),
+                    (body.school.school_type or None), (body.school.counselor_name or None),
+                    (body.school.counselor_email or None), _pp_parse_date(body.school.start_date),
+                    _pp_parse_date(body.school.expected_graduation_date), user_id)
+                written.append("school")
+            uw = _pp_num(body.gpa.unweighted)
+            wt = _pp_num(body.gpa.weighted)
+            if uw is not None or wt is not None:
+                await conn.execute(
+                    "DELETE FROM gpa_history WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                    "AND source_system='parent_portal'", tenant_id, student_id)
+                await conn.execute(
+                    "INSERT INTO gpa_history (tenant_id, student_id, as_of_date, gpa_value, "
+                    "unweighted_gpa_value, weighted_gpa_value, is_weighted, is_official, reported_by_role, "
+                    "source_system, created_by, updated_by) VALUES ($1::uuid,$2::uuid,CURRENT_DATE,$3,$4,$5,"
+                    "$6,false,'parent','parent_portal',$7::uuid,$7::uuid)",
+                    tenant_id, student_id, (uw if uw is not None else wt), uw, wt, (wt is not None), user_id)
+                written.append("gpa")
+            pos = _pp_int(body.rank.position)
+            size = _pp_int(body.rank.size)
+            if pos is not None or size is not None:
+                await conn.execute(
+                    "DELETE FROM class_rank_history WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                    "AND source_system='parent_portal'", tenant_id, student_id)
+                await conn.execute(
+                    "INSERT INTO class_rank_history (tenant_id, student_id, as_of_date, rank_position, "
+                    "class_size, is_official, reported_by_role, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,CURRENT_DATE,$3,$4,false,'parent','parent_portal',$5::uuid,$5::uuid)",
+                    tenant_id, student_id, pos, size, user_id)
+                written.append("rank")
+    return {"student_id": student_id, "written": written}
+
+
+# ------------------------------- Coursework --------------------------------
+
+_RIGOR = {"regular", "honors", "ap", "ib", "dual"}
+
+
+class CourseItem(BaseModel):
+    course_name: Optional[str] = None
+    school_name: Optional[str] = None
+    subject: Optional[str] = None
+    school_year: Optional[str] = None
+    grade_level: Optional[int] = None
+    term: Optional[str] = None
+    grade_received: Optional[str] = None
+    credit_hours: Optional[float] = None
+    rigor: Optional[str] = None
+    ap_exam_score: Optional[int] = None
+    teacher_name: Optional[str] = None
+    notes: Optional[str] = None
+    skills: list[str] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
+
+
+class CoursesRequest(BaseModel):
+    items: list[CourseItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/courses")
+async def get_student_courses(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            "SELECT course_name, school_name, subject, school_year, grade_level, term, grade_received, "
+            "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
+            "teacher_name, notes, admission_traits_developed, evidence_artifact_ids "
+            "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "AND source_system='parent_portal' ORDER BY grade_level NULLS LAST, course_name", student_id)
+
+    def rigor_of(r):
+        if r["is_ap"]: return "ap"
+        if r["is_ib"]: return "ib"
+        if r["is_dual_credit"]: return "dual"
+        if r["is_honors"]: return "honors"
+        return r["course_type"] or "regular"
+
+    return {"student_id": student_id, "items": [
+        {"course_name": r["course_name"], "school_name": r["school_name"], "subject": r["subject"],
+         "school_year": r["school_year"], "grade_level": r["grade_level"], "term": r["term"],
+         "grade_received": r["grade_received"],
+         "credit_hours": float(r["credit_hours"]) if r["credit_hours"] is not None else None,
+         "rigor": rigor_of(r), "ap_exam_score": r["ap_exam_score"], "teacher_name": r["teacher_name"],
+         "notes": r["notes"], "skills": _pp_skills(r["admission_traits_developed"]),
+         "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]}
+
+
+@router.post("/student/{student_id}/courses")
+async def post_student_courses(request: Request, student_id: str, body: CoursesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            default_school = await _pp_current_school_name(conn, student_id)
+            await conn.execute("DELETE FROM courses_taken WHERE tenant_id=$1::uuid "
+                               "AND student_id=$2::uuid AND source_system='parent_portal'",
+                               tenant_id, student_id)
+            for it in body.items:
+                name = (it.course_name or "").strip()
+                if not name:
+                    continue
+                school = (it.school_name or "").strip() or default_school or "Unspecified"
+                rigor = (it.rigor or "regular").lower()
+                if rigor not in _RIGOR:
+                    rigor = "regular"
+                gp = _pp_grade_points(it.grade_received)
+                gpw = (gp + _RIGOR_BONUS.get(rigor, 0.0)) if gp is not None else None
+                await conn.execute(
+                    "INSERT INTO courses_taken (tenant_id, student_id, course_name, school_name, "
+                    "course_type, subject, grade_level, school_year, term, credit_hours, grade_received, "
+                    "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, teacher_name, "
+                    "grade_points_4_0, grade_points_weighted, notes, admission_traits_developed, "
+                    "evidence_artifact_ids, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,"
+                    "$18,$19,$20,$21::jsonb,$22::text[]::uuid[],'parent_portal',$23::uuid,$23::uuid)",
+                    tenant_id, student_id, name, school, rigor, (it.subject or None),
+                    _pp_int(it.grade_level), (it.school_year or None), (it.term or None),
+                    _pp_num(it.credit_hours), (it.grade_received or None),
+                    rigor == "honors", rigor == "ap", rigor == "ib", rigor == "dual",
+                    _pp_int(it.ap_exam_score), (it.teacher_name or None),
+                    gp, gpw, (it.notes or None), json.dumps(_pp_skills(it.skills)),
+                    _pp_artifacts(it.artifact_ids), user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved}
+
+
+# --------------------------- Standardized Tests ----------------------------
+
+_TEST_NAMES = {"SAT": "SAT", "ACT": "ACT", "PSAT": "PSAT/NMSQT", "AP": "AP Exam", "IB": "IB Exam"}
+
+
+class TestItem(BaseModel):
+    test_code: Optional[str] = None
+    sitting_date: Optional[str] = None
+    score_overall: Optional[float] = None
+    percentile: Optional[float] = None
+    notes: Optional[str] = None
+    skills: list[str] = Field(default_factory=list)
+    artifact_ids: list[str] = Field(default_factory=list)
+
+
+class TestsRequest(BaseModel):
+    items: list[TestItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/tests")
+async def get_student_tests(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            "SELECT test_code, sitting_date, score_overall, percentile, notes, "
+            "admission_traits_developed, evidence_artifact_ids FROM standardized_test_scores "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal' "
+            "ORDER BY sitting_date DESC NULLS LAST", student_id)
+    return {"student_id": student_id, "items": [
+        {"test_code": r["test_code"],
+         "sitting_date": r["sitting_date"].isoformat() if r["sitting_date"] else None,
+         "score_overall": float(r["score_overall"]) if r["score_overall"] is not None else None,
+         "percentile": float(r["percentile"]) if r["percentile"] is not None else None,
+         "notes": r["notes"], "skills": _pp_skills(r["admission_traits_developed"]),
+         "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]}
+
+
+@router.post("/student/{student_id}/tests")
+async def post_student_tests(request: Request, student_id: str, body: TestsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute("DELETE FROM standardized_test_scores WHERE tenant_id=$1::uuid "
+                               "AND student_id=$2::uuid AND source_system='parent_portal'",
+                               tenant_id, student_id)
+            for it in body.items:
+                code = (it.test_code or "").strip().upper()
+                d = _pp_parse_date(it.sitting_date)
+                if code not in _TEST_NAMES or d is None:
+                    continue
+                await conn.execute(
+                    "INSERT INTO standardized_test_scores (tenant_id, student_id, test_code, test_name, "
+                    "sitting_date, score_overall, percentile, is_official, reporting_status, notes, "
+                    "admission_traits_developed, evidence_artifact_ids, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,false,'self_reported',$8,$9::jsonb,"
+                    "$10::text[]::uuid[],'parent_portal',$11::uuid,$11::uuid)",
+                    tenant_id, student_id, code, _TEST_NAMES[code], d,
+                    _pp_num(it.score_overall), _pp_num(it.percentile), (it.notes or None),
+                    json.dumps(_pp_skills(it.skills)), _pp_artifacts(it.artifact_ids), user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved}
