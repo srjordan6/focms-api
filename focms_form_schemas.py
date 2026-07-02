@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.2 · Session 1 of the schema-driven parent portal build.
+v0.12.15 · meta-skills tracking + major-gap report engine.
+         v0.12.2 · Session 1 of the schema-driven parent portal build.
          v0.12.1 fixes veteran_military_status placeholder alignment.
          v0.12.2 adds GET /entries/{student_id} for form pre-population.
 
@@ -777,7 +778,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.14)
+# Parent-portal capture endpoints (v0.12.15)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -1832,3 +1833,381 @@ async def post_identity_documents(request: Request, student_id: str, body: Ident
                     tenant_id, student_id, dt, it.artifact_id.strip(), (it.notes or None), user_id)
                 saved += 1
     return {"student_id": student_id, "saved": saved}
+
+
+# ======================================================================
+# v0.12.15 - Meta-skills tracking + Major-gap report engine
+# ----------------------------------------------------------------------
+# Meta-skills (meta_skills_catalog) are practiced-over-time capabilities
+# with a 0-100 proficiency that moves; unlike the 500-skill catalog they
+# are never age-presumed (no typical_age_max). Captured in
+# student_meta_skills (current_level / target_level) with a dated
+# meta_skill_practice_log for the trajectory.
+#
+# Major-gap report: given a student and a CIP major, compares the
+# student's skill inventory (acquired + age-presumed from the 500 catalog,
+# plus meta-skill levels) against major_skill_requirements, and returns
+# the differential weighted by importance. Cited to IPEDS/CIP.
+# ======================================================================
+
+_META_PROF_MIN, _META_PROF_MAX = 0, 100
+
+
+def _clamp_level(v):
+    """Coerce an incoming level to an int in 0..100, or None."""
+    if v is None:
+        return None
+    try:
+        n = int(round(float(v)))
+    except (TypeError, ValueError):
+        return None
+    return max(_META_PROF_MIN, min(_META_PROF_MAX, n))
+
+
+# ----------------------------- Meta-skills catalog -----------------------------
+
+@router.get("/meta-skills-catalog")
+async def get_meta_skills_catalog(request: Request):
+    await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT code, title, framework, description, daily_practice, protocol, sort_order "
+            "FROM meta_skills_catalog WHERE is_active ORDER BY sort_order")
+    return {"meta_skills": [
+        {"code": r["code"], "title": r["title"], "framework": r["framework"],
+         "description": r["description"], "daily_practice": r["daily_practice"],
+         "protocol": r["protocol"], "sort_order": r["sort_order"]} for r in rows]}
+
+
+# ----------------------------- Student meta-skills -----------------------------
+
+class MetaSkillItem(BaseModel):
+    meta_skill_code: str
+    current_level: Optional[int] = None
+    target_level: Optional[int] = None
+    notes: Optional[str] = None
+
+
+class MetaSkillsRequest(BaseModel):
+    items: list[MetaSkillItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/meta-skills")
+async def get_student_meta_skills(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        rows = await conn.fetch(
+            "SELECT meta_skill_code, current_level, target_level, notes, updated_at "
+            "FROM student_meta_skills WHERE student_id=$1::uuid AND deleted_at IS NULL",
+            student_id)
+        # last practice date per meta-skill, for the trajectory hint
+        practice = await conn.fetch(
+            "SELECT meta_skill_code, max(practice_date) AS last_date, count(*) AS sessions "
+            "FROM meta_skill_practice_log WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "GROUP BY meta_skill_code", student_id)
+    pmap = {r["meta_skill_code"]: r for r in practice}
+    out = []
+    for r in rows:
+        p = pmap.get(r["meta_skill_code"])
+        out.append({
+            "meta_skill_code": r["meta_skill_code"],
+            "current_level": r["current_level"], "target_level": r["target_level"],
+            "notes": r["notes"],
+            "last_practice_date": p["last_date"].isoformat() if p and p["last_date"] else None,
+            "practice_sessions": (p["sessions"] if p else 0),
+        })
+    return {"student_id": student_id, "meta_skills": out}
+
+
+@router.post("/student/{student_id}/meta-skills")
+async def post_student_meta_skills(request: Request, student_id: str, body: MetaSkillsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        valid = {r["code"] for r in await conn.fetch(
+            "SELECT code FROM meta_skills_catalog WHERE is_active")}
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            for it in body.items:
+                code = (it.meta_skill_code or "").strip()
+                if code not in valid:
+                    continue
+                cur = _clamp_level(it.current_level)
+                tgt = _clamp_level(it.target_level)
+                notes = (it.notes or "").strip() or None
+                # upsert one live row per (student, meta_skill)
+                await conn.execute(
+                    "DELETE FROM student_meta_skills WHERE tenant_id=$1::uuid "
+                    "AND student_id=$2::uuid AND meta_skill_code=$3", tenant_id, student_id, code)
+                await conn.execute(
+                    "INSERT INTO student_meta_skills (tenant_id, student_id, meta_skill_code, "
+                    "current_level, target_level, notes, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,'parent_portal',$7::uuid,$7::uuid)",
+                    tenant_id, student_id, code, cur, tgt, notes, user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved}
+
+
+# ----------------------------- Practice log -----------------------------
+
+class PracticeItem(BaseModel):
+    meta_skill_code: str
+    practice_date: str
+    duration_minutes: Optional[int] = None
+    practice_type: Optional[str] = None
+    reflection: Optional[str] = None
+    level_after: Optional[int] = None
+
+
+class PracticeRequest(BaseModel):
+    items: list[PracticeItem] = Field(default_factory=list)
+
+
+@router.get("/student/{student_id}/meta-skills/practice")
+async def get_meta_skill_practice(request: Request, student_id: str, meta_skill_code: Optional[str] = None):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        if meta_skill_code:
+            rows = await conn.fetch(
+                "SELECT meta_skill_code, practice_date, duration_minutes, practice_type, "
+                "reflection, level_after FROM meta_skill_practice_log "
+                "WHERE student_id=$1::uuid AND deleted_at IS NULL AND meta_skill_code=$2 "
+                "ORDER BY practice_date DESC, created_at DESC", student_id, meta_skill_code.strip())
+        else:
+            rows = await conn.fetch(
+                "SELECT meta_skill_code, practice_date, duration_minutes, practice_type, "
+                "reflection, level_after FROM meta_skill_practice_log "
+                "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+                "ORDER BY practice_date DESC, created_at DESC LIMIT 500", student_id)
+    return {"student_id": student_id, "sessions": [
+        {"meta_skill_code": r["meta_skill_code"],
+         "practice_date": r["practice_date"].isoformat() if r["practice_date"] else None,
+         "duration_minutes": r["duration_minutes"], "practice_type": r["practice_type"],
+         "reflection": r["reflection"], "level_after": r["level_after"]} for r in rows]}
+
+
+@router.post("/student/{student_id}/meta-skills/practice")
+async def post_meta_skill_practice(request: Request, student_id: str, body: PracticeRequest):
+    """Append-only practice log. Each item is a dated session; optionally
+    updates the meta-skill's current_level when level_after is supplied."""
+    tenant_id, user_id = await _pp_context(request, student_id)
+    logged = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        valid = {r["code"] for r in await conn.fetch(
+            "SELECT code FROM meta_skills_catalog WHERE is_active")}
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            for it in body.items:
+                code = (it.meta_skill_code or "").strip()
+                pdate = _pp_parse_date(it.practice_date)
+                if code not in valid or pdate is None:
+                    continue
+                lvl = _clamp_level(it.level_after)
+                dur = it.duration_minutes if isinstance(it.duration_minutes, int) else None
+                await conn.execute(
+                    "INSERT INTO meta_skill_practice_log (tenant_id, student_id, meta_skill_code, "
+                    "practice_date, duration_minutes, practice_type, reflection, level_after, "
+                    "source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,'parent_portal',$9::uuid,$9::uuid)",
+                    tenant_id, student_id, code, pdate, dur,
+                    ((it.practice_type or "").strip() or None),
+                    ((it.reflection or "").strip() or None), lvl, user_id)
+                logged += 1
+                # if a level_after was recorded, advance the current_level snapshot
+                if lvl is not None:
+                    await conn.execute(
+                        "UPDATE student_meta_skills SET current_level=$4, updated_at=now(), updated_by=$5::uuid "
+                        "WHERE tenant_id=$1::uuid AND student_id=$2::uuid AND meta_skill_code=$3",
+                        tenant_id, student_id, code, lvl, user_id)
+    return {"student_id": student_id, "logged": logged}
+
+
+# ----------------------------- CIP majors -----------------------------
+
+@router.get("/cip-majors")
+async def get_cip_majors(request: Request, q: Optional[str] = None):
+    await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        if q and q.strip():
+            like = "%" + q.strip().lower() + "%"
+            rows = await conn.fetch(
+                "SELECT cip_code, title, cip_family, keywords FROM cip_majors "
+                "WHERE is_active AND (lower(title) LIKE $1 OR lower(keywords) LIKE $1 OR cip_code LIKE $2) "
+                "ORDER BY title", like, (q.strip() + "%"))
+        else:
+            rows = await conn.fetch(
+                "SELECT cip_code, title, cip_family, keywords FROM cip_majors "
+                "WHERE is_active ORDER BY title")
+    return {"majors": [
+        {"cip_code": r["cip_code"], "title": r["title"], "cip_family": r["cip_family"],
+         "keywords": r["keywords"]} for r in rows]}
+
+
+# ----------------------------- Major-gap report -----------------------------
+# The skill-cluster -> CIP-major engine. Deterministic comparison first;
+# every number traces to a stored value (skills_catalog age presumption,
+# student_skills attestations, student_meta_skills levels,
+# major_skill_requirements weights). Cited to IPEDS/CIP.
+
+# A required meta-skill is considered "met" at/above this level unless the
+# student set a personal target that is higher.
+_META_TARGET_DEFAULT = 70
+
+# Map requirement importance (1-5) to a coverage weight.
+_IMP_WEIGHT = {1: 1.0, 2: 2.0, 3: 3.0, 4: 4.0, 5: 5.0}
+
+
+@router.get("/student/{student_id}/major-gap")
+async def get_major_gap(request: Request, student_id: str, cip_code: str):
+    """Differential of a student's capability inventory against a major's
+    required skill cluster. Returns per-skill status, weighted coverage,
+    strengths, and gaps ranked by importance."""
+    tenant_id, _ = await _pp_context(request, student_id)
+    cip = (cip_code or "").strip()
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+
+        major = await conn.fetchrow(
+            "SELECT cip_code, title, cip_family FROM cip_majors WHERE cip_code=$1 AND is_active", cip)
+        if not major:
+            raise HTTPException(status_code=404, detail="cip_major_not_found")
+
+        reqs = await conn.fetch(
+            "SELECT skill_code, meta_skill_code, importance, rationale "
+            "FROM major_skill_requirements WHERE cip_code=$1 AND is_active", cip)
+        if not reqs:
+            raise HTTPException(status_code=404, detail="no_requirements_for_major")
+
+        age = await _pp_student_age(conn, student_id)
+
+        # student's hard-skill inventory: explicit rows + age presumption
+        srows = await conn.fetch(
+            "SELECT skill_code, acquired, proficiency FROM student_skills "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL AND skill_code IS NOT NULL", student_id)
+        explicit = {r["skill_code"]: r for r in srows}
+        amax = {r["code"]: (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None)
+                for r in await conn.fetch("SELECT code, typical_age_max FROM skills_catalog WHERE is_active")}
+        titles = {r["code"]: r["title"]
+                  for r in await conn.fetch("SELECT code, title FROM skills_catalog WHERE is_active")}
+
+        # student's meta-skill levels
+        mrows = await conn.fetch(
+            "SELECT meta_skill_code, current_level, target_level FROM student_meta_skills "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+        mlevel = {r["meta_skill_code"]: r for r in mrows}
+        mtitles = {r["code"]: (r["title"], r["framework"])
+                   for r in await conn.fetch("SELECT code, title, framework FROM meta_skills_catalog WHERE is_active")}
+
+    def hard_status(code):
+        """(status, detail) for a required hard skill."""
+        row = explicit.get(code)
+        if row is not None:
+            if row["acquired"]:
+                return "have", (row["proficiency"] or "attested")
+            return "gap", "marked not yet acquired"
+        m = amax.get(code)
+        if age is not None and m is not None and age >= m:
+            return "presumed", "presumed by age"
+        return "gap", "not yet acquired"
+
+    def meta_status(code, imp):
+        row = mlevel.get(code)
+        target = _META_TARGET_DEFAULT
+        if row and row["target_level"] is not None:
+            target = row["target_level"]
+        cur = row["current_level"] if row and row["current_level"] is not None else None
+        if cur is None:
+            return "gap", None, target, "no level recorded"
+        if cur >= target:
+            return "have", cur, target, "at or above target"
+        if cur >= max(0, target - 20):
+            return "developing", cur, target, "approaching target"
+        return "gap", cur, target, "below target"
+
+    have_w = total_w = 0.0
+    strengths, gaps, developing = [], [], []
+    hard_items, meta_items = [], []
+
+    for r in reqs:
+        imp = int(r["importance"] or 3)
+        w = _IMP_WEIGHT.get(imp, 3.0)
+        total_w += w
+        if r["skill_code"]:
+            status, detail = hard_status(r["skill_code"])
+            item = {"kind": "skill", "code": r["skill_code"],
+                    "title": titles.get(r["skill_code"], r["skill_code"]),
+                    "importance": imp, "status": status, "detail": detail,
+                    "rationale": r["rationale"]}
+            hard_items.append(item)
+            if status in ("have", "presumed"):
+                have_w += w
+                strengths.append(item)
+            else:
+                gaps.append(item)
+        else:
+            status, cur, tgt, detail = meta_status(r["meta_skill_code"], imp)
+            t, fw = mtitles.get(r["meta_skill_code"], (r["meta_skill_code"], None))
+            item = {"kind": "meta_skill", "code": r["meta_skill_code"], "title": t,
+                    "framework": fw, "importance": imp, "status": status,
+                    "current_level": cur, "target_level": tgt, "detail": detail,
+                    "rationale": r["rationale"]}
+            meta_items.append(item)
+            if status == "have":
+                have_w += w
+                strengths.append(item)
+            elif status == "developing":
+                have_w += w * 0.5
+                developing.append(item)
+            else:
+                gaps.append(item)
+
+    coverage = round((have_w / total_w) * 100, 1) if total_w else 0.0
+    gaps.sort(key=lambda x: -x["importance"])
+    strengths.sort(key=lambda x: -x["importance"])
+
+    # top next actions: the highest-importance gaps
+    next_actions = []
+    for g in gaps[:5]:
+        if g["kind"] == "meta_skill":
+            next_actions.append(
+                f"Build {g['title']} (currently {g.get('current_level') if g.get('current_level') is not None else 'unrated'}, "
+                f"target {g.get('target_level')}). {g['rationale']}")
+        else:
+            next_actions.append(f"Develop: {g['title']} ({g['rationale']})")
+
+    return {
+        "student_id": student_id,
+        "student_age": age,
+        "major": {"cip_code": major["cip_code"], "title": major["title"],
+                  "cip_family": major["cip_family"]},
+        "coverage_pct": coverage,
+        "counts": {
+            "required_total": len(reqs),
+            "have": len(strengths),
+            "developing": len(developing),
+            "gaps": len(gaps),
+        },
+        "strengths": strengths,
+        "developing": developing,
+        "gaps": gaps,
+        "hard_skills": hard_items,
+        "meta_skills": meta_items,
+        "next_actions": next_actions,
+        "citation": {
+            "taxonomy": "U.S. Dept. of Education IPEDS / CIP 2020",
+            "cip_code": major["cip_code"],
+            "note": "Requirement weights are FOCMS curated; major identity and code follow the "
+                    "federal CIP taxonomy. Skill presumption uses catalog typical-age bands.",
+        },
+    }
