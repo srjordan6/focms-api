@@ -1,7 +1,7 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.33 · school-search K-12 queries locally loaded CCD (schools, pg_trgm); state optional, no live DOE call.
+v0.12.33a · school-search K-12 queries k12_schools (per-school CCD, pg_trgm); state optional, no live DOE call.
          v0.12.32 · Teacher registry (GET/POST) + universal band-aware school search proxy (DOE k12 / IPEDS college).
          v0.12.31 · Academics: per-grade year records with mid-year school-transfer support.
          v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
@@ -4247,14 +4247,14 @@ async def school_search(request: Request, q: str, level: str = "k12",
         if state:
             rows = await conn.fetch(
                 "SELECT ncessch, name, address_line1, city, state, zip, phone, "
-                "district_name FROM schools "
+                "district_name FROM k12_schools "
                 "WHERE state = $1 AND lower(name) LIKE '%' || lower($2) || '%' "
                 "ORDER BY name LIMIT $3",
                 state.upper(), q, limit)
         else:
             rows = await conn.fetch(
                 "SELECT ncessch, name, address_line1, city, state, zip, phone, "
-                "district_name FROM schools "
+                "district_name FROM k12_schools "
                 "WHERE lower(name) LIKE '%' || lower($1) || '%' "
                 "ORDER BY name LIMIT $2",
                 q, limit)
