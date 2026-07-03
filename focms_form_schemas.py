@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.19 · SPS fixes: skills bucket excluded when no student signal; inference engine auto-runs when empty (internal).
+v0.12.20 · fix: enum-safe event_type cast in inference engine (500 on auto-run).
+         v0.12.19 · SPS fixes: skills bucket excluded when no student signal; inference engine auto-runs when empty (internal).
          v0.12.18 · Success Predictor Score: weighted A/E/S/M buckets per major with meta-alignment boost.
          v0.12.17 · meta-skills internal-only: parent-portal scope blocked from all meta endpoints; major-gap serves hard-skills-only basis to parent audiences.
          v0.12.16 · evidence-based meta-skill inference engine (200-skill taxonomy).
@@ -782,7 +783,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.19)
+# Parent-portal capture endpoints (v0.12.20)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2344,7 +2345,7 @@ async def _run_meta_inference(conn, tenant_id: str, student_id: str):
     # ---------- Signals from event titles/details (competition detail) ----------
     trows = await conn.fetch(
         "SELECT title, details->>'meet' AS meet FROM events "
-        "WHERE student_id=$1::uuid AND deleted_at IS NULL AND event_type = ANY($2::text[])",
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL AND event_type::text = ANY($2::text[])",
         student_id, list(COMPETITION_TYPES))
     import re as _re
     disciplines = set()
