@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.39 · Career: job_description field + meta-skill inference rule R10 (job title/description/skills -> meta-skills).
+v0.12.40 · Higher-Ed: essays + recommenders + financial-aid + college-tests GET/POST.
+         v0.12.39 · Career: job_description field + meta-skill inference rule R10 (job title/description/skills -> meta-skills).
          v0.12.38 · Career pillar: career-profile + job-experiences + references (covers standard employment application fields).
          v0.12.37b · languages: seed carries codes + is never cached (avoids poisoning). fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
          v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
@@ -4784,5 +4785,398 @@ async def post_references(request: Request, student_id: str, body: ReferencesReq
                         tenant_id, student_id, nm, it.relationship, it.is_professional,
                         it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.country, it.phone, it.email, it.notes, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.40 - Higher-Ed: essays, recommenders, financial aid, testing
+# ======================================================================
+
+
+class EssayItem(BaseModel):
+    id: Optional[str] = None
+    essay_title: Optional[str] = None
+    prompt_text: Optional[str] = None
+    application_type: Optional[str] = None
+    target_schools: List[str] = []
+    status: Optional[str] = None
+    word_count: Optional[int] = None
+    word_limit: Optional[int] = None
+    topic_themes: List[str] = []
+    body_content: Optional[str] = None
+    notes: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class EssaysRequest(BaseModel):
+    items: List[EssayItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/essays")
+async def get_essays(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, essay_title, prompt_text, application_type, "
+            "target_schools, status, word_count, word_limit, topic_themes, "
+            "body_content, notes, (visibility='public') AS show_on_showcase "
+            "FROM essays WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["target_schools"] = list(d["target_schools"] or [])
+        d["topic_themes"] = list(d["topic_themes"] or [])
+        out.append(d)
+    return {"student_id": student_id, "essays": out}
+
+
+@router.post("/student/{student_id}/essays")
+async def post_essays(request: Request, student_id: str, body: EssaysRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE essays SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                if not (it.essay_title or it.prompt_text): continue
+                wc = it.word_count
+                if wc is None and it.body_content:
+                    wc = len([w for w in it.body_content.split() if w])
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE essays SET essay_title=$3, prompt_text=$4, application_type=$5, "
+                        "target_schools=$6, status=$7, word_count=$8, word_limit=$9, "
+                        "topic_themes=$10, body_content=$11, notes=$12, updated_at=now(), "
+                        "updated_by=$13::uuid WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.essay_title, it.prompt_text, it.application_type,
+                        list(it.target_schools or []), it.status, wc, it.word_limit,
+                        list(it.topic_themes or []), it.body_content, it.notes, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute("UPDATE essays SET visibility='public' WHERE id=$1::uuid", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute("UPDATE essays SET visibility='private' WHERE id=$1::uuid", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO essays (tenant_id, student_id, essay_title, prompt_text, "
+                        "application_type, target_schools, status, word_count, word_limit, "
+                        "topic_themes, body_content, notes, visibility, source_system, "
+                        "created_by, updated_by) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,"
+                        "$10,$11,$12,'private','parent_portal',$13::uuid,$13::uuid) RETURNING id",
+                        tenant_id, student_id, it.essay_title, it.prompt_text, it.application_type,
+                        list(it.target_schools or []), it.status, wc, it.word_limit,
+                        list(it.topic_themes or []), it.body_content, it.notes, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute("UPDATE essays SET visibility='public' WHERE id=$1::uuid", rid)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+class RecommenderItem(BaseModel):
+    id: Optional[str] = None
+    recommender_name: str
+    recommender_role: Optional[str] = None
+    organization_name: Optional[str] = None
+    subject_or_specialty: Optional[str] = None
+    relationship_quality: Optional[str] = None
+    years_known: Optional[float] = None
+    contact_email: Optional[str] = None
+    contact_phone: Optional[str] = None
+    preferred_contact_method: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class RecommendersRequest(BaseModel):
+    items: List[RecommenderItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/recommenders")
+async def get_recommenders(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, recommender_name, recommender_role, organization_name, "
+            "subject_or_specialty, relationship_quality, years_known, contact_email, "
+            "contact_phone, preferred_contact_method, notes FROM recommenders "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL ORDER BY recommender_name",
+            student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["years_known"] = float(d["years_known"]) if d["years_known"] is not None else None
+        out.append(d)
+    return {"student_id": student_id, "recommenders": out}
+
+
+@router.post("/student/{student_id}/recommenders")
+async def post_recommenders(request: Request, student_id: str, body: RecommendersRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE recommenders SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                nm = (it.recommender_name or "").strip()
+                if not nm: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE recommenders SET recommender_name=$3, recommender_role=$4, "
+                        "organization_name=$5, subject_or_specialty=$6, relationship_quality=$7, "
+                        "years_known=$8, contact_email=$9, contact_phone=$10, "
+                        "preferred_contact_method=$11, notes=$12, updated_at=now(), "
+                        "updated_by=$13::uuid WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, nm, it.recommender_role, it.organization_name,
+                        it.subject_or_specialty, it.relationship_quality, it.years_known,
+                        it.contact_email, it.contact_phone, it.preferred_contact_method,
+                        it.notes, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO recommenders (tenant_id, student_id, recommender_name, "
+                        "recommender_role, organization_name, subject_or_specialty, "
+                        "relationship_quality, years_known, contact_email, contact_phone, "
+                        "preferred_contact_method, notes, visibility, source_system, "
+                        "created_by, updated_by) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,"
+                        "$9,$10,$11,$12,'private','parent_portal',$13::uuid,$13::uuid)",
+                        tenant_id, student_id, nm, it.recommender_role, it.organization_name,
+                        it.subject_or_specialty, it.relationship_quality, it.years_known,
+                        it.contact_email, it.contact_phone, it.preferred_contact_method,
+                        it.notes, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+class FinAidItem(BaseModel):
+    id: Optional[str] = None
+    aid_type: str
+    school_name: Optional[str] = None
+    university_leaid: Optional[str] = None
+    form_or_program: Optional[str] = None
+    status: Optional[str] = None
+    submitted_date: Optional[str] = None
+    deadline: Optional[str] = None
+    priority_deadline: Optional[str] = None
+    award_amount: Optional[float] = None
+    is_renewable: Optional[bool] = None
+    renewal_terms: Optional[str] = None
+    css_code: Optional[str] = None
+    requires_css: Optional[bool] = None
+    requires_fafsa: Optional[bool] = None
+    requires_idoc: Optional[bool] = None
+    fee_waiver_used: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class FinAidRequest(BaseModel):
+    items: List[FinAidItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/financial-aid")
+async def get_financial_aid(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, aid_type, school_name, university_leaid, form_or_program, "
+            "status, submitted_date, deadline, priority_deadline, award_amount, is_renewable, "
+            "renewal_terms, css_code, requires_css, requires_fafsa, requires_idoc, "
+            "fee_waiver_used, notes FROM financial_aid_items "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL ORDER BY deadline NULLS LAST",
+            student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("submitted_date", "deadline", "priority_deadline"):
+            d[k] = d[k].isoformat() if d[k] else None
+        d["award_amount"] = float(d["award_amount"]) if d["award_amount"] is not None else None
+        out.append(d)
+    return {"student_id": student_id, "financial_aid": out}
+
+
+@router.post("/student/{student_id}/financial-aid")
+async def post_financial_aid(request: Request, student_id: str, body: FinAidRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE financial_aid_items SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                if not it.aid_type: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE financial_aid_items SET aid_type=$3, school_name=$4, "
+                        "university_leaid=$5, form_or_program=$6, status=$7, "
+                        "submitted_date=$8::date, deadline=$9::date, priority_deadline=$10::date, "
+                        "award_amount=$11, is_renewable=$12, renewal_terms=$13, css_code=$14, "
+                        "requires_css=$15, requires_fafsa=$16, requires_idoc=$17, "
+                        "fee_waiver_used=$18, notes=$19, updated_at=now(), updated_by=$20::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.aid_type, it.school_name, it.university_leaid,
+                        it.form_or_program, it.status, it.submitted_date, it.deadline,
+                        it.priority_deadline, it.award_amount, it.is_renewable, it.renewal_terms,
+                        it.css_code, it.requires_css, it.requires_fafsa, it.requires_idoc,
+                        it.fee_waiver_used, it.notes, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO financial_aid_items (tenant_id, student_id, aid_type, "
+                        "school_name, university_leaid, form_or_program, status, submitted_date, "
+                        "deadline, priority_deadline, award_amount, is_renewable, renewal_terms, "
+                        "css_code, requires_css, requires_fafsa, requires_idoc, fee_waiver_used, "
+                        "notes, source_system, created_by, updated_by) VALUES ($1::uuid,$2::uuid,"
+                        "$3,$4,$5,$6,$7,$8::date,$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,"
+                        "$18,$19,'parent_portal',$20::uuid,$20::uuid)",
+                        tenant_id, student_id, it.aid_type, it.school_name, it.university_leaid,
+                        it.form_or_program, it.status, it.submitted_date, it.deadline,
+                        it.priority_deadline, it.award_amount, it.is_renewable, it.renewal_terms,
+                        it.css_code, it.requires_css, it.requires_fafsa, it.requires_idoc,
+                        it.fee_waiver_used, it.notes, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+class ColTestItem(BaseModel):
+    id: Optional[str] = None
+    test_type: str
+    test_date: Optional[str] = None
+    registration_deadline: Optional[str] = None
+    is_planned: Optional[bool] = None
+    is_superscore: Optional[bool] = None
+    composite_score: Optional[int] = None
+    section_scores: Optional[dict] = None
+    percentile: Optional[int] = None
+    superscore_composite: Optional[int] = None
+    registration_status: Optional[str] = None
+    fee_waiver_used: Optional[bool] = None
+    notes: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class ColTestRequest(BaseModel):
+    items: List[ColTestItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/college-tests")
+async def get_college_tests(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, test_type, test_date, registration_deadline, is_planned, "
+            "is_superscore, composite_score, section_scores, percentile, superscore_composite, "
+            "registration_status, fee_waiver_used, notes, (visibility='public') AS show_on_showcase "
+            "FROM college_test_scores WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY test_date DESC NULLS LAST", student_id)
+    import json as _json
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("test_date", "registration_deadline"):
+            d[k] = d[k].isoformat() if d[k] else None
+        ss = d.get("section_scores")
+        if isinstance(ss, str):
+            try: d["section_scores"] = _json.loads(ss)
+            except Exception: d["section_scores"] = {}
+        out.append(d)
+    return {"student_id": student_id, "tests": out}
+
+
+@router.post("/student/{student_id}/college-tests")
+async def post_college_tests(request: Request, student_id: str, body: ColTestRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    import json as _json
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE college_test_scores SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                if not it.test_type: continue
+                ss = _json.dumps(it.section_scores) if it.section_scores else "{}"
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE college_test_scores SET test_type=$3, test_date=$4::date, "
+                        "registration_deadline=$5::date, is_planned=$6, is_superscore=$7, "
+                        "composite_score=$8, section_scores=$9::jsonb, percentile=$10, "
+                        "superscore_composite=$11, registration_status=$12, fee_waiver_used=$13, "
+                        "notes=$14, updated_at=now(), updated_by=$15::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.test_type, it.test_date, it.registration_deadline,
+                        it.is_planned, it.is_superscore, it.composite_score, ss, it.percentile,
+                        it.superscore_composite, it.registration_status, it.fee_waiver_used,
+                        it.notes, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute("UPDATE college_test_scores SET visibility='public' WHERE id=$1::uuid", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute("UPDATE college_test_scores SET visibility='private' WHERE id=$1::uuid", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO college_test_scores (tenant_id, student_id, test_type, "
+                        "test_date, registration_deadline, is_planned, is_superscore, "
+                        "composite_score, section_scores, percentile, superscore_composite, "
+                        "registration_status, fee_waiver_used, notes, visibility, source_system, "
+                        "created_by, updated_by) VALUES ($1::uuid,$2::uuid,$3,$4::date,$5::date,"
+                        "$6,$7,$8,$9::jsonb,$10,$11,$12,$13,$14,'private','parent_portal',"
+                        "$15::uuid,$15::uuid) RETURNING id",
+                        tenant_id, student_id, it.test_type, it.test_date, it.registration_deadline,
+                        it.is_planned, it.is_superscore, it.composite_score, ss, it.percentile,
+                        it.superscore_composite, it.registration_status, it.fee_waiver_used,
+                        it.notes, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute("UPDATE college_test_scores SET visibility='public' WHERE id=$1::uuid", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
