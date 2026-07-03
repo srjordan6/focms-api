@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.24 · Extracurricular expansion: programs picker, named-awards catalog, EC milestones catalog, awards GET/POST, sessions log GET/POST.
+v0.12.25 · universal activity fields: skills_gained + show_on_showcase across affiliations, awards, sessions.
+         v0.12.24 · Extracurricular expansion: programs picker, named-awards catalog, EC milestones catalog, awards GET/POST, sessions log GET/POST.
          v0.12.23 · Extra Curricular pillar: affiliations GET/POST for programs, activities, service orgs, coach relationships.
          v0.12.22 · SPS skills bucket is age-aware: denominator = age-appropriate + evidenced requirements; ahead-of-age skills count fully.
          v0.12.21 · fix: tenant GUC now set via SET LOCAL inside one transaction per handler (_tenant_conn); cures intermittent empty RLS reads through PgBouncer.
@@ -793,7 +794,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.24)
+# Parent-portal capture endpoints (v0.12.25)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2698,6 +2699,8 @@ _AFFIL_TYPES = {"program", "activity", "service_org", "coach_relationship"}
 
 class AffiliationItem(BaseModel):
     id: Optional[str] = None
+    skills_gained: List[str] = []
+    show_on_showcase: Optional[bool] = None
     affiliation_type: str
     organization_name: str
     organization_url: Optional[str] = None
@@ -2726,13 +2729,16 @@ async def get_student_affiliations(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
-            "SELECT id, affiliation_type::text AS affiliation_type, organization_name, "
-            "organization_url, organization_city, organization_state, role, "
-            "role_start_date, role_end_date, weekly_hours, total_hours, "
-            "coach_name, coach_email, coach_role, notes, public_description, "
-            "is_verified, source_system "
-            "FROM affiliations WHERE student_id=$1::uuid AND deleted_at IS NULL "
-            "ORDER BY affiliation_type, coalesce(role_start_date, created_at::date) DESC",
+            "SELECT a.id, a.affiliation_type::text AS affiliation_type, a.organization_name, "
+            "a.organization_url, a.organization_city, a.organization_state, a.role, "
+            "a.role_start_date, a.role_end_date, a.weekly_hours, a.total_hours, "
+            "a.coach_name, a.coach_email, a.coach_role, a.notes, a.public_description, "
+            "a.is_verified, a.source_system, (a.visibility='public') AS show_on_showcase, "
+            "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
+            " FROM student_skills ss WHERE ss.source_activity = 'affiliations:'||a.id::text "
+            " AND ss.deleted_at IS NULL), ARRAY[]::text[]) AS skills_gained "
+            "FROM affiliations a WHERE a.student_id=$1::uuid AND a.deleted_at IS NULL "
+            "ORDER BY a.affiliation_type, coalesce(a.role_start_date, a.created_at::date) DESC",
             student_id)
     out = []
     for r in rows:
@@ -2791,9 +2797,11 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id)
                     if r and r.endswith(" 1"):
+                        await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                            "affiliations", it.id, it.skills_gained, it.show_on_showcase)
                         updated += 1
                 else:
-                    await conn.execute(
+                    rid = await conn.fetchval(
                         "INSERT INTO affiliations (tenant_id, student_id, affiliation_type, "
                         "organization_name, organization_url, organization_city, organization_state, "
                         "role, role_start_date, role_end_date, weekly_hours, total_hours, "
@@ -2801,15 +2809,62 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3::affiliation_type_enum,$4,$5,$6,$7,$8,"
                         "$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,'private','parent_portal',"
-                        "$18::uuid,$18::uuid)",
+                        "$18::uuid,$18::uuid) RETURNING id",
                         tenant_id, student_id, atype, name, it.organization_url,
                         it.organization_city, it.organization_state, it.role,
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id)
+                    await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                        "affiliations", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
+
+
+
+# v0.12.25: universal activity helpers
+async def _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                                     table, record_id, skills_gained, show_on_showcase):
+    if show_on_showcase is True:
+        await conn.execute(
+            f"UPDATE {table} SET visibility='public' "
+            f"WHERE id=$1::uuid AND student_id=$2::uuid AND visibility_locked=false",
+            record_id, student_id)
+    elif show_on_showcase is False:
+        await conn.execute(
+            f"UPDATE {table} SET visibility='private' "
+            f"WHERE id=$1::uuid AND student_id=$2::uuid AND visibility_locked=false",
+            record_id, student_id)
+    if not skills_gained:
+        return
+    valid = {r["code"] for r in await conn.fetch("SELECT code FROM skills_catalog WHERE is_active")}
+    src = f"{table}:{record_id}"
+    for entry in skills_gained:
+        code = (entry or "").strip()
+        if not code:
+            continue
+        if code in valid:
+            existing = await conn.fetchval(
+                "SELECT id FROM student_skills WHERE student_id=$1::uuid AND skill_code=$2 "
+                "AND deleted_at IS NULL LIMIT 1", student_id, code)
+            if existing:
+                await conn.execute(
+                    "UPDATE student_skills SET acquired=true, source_activity=$3, "
+                    "updated_at=now(), updated_by=$4::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
+                    existing, student_id, src, user_id)
+            else:
+                await conn.execute(
+                    "INSERT INTO student_skills (tenant_id, student_id, skill_code, acquired, "
+                    "acquired_date, source_activity, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                    tenant_id, student_id, code, src, user_id)
+        else:
+            await conn.execute(
+                "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
+                "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
+                "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                tenant_id, student_id, code, src, user_id)
 
 # ======================================================================
 # v0.12.24 - Extracurricular expansion
@@ -2853,6 +2908,8 @@ async def get_ec_milestones(request: Request):
 
 class AwardItem(BaseModel):
     id: Optional[str] = None
+    skills_gained: List[str] = []
+    show_on_showcase: Optional[bool] = None
     award_name: str
     granting_organization: Optional[str] = None
     awarded_date: Optional[str] = None
@@ -2878,13 +2935,16 @@ async def get_student_awards(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
-            "SELECT id::text AS id, award_name, granting_organization, awarded_date, level, "
-            "category, rank_or_placement, competing_pool_size, monetary_value_usd, "
-            "named_award_catalog_id::text AS named_award_catalog_id, "
-            "related_affiliation_id::text AS related_affiliation_id, "
-            "notes, public_description, source_system "
-            "FROM awards_honors WHERE student_id=$1::uuid AND deleted_at IS NULL "
-            "ORDER BY awarded_date DESC NULLS LAST, created_at DESC", student_id)
+            "SELECT a.id::text AS id, a.award_name, a.granting_organization, a.awarded_date, a.level, "
+            "a.category, a.rank_or_placement, a.competing_pool_size, a.monetary_value_usd, "
+            "a.named_award_catalog_id::text AS named_award_catalog_id, "
+            "a.related_affiliation_id::text AS related_affiliation_id, "
+            "a.notes, a.public_description, a.source_system, (a.visibility='public') AS show_on_showcase, "
+            "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
+            " FROM student_skills ss WHERE ss.source_activity = 'awards_honors:'||a.id::text "
+            " AND ss.deleted_at IS NULL), ARRAY[]::text[]) AS skills_gained "
+            "FROM awards_honors a WHERE a.student_id=$1::uuid AND a.deleted_at IS NULL "
+            "ORDER BY a.awarded_date DESC NULLS LAST, a.created_at DESC", student_id)
     out = []
     for r in rows:
         d = dict(r)
@@ -2928,9 +2988,12 @@ async def post_student_awards(request: Request, student_id: str, body: AwardsReq
                         it.level, it.category, it.rank_or_placement, it.competing_pool_size,
                         it.monetary_value_usd, it.named_award_catalog_id or '',
                         it.related_affiliation_id or '', it.notes, it.public_description, user_id)
-                    if r and r.endswith(" 1"): updated += 1
+                    if r and r.endswith(" 1"):
+                        await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                            "awards_honors", it.id, it.skills_gained, it.show_on_showcase)
+                        updated += 1
                 else:
-                    await conn.execute(
+                    rid = await conn.fetchval(
                         "INSERT INTO awards_honors (tenant_id, student_id, award_name, "
                         "granting_organization, awarded_date, level, category, rank_or_placement, "
                         "competing_pool_size, monetary_value_usd, "
@@ -2938,11 +3001,13 @@ async def post_student_awards(request: Request, student_id: str, body: AwardsReq
                         "public_description, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3,$4,$5::date,$6,$7,$8,$9,$10,"
                         "NULLIF($11,'')::uuid,NULLIF($12,'')::uuid,$13,$14,'private',"
-                        "'parent_portal',$15::uuid,$15::uuid)",
+                        "'parent_portal',$15::uuid,$15::uuid) RETURNING id",
                         tenant_id, student_id, name, it.granting_organization, it.awarded_date,
                         it.level, it.category, it.rank_or_placement, it.competing_pool_size,
                         it.monetary_value_usd, it.named_award_catalog_id or '',
                         it.related_affiliation_id or '', it.notes, it.public_description, user_id)
+                    await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                        "awards_honors", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
@@ -2953,6 +3018,8 @@ _EC_EVENT_TYPES = {"service_session", "summer_experience", "leadership_milestone
 
 class EcSessionItem(BaseModel):
     id: Optional[str] = None
+    skills_gained: List[str] = []
+    show_on_showcase: Optional[bool] = None
     event_type: str
     title: str
     event_date: str
@@ -2973,12 +3040,15 @@ async def get_ec_sessions(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
-            "SELECT id::text AS id, event_type::text AS event_type, title, event_date, "
-            "duration_minutes, location_name AS location, affiliation_id::text AS related_affiliation_id, "
-            "notes, source_system "
-            "FROM events WHERE student_id=$1::uuid AND deleted_at IS NULL "
-            "AND event_type::text = ANY($2::text[]) "
-            "ORDER BY event_date DESC NULLS LAST",
+            "SELECT e.id::text AS id, e.event_type::text AS event_type, e.title, e.event_date, "
+            "e.duration_minutes, e.location_name AS location, e.affiliation_id::text AS related_affiliation_id, "
+            "e.notes, e.source_system, (e.visibility='public') AS show_on_showcase, "
+            "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
+            " FROM student_skills ss WHERE ss.source_activity = 'events:'||e.id::text "
+            " AND ss.deleted_at IS NULL), ARRAY[]::text[]) AS skills_gained "
+            "FROM events e WHERE e.student_id=$1::uuid AND e.deleted_at IS NULL "
+            "AND e.event_type::text = ANY($2::text[]) "
+            "ORDER BY e.event_date DESC NULLS LAST",
             student_id, list(_EC_EVENT_TYPES))
     out = []
     for r in rows:
@@ -3024,16 +3094,21 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id)
-                    if r and r.endswith(" 1"): updated += 1
+                    if r and r.endswith(" 1"):
+                        await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                            "events", it.id, it.skills_gained, it.show_on_showcase)
+                        updated += 1
                 else:
-                    await conn.execute(
+                    rid = await conn.fetchval(
                         "INSERT INTO events (tenant_id, student_id, event_type, title, "
                         "event_date, duration_minutes, location_name, affiliation_id, notes, "
                         "visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,$5::date,$6,$7,"
-                        "NULLIF($8,'')::uuid,$9,'private','parent_portal',$10::uuid,$10::uuid)",
+                        "NULLIF($8,'')::uuid,$9,'private','parent_portal',$10::uuid,$10::uuid) RETURNING id",
                         tenant_id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id)
+                    await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
+                        "events", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
