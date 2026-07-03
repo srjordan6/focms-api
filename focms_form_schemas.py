@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.18 · Success Predictor Score: weighted A/E/S/M buckets per major with meta-alignment boost.
+v0.12.19 · SPS fixes: skills bucket excluded when no student signal; inference engine auto-runs when empty (internal).
+         v0.12.18 · Success Predictor Score: weighted A/E/S/M buckets per major with meta-alignment boost.
          v0.12.17 · meta-skills internal-only: parent-portal scope blocked from all meta endpoints; major-gap serves hard-skills-only basis to parent audiences.
          v0.12.16 · evidence-based meta-skill inference engine (200-skill taxonomy).
          v0.12.15 · meta-skills tracking + major-gap report engine.
@@ -781,7 +782,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.18)
+# Parent-portal capture endpoints (v0.12.19)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2128,6 +2129,7 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str, audien
                   for r in await conn.fetch("SELECT code, title FROM skills_catalog WHERE is_active")}
 
         # student's inferred meta-skill read (evidence-based; parents do not self-rate)
+        await _ensure_inferences(conn, tenant_id, student_id, ctx.get("user_id") and str(ctx["user_id"]))
         mrows = await conn.fetch(
             "SELECT meta_skill_code, score, confidence FROM meta_skill_inferences "
             "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
@@ -2452,6 +2454,40 @@ async def _run_meta_inference(conn, tenant_id: str, student_id: str):
     return findings
 
 
+# v0.12.19: shared engine writer + lazy auto-run
+async def _write_inferences(conn, tenant_id: str, student_id: str, user_id):
+    """Replace stored inferences from a fresh engine run. Returns count written."""
+    valid = {r["code"] for r in await conn.fetch("SELECT code FROM meta_skills_catalog WHERE is_active")}
+    findings = await _run_meta_inference(conn, tenant_id, student_id)
+    async with conn.transaction():
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        await conn.execute(
+            "DELETE FROM meta_skill_inferences WHERE tenant_id=$1::uuid AND student_id=$2::uuid",
+            tenant_id, student_id)
+        written = 0
+        for code, f in findings.items():
+            if code not in valid:
+                continue
+            await conn.execute(
+                "INSERT INTO meta_skill_inferences (tenant_id, student_id, meta_skill_code, "
+                "score, confidence, evidence, rule_code, engine_version, created_by, updated_by) "
+                "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb,$7,'v1',$8::uuid,$8::uuid)",
+                tenant_id, student_id, code, int(f["score"]), f["confidence"],
+                json.dumps(f["evidence"]), ",".join(f["rules"]), user_id)
+            written += 1
+    return written
+
+
+async def _ensure_inferences(conn, tenant_id: str, student_id: str, user_id):
+    """Lazy internal compute: if no inference rows exist for the student,
+    run the engine now. Internal tracking only - never surfaced to parents."""
+    n = await conn.fetchval(
+        "SELECT count(*) FROM meta_skill_inferences WHERE student_id=$1::uuid AND deleted_at IS NULL",
+        student_id)
+    if not n:
+        await _write_inferences(conn, tenant_id, student_id, user_id)
+
+
 @router.post("/student/{student_id}/meta-skills/infer")
 async def run_meta_skill_inference(request: Request, student_id: str):
     """Run the inference engine over the student's activity record and
@@ -2460,24 +2496,7 @@ async def run_meta_skill_inference(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
-        valid = {r["code"] for r in await conn.fetch("SELECT code FROM meta_skills_catalog WHERE is_active")}
-        findings = await _run_meta_inference(conn, tenant_id, student_id)
-        async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
-            await conn.execute(
-                "DELETE FROM meta_skill_inferences WHERE tenant_id=$1::uuid AND student_id=$2::uuid",
-                tenant_id, student_id)
-            written = 0
-            for code, f in findings.items():
-                if code not in valid:
-                    continue
-                await conn.execute(
-                    "INSERT INTO meta_skill_inferences (tenant_id, student_id, meta_skill_code, "
-                    "score, confidence, evidence, rule_code, engine_version, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb,$7,'v1',$8::uuid,$8::uuid)",
-                    tenant_id, student_id, code, int(f["score"]), f["confidence"],
-                    json.dumps(f["evidence"]), ",".join(f["rules"]), user_id)
-                written += 1
+        written = await _write_inferences(conn, tenant_id, student_id, user_id)
     return {"student_id": student_id, "inferred": written}
 
 
@@ -2611,14 +2630,19 @@ async def get_major_sps(request: Request, student_id: str, cip_code: str, audien
             amax = {r["code"]: (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None)
                     for r in await conn.fetch("SELECT code, typical_age_max FROM skills_catalog WHERE is_active")}
             have_w = total_w = 0.0
+            signal_hits = 0
             for r in reqs:
                 total_w += r["importance"]
                 acq = explicit.get(r["skill_code"])
                 presumed = (acq is None and age is not None and amax.get(r["skill_code"]) is not None
                             and age > amax[r["skill_code"]])
+                if acq is not None or presumed:
+                    signal_hits += 1
                 if acq is True or presumed:
                     have_w += r["importance"]
-            if total_w:
+            # no explicit rows and no presumable requirements = no signal at all:
+            # exclude the bucket (renormalize) instead of scoring a false zero
+            if total_w and (explicit or signal_hits):
                 buckets["skills"] = {
                     "score": round(have_w / total_w, 3),
                     "evidence": [f"Hard-skill coverage of {len(reqs)} requirements for {major['title']}"]}
@@ -2626,6 +2650,7 @@ async def get_major_sps(request: Request, student_id: str, cip_code: str, audien
         # meta-alignment boost: share of the major's meta requirements evidenced at 4+
         boost = 0.0
         matched_codes = []
+        await _ensure_inferences(conn, tenant_id, student_id, ctx.get("user_id") and str(ctx["user_id"]))
         mreqs = await conn.fetch(
             "SELECT meta_skill_code FROM major_skill_requirements "
             "WHERE cip_code=$1 AND is_active AND meta_skill_code IS NOT NULL", cip)
