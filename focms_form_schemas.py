@@ -1,7 +1,7 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.37a · fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
+v0.12.37b · languages: seed carries codes + is never cached (avoids poisoning). fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
          v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
          v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
          v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
@@ -4347,12 +4347,15 @@ async def get_languages_catalog(request: Request, target: str = "en"):
         except Exception:
             langs = None
     if not langs:
-        seed = ["English","Spanish","Mandarin Chinese","Cantonese","Hindi","Arabic",
-                "French","Korean","Vietnamese","Tagalog","Portuguese","Russian","German",
-                "Japanese","Urdu","Punjabi","Bengali","Persian","Gujarati","Tamil","Telugu",
-                "Italian","Polish","Turkish","Ukrainian","Hebrew","Thai","Amharic","Somali",
-                "Haitian Creole","Nepali","Burmese","Swahili"]
-        langs = [{"code": None, "name": n} for n in seed]
+        seed = [("en","English"),("es","Spanish"),("zh","Chinese"),("hi","Hindi"),
+                ("ar","Arabic"),("fr","French"),("ko","Korean"),("vi","Vietnamese"),
+                ("tl","Tagalog"),("pt","Portuguese"),("ru","Russian"),("de","German"),
+                ("ja","Japanese"),("ur","Urdu"),("bn","Bengali"),("it","Italian"),
+                ("pl","Polish"),("tr","Turkish"),("uk","Ukrainian"),("he","Hebrew"),
+                ("th","Thai"),("sw","Swahili")]
+        langs = [{"code": c, "name": n} for c, n in seed]
+        # Do NOT cache the seed fallback, so a later valid key returns the full list.
+        return {"languages": langs, "cached": False, "seed": True}
     _LANG_CACHE["data"] = langs
     _LANG_CACHE["ts"] = now
     return {"languages": langs, "cached": False}
