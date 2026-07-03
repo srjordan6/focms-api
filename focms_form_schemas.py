@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.17 · meta-skills internal-only: parent-portal scope blocked from all meta endpoints; major-gap serves hard-skills-only basis to parent audiences.
+v0.12.18 · Success Predictor Score: weighted A/E/S/M buckets per major with meta-alignment boost.
+         v0.12.17 · meta-skills internal-only: parent-portal scope blocked from all meta endpoints; major-gap serves hard-skills-only basis to parent audiences.
          v0.12.16 · evidence-based meta-skill inference engine (200-skill taxonomy).
          v0.12.15 · meta-skills tracking + major-gap report engine.
          v0.12.2 · Session 1 of the schema-driven parent portal build.
@@ -780,7 +781,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.17)
+# Parent-portal capture endpoints (v0.12.18)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2512,3 +2513,155 @@ async def get_inferred_meta_skills(request: Request, student_id: str):
     return {"student_id": student_id,
             "computed_at": computed_at.isoformat() if computed_at else None,
             "found": len(inf), "total": len(cat), "skills": out}
+
+
+# ======================================================================
+# v0.12.18 - Success Predictor Score (SPS)
+# ----------------------------------------------------------------------
+# SPS = (w1*A) + (w2*E) + (w3*S) + (w4*M) + meta-alignment boost (<=5%)
+#   A Academic Foundation  - latest percentile per assessment subject
+#   E Engagement & Grit    - activity volume, span, and breadth
+#   S Skills               - hard-skill coverage vs the major (gap engine)
+#   M Context & Milestones - milestones, repertoire, championship record
+# Weights are per-major (cip_majors.weight_*), family-calibrated.
+# Meta boost reads meta_skill_inferences (internal engine). Parent
+# audiences receive the boost folded into the score with no meta-skill
+# names or itemization (meta-skills are internal-only).
+# Buckets with no data are excluded and weights renormalized - the
+# score never punishes a family for data not yet captured.
+# ======================================================================
+
+async def _sps_buckets(conn, student_id: str):
+    """Compute A/E/M vectors (0-1) with cited evidence. S comes from the gap engine."""
+    out = {}
+
+    # A - Academic Foundation: latest percentile per subject, averaged
+    arows = await conn.fetch(
+        "SELECT DISTINCT ON (subject) subject, percentile, test_date FROM assessments "
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL AND percentile IS NOT NULL "
+        "AND subject IS NOT NULL ORDER BY subject, test_date DESC", student_id)
+    if arows:
+        vals = [float(r["percentile"]) / 100.0 for r in arows]
+        out["academics"] = {
+            "score": round(sum(vals) / len(vals), 3),
+            "evidence": ["Latest percentile per subject: " + ", ".join(
+                f"{r['subject']} P{int(r['percentile'])} ({r['test_date']})" for r in arows)]}
+
+    # E - Engagement & Grit: volume x span x breadth of the activity record
+    ev = await conn.fetchrow(
+        "SELECT count(*) AS n, min(event_date) AS first, max(event_date) AS last, "
+        "count(DISTINCT event_type) AS types FROM events "
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL AND event_date IS NOT NULL", student_id)
+    if ev and int(ev["n"] or 0) > 0:
+        n = int(ev["n"])
+        months = round((ev["last"] - ev["first"]).days / 30.44, 1) if ev["first"] and ev["last"] else 0
+        breadth = int(ev["types"])
+        e = min(1.0, 0.5 * min(n / 150.0, 1.0) + 0.3 * min(months / 36.0, 1.0) + 0.2 * min(breadth / 4.0, 1.0))
+        out["engagement"] = {
+            "score": round(e, 3),
+            "evidence": [f"{n} logged activity events over {months} months across {breadth} activity types"]}
+
+    # M - Context & Milestones: milestones + repertoire + championship record
+    mrow = await conn.fetchrow(
+        "SELECT (SELECT count(*) FROM student_life_milestones WHERE student_id=$1::uuid AND deleted_at IS NULL) AS miles, "
+        "(SELECT count(*) FROM personal_records WHERE student_id=$1::uuid AND deleted_at IS NULL AND record_kind='music_repertoire') AS rep, "
+        "(SELECT count(*) FROM events WHERE student_id=$1::uuid AND deleted_at IS NULL "
+        " AND (lower(coalesce(details->>'meet','')) LIKE '%championship%' OR lower(coalesce(details->>'meet','')) LIKE '%champs%')) AS champ",
+        student_id)
+    miles, rep, champ = int(mrow["miles"] or 0), int(mrow["rep"] or 0), int(mrow["champ"] or 0)
+    if miles + rep + champ > 0:
+        m = min(1.0, (miles * 2.0 + rep + min(champ, 10) * 0.3) / 10.0)
+        out["milestones"] = {
+            "score": round(m, 3),
+            "evidence": [f"{miles} recorded life milestones, {rep} performance repertoire pieces, "
+                         f"{champ} championship-level competition entries"]}
+    return out
+
+
+@router.get("/student/{student_id}/major-sps")
+async def get_major_sps(request: Request, student_id: str, cip_code: str, audience: str = None):
+    """Success Predictor Score for a student against a major."""
+    ctx = await _resolve_context(request)
+    if ctx.get("scope") == "parent_portal" and student_id not in (ctx.get("student_ids") or []):
+        raise HTTPException(status_code=403, detail="student_not_authorized")
+    tenant_id = str(ctx["tenant_id"])
+    parent_view = (ctx.get("scope") == "parent_portal") or ((audience or "").strip().lower() == "parent")
+    cip = (cip_code or "").strip()
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        major = await conn.fetchrow(
+            "SELECT cip_code, title, weight_academics, weight_engagement, weight_skills, weight_milestones "
+            "FROM cip_majors WHERE cip_code=$1 AND is_active", cip)
+        if not major:
+            raise HTTPException(status_code=404, detail="cip_major_not_found")
+
+        buckets = await _sps_buckets(conn, student_id)
+
+        # S - hard-skill coverage vs this major (same math as the gap report)
+        reqs = await conn.fetch(
+            "SELECT skill_code, importance FROM major_skill_requirements "
+            "WHERE cip_code=$1 AND is_active AND skill_code IS NOT NULL", cip)
+        if reqs:
+            age = await _pp_student_age(conn, student_id)
+            srows = await conn.fetch(
+                "SELECT skill_code, acquired FROM student_skills "
+                "WHERE student_id=$1::uuid AND deleted_at IS NULL AND skill_code IS NOT NULL", student_id)
+            explicit = {r["skill_code"]: r["acquired"] for r in srows}
+            amax = {r["code"]: (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None)
+                    for r in await conn.fetch("SELECT code, typical_age_max FROM skills_catalog WHERE is_active")}
+            have_w = total_w = 0.0
+            for r in reqs:
+                total_w += r["importance"]
+                acq = explicit.get(r["skill_code"])
+                presumed = (acq is None and age is not None and amax.get(r["skill_code"]) is not None
+                            and age > amax[r["skill_code"]])
+                if acq is True or presumed:
+                    have_w += r["importance"]
+            if total_w:
+                buckets["skills"] = {
+                    "score": round(have_w / total_w, 3),
+                    "evidence": [f"Hard-skill coverage of {len(reqs)} requirements for {major['title']}"]}
+
+        # meta-alignment boost: share of the major's meta requirements evidenced at 4+
+        boost = 0.0
+        matched_codes = []
+        mreqs = await conn.fetch(
+            "SELECT meta_skill_code FROM major_skill_requirements "
+            "WHERE cip_code=$1 AND is_active AND meta_skill_code IS NOT NULL", cip)
+        if mreqs:
+            inf = await conn.fetch(
+                "SELECT meta_skill_code, score FROM meta_skill_inferences "
+                "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+            imap = {r["meta_skill_code"]: r["score"] for r in inf}
+            need = [r["meta_skill_code"] for r in mreqs]
+            matched_codes = [c for c in need if imap.get(c, 0) >= 4]
+            boost = (len(matched_codes) / len(need)) * 0.05
+
+    # weighted score over buckets that have data; weights renormalized
+    wmap = {"academics": float(major["weight_academics"] or 0.40),
+            "engagement": float(major["weight_engagement"] or 0.20),
+            "skills": float(major["weight_skills"] or 0.30),
+            "milestones": float(major["weight_milestones"] or 0.10)}
+    active_w = sum(w for k, w in wmap.items() if k in buckets)
+    base = 0.0
+    comp = []
+    for k, w in wmap.items():
+        b = buckets.get(k)
+        wn = round(w / active_w, 3) if active_w else 0.0
+        comp.append({"bucket": k, "weight": w, "weight_normalized": (wn if b else None),
+                     "score": (b["score"] if b else None),
+                     "evidence": (b["evidence"] if b else ["No data captured yet - excluded from the score"])})
+        if b and active_w:
+            base += (w / active_w) * b["score"]
+    sps = round(min((base + boost) * 100.0, 100.0), 1)
+
+    resp = {"student_id": student_id, "major": {"cip_code": major["cip_code"], "title": major["title"]},
+            "sps": sps, "base_pct": round(base * 100.0, 1),
+            "alignment_bonus_pct": round(boost * 100.0, 1),
+            "basis": ("parent" if parent_view else "full"),
+            "components": comp,
+            "note": "Buckets without data are excluded and weights renormalized; the score reflects captured evidence only."}
+    if not parent_view:
+        resp["alignment_matched_meta_skills"] = matched_codes
+    return resp
