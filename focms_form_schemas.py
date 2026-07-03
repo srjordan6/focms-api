@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
+v0.12.31 · Academics: per-grade year records with mid-year school-transfer support.
+         v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
          v0.12.29 · Academics: current-school helper for prefill (name, address, phone).
          v0.12.28a · Academics band summary: coerce text grade values (PK, K, "9") to int before comparison.
          v0.12.28 · Academics grade-band scoping: summary + courses GET/POST filtered by band (preschool/elementary/middle/high).
@@ -801,7 +802,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.30)
+# Parent-portal capture endpoints (v0.12.31)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -3982,6 +3983,144 @@ async def post_report_cards(request: Request, student_id: str, body: ReportCards
                     if it.show_on_showcase is True:
                         await conn.execute(
                             "UPDATE report_cards SET visibility='public' "
+                            "WHERE id=$1::uuid AND visibility_locked=false", rid)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.31 - Student year records (per-grade, multi-school-year, mid-year transfer)
+# ======================================================================
+
+
+class YearRecordItem(BaseModel):
+    id: Optional[str] = None
+    grade_level: int
+    school_year: str
+    school_id: Optional[str] = None
+    school_name: Optional[str] = None
+    is_full_year: Optional[bool] = None
+    attendance_from: Optional[str] = None
+    attendance_to: Optional[str] = None
+    gpa_unweighted: Optional[float] = None
+    gpa_weighted: Optional[float] = None
+    days_present: Optional[int] = None
+    days_absent: Optional[int] = None
+    days_tardy: Optional[int] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class YearRecordsRequest(BaseModel):
+    items: List[YearRecordItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/year-records")
+async def get_year_records(request: Request, student_id: str,
+                           grade_level: Optional[int] = None):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        if grade_level is not None:
+            rows = await conn.fetch(
+                "SELECT id::text AS id, grade_level, school_year, "
+                "school_id::text AS school_id, school_name, is_full_year, "
+                "attendance_from, attendance_to, gpa_unweighted, gpa_weighted, "
+                "days_present, days_absent, days_tardy, notes, public_description, "
+                "(visibility='public') AS show_on_showcase "
+                "FROM student_year_records WHERE student_id=$1::uuid "
+                "AND deleted_at IS NULL AND grade_level=$2 "
+                "ORDER BY school_year DESC, attendance_from DESC NULLS LAST",
+                student_id, grade_level)
+        else:
+            rows = await conn.fetch(
+                "SELECT id::text AS id, grade_level, school_year, "
+                "school_id::text AS school_id, school_name, is_full_year, "
+                "attendance_from, attendance_to, gpa_unweighted, gpa_weighted, "
+                "days_present, days_absent, days_tardy, notes, public_description, "
+                "(visibility='public') AS show_on_showcase "
+                "FROM student_year_records WHERE student_id=$1::uuid "
+                "AND deleted_at IS NULL "
+                "ORDER BY grade_level, school_year DESC, attendance_from DESC NULLS LAST",
+                student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("attendance_from", "attendance_to"):
+            d[k] = d[k].isoformat() if d[k] else None
+        for k in ("gpa_unweighted", "gpa_weighted"):
+            d[k] = float(d[k]) if d[k] is not None else None
+        out.append(d)
+    return {"student_id": student_id, "years": out}
+
+
+@router.post("/student/{student_id}/year-records")
+async def post_year_records(request: Request, student_id: str, body: YearRecordsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE student_year_records SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                if it.grade_level is None or it.grade_level < 0 or it.grade_level > 12:
+                    continue
+                sy = (it.school_year or "").strip()
+                if not sy: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE student_year_records SET grade_level=$3, school_year=$4, "
+                        "school_id=NULLIF($5,'')::uuid, school_name=$6, is_full_year=$7, "
+                        "attendance_from=$8::date, attendance_to=$9::date, "
+                        "gpa_unweighted=$10, gpa_weighted=$11, days_present=$12, "
+                        "days_absent=$13, days_tardy=$14, notes=$15, "
+                        "public_description=$16, updated_at=now(), updated_by=$17::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.grade_level, sy, it.school_id or '',
+                        it.school_name, it.is_full_year, it.attendance_from,
+                        it.attendance_to, it.gpa_unweighted, it.gpa_weighted,
+                        it.days_present, it.days_absent, it.days_tardy, it.notes,
+                        it.public_description, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute(
+                                "UPDATE student_year_records SET visibility='public' "
+                                "WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute(
+                                "UPDATE student_year_records SET visibility='private' "
+                                "WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO student_year_records (tenant_id, student_id, "
+                        "grade_level, school_year, school_id, school_name, is_full_year, "
+                        "attendance_from, attendance_to, gpa_unweighted, gpa_weighted, "
+                        "days_present, days_absent, days_tardy, notes, public_description, "
+                        "visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,NULLIF($5,'')::uuid,$6,$7,"
+                        "$8::date,$9::date,$10,$11,$12,$13,$14,$15,$16,"
+                        "'private','parent_portal',$17::uuid,$17::uuid) RETURNING id",
+                        tenant_id, student_id, it.grade_level, sy, it.school_id or '',
+                        it.school_name, it.is_full_year, it.attendance_from,
+                        it.attendance_to, it.gpa_unweighted, it.gpa_weighted,
+                        it.days_present, it.days_absent, it.days_tardy, it.notes,
+                        it.public_description, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute(
+                            "UPDATE student_year_records SET visibility='public' "
                             "WHERE id=$1::uuid AND visibility_locked=false", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
