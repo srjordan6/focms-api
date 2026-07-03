@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.29 · Academics: current-school helper for prefill (name, address, phone).
+v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
+         v0.12.29 · Academics: current-school helper for prefill (name, address, phone).
          v0.12.28a · Academics band summary: coerce text grade values (PK, K, "9") to int before comparison.
          v0.12.28 · Academics grade-band scoping: summary + courses GET/POST filtered by band (preschool/elementary/middle/high).
          v0.12.27a · fix: details column arrives as str via asyncpg; json-decode before .get.
@@ -800,7 +801,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.29)
+# Parent-portal capture endpoints (v0.12.30)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -3668,3 +3669,319 @@ async def get_current_school(request: Request, student_id: str):
     d = dict(row)
     d["grade_levels_attended"] = list(d["grade_levels_attended"] or [])
     return {"student_id": student_id, "school": d}
+
+
+# ======================================================================
+# v0.12.30 - School profile (School Report data) + Report Cards
+# ======================================================================
+
+
+class SchoolProfileItem(BaseModel):
+    id: Optional[str] = None
+    school_name: str
+    school_ceeb_code: Optional[str] = None
+    ceeb_code: Optional[str] = None
+    school_type: Optional[str] = None
+    street_address: Optional[str] = None
+    city_town: Optional[str] = None
+    state_province: Optional[str] = None
+    zip_postal_code: Optional[str] = None
+    country: Optional[str] = None
+    counselor_name: Optional[str] = None
+    counselor_position: Optional[str] = None
+    counselor_phone: Optional[str] = None
+    counselor_email: Optional[str] = None
+    counselor_fax: Optional[str] = None
+    is_current_school: Optional[bool] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    grade_levels_attended: List[str] = []
+    grading_scale: Optional[str] = None
+    max_grade_offered: Optional[str] = None
+    schedule_type: Optional[str] = None
+    courses_available_flags: Optional[dict] = None
+    courses_available_notes: Optional[str] = None
+    graduating_class_size: Optional[int] = None
+    boarding_students: Optional[int] = None
+    curriculum_notes: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class SchoolProfilesRequest(BaseModel):
+    items: List[SchoolProfileItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/school-profiles")
+async def get_school_profiles(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, school_name, school_ceeb_code, ceeb_code, "
+            "school_type, street_address, city_town, state_province, "
+            "zip_postal_code, country, counselor_name, counselor_position, "
+            "counselor_phone, counselor_email, counselor_fax, "
+            "is_current_school, start_date, end_date, grade_levels_attended, "
+            "grading_scale, max_grade_offered, schedule_type, "
+            "courses_available_flags, courses_available_notes, "
+            "graduating_class_size, boarding_students, curriculum_notes, notes "
+            "FROM student_school_enrollments "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY is_current_school DESC NULLS LAST, start_date DESC NULLS LAST",
+            student_id)
+    import json as _json
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("start_date", "end_date"):
+            d[k] = d[k].isoformat() if d[k] else None
+        d["grade_levels_attended"] = list(d["grade_levels_attended"] or [])
+        caf = d.get("courses_available_flags")
+        if isinstance(caf, str):
+            try: d["courses_available_flags"] = _json.loads(caf)
+            except Exception: d["courses_available_flags"] = {}
+        out.append(d)
+    return {"student_id": student_id, "schools": out}
+
+
+@router.post("/student/{student_id}/school-profiles")
+async def post_school_profiles(request: Request, student_id: str, body: SchoolProfilesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    import json as _json
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE student_school_enrollments SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                name = (it.school_name or "").strip()
+                if not name: continue
+                caf = _json.dumps(it.courses_available_flags) if it.courses_available_flags else None
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    if it.is_current_school:
+                        await conn.execute(
+                            "UPDATE student_school_enrollments SET is_current_school=false "
+                            "WHERE student_id=$1::uuid AND id != $2::uuid AND deleted_at IS NULL",
+                            student_id, it.id)
+                    r = await conn.execute(
+                        "UPDATE student_school_enrollments SET school_name=$3, "
+                        "school_ceeb_code=$4, ceeb_code=$5, school_type=$6, "
+                        "street_address=$7, city_town=$8, state_province=$9, "
+                        "zip_postal_code=$10, country=$11, counselor_name=$12, "
+                        "counselor_position=$13, counselor_phone=$14, counselor_email=$15, "
+                        "counselor_fax=$16, is_current_school=$17, "
+                        "start_date=$18::date, end_date=$19::date, grade_levels_attended=$20, "
+                        "grading_scale=$21, max_grade_offered=$22, schedule_type=$23, "
+                        "courses_available_flags=$24::jsonb, courses_available_notes=$25, "
+                        "graduating_class_size=$26, boarding_students=$27, "
+                        "curriculum_notes=$28, notes=$29, "
+                        "updated_at=now(), updated_by=$30::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, name, it.school_ceeb_code, it.ceeb_code,
+                        it.school_type, it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.country, it.counselor_name, it.counselor_position,
+                        it.counselor_phone, it.counselor_email, it.counselor_fax,
+                        it.is_current_school, it.start_date, it.end_date, it.grade_levels_attended,
+                        it.grading_scale, it.max_grade_offered, it.schedule_type,
+                        caf, it.courses_available_notes, it.graduating_class_size,
+                        it.boarding_students, it.curriculum_notes, it.notes, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    if it.is_current_school:
+                        await conn.execute(
+                            "UPDATE student_school_enrollments SET is_current_school=false "
+                            "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+                    await conn.execute(
+                        "INSERT INTO student_school_enrollments (tenant_id, student_id, "
+                        "school_name, school_ceeb_code, ceeb_code, school_type, "
+                        "street_address, city_town, state_province, zip_postal_code, "
+                        "country, counselor_name, counselor_position, counselor_phone, "
+                        "counselor_email, counselor_fax, is_current_school, "
+                        "start_date, end_date, grade_levels_attended, "
+                        "grading_scale, max_grade_offered, schedule_type, "
+                        "courses_available_flags, courses_available_notes, "
+                        "graduating_class_size, boarding_students, curriculum_notes, notes, "
+                        "visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,"
+                        "$15,$16,$17,$18::date,$19::date,$20,$21,$22,$23,$24::jsonb,$25,"
+                        "$26,$27,$28,$29,'private','parent_portal',$30::uuid,$30::uuid)",
+                        tenant_id, student_id, name, it.school_ceeb_code, it.ceeb_code,
+                        it.school_type, it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.country, it.counselor_name, it.counselor_position,
+                        it.counselor_phone, it.counselor_email, it.counselor_fax,
+                        it.is_current_school, it.start_date, it.end_date, it.grade_levels_attended,
+                        it.grading_scale, it.max_grade_offered, it.schedule_type,
+                        caf, it.courses_available_notes, it.graduating_class_size,
+                        it.boarding_students, it.curriculum_notes, it.notes, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ---- Report cards ----
+
+class ReportCardSubject(BaseModel):
+    subject: str
+    grade: Optional[str] = None
+    numeric_grade: Optional[float] = None
+    comment: Optional[str] = None
+
+
+class ReportCardItem(BaseModel):
+    id: Optional[str] = None
+    school_name: Optional[str] = None
+    school_year: str
+    grade_level: int
+    period_kind: str
+    period_label: Optional[str] = None
+    period_end_date: Optional[str] = None
+    gpa_unweighted: Optional[float] = None
+    gpa_weighted: Optional[float] = None
+    class_rank: Optional[int] = None
+    class_size: Optional[int] = None
+    days_present: Optional[int] = None
+    days_absent: Optional[int] = None
+    days_tardy: Optional[int] = None
+    subjects: List[ReportCardSubject] = []
+    teacher_comments: Optional[str] = None
+    evidence_urls: List[str] = []
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class ReportCardsRequest(BaseModel):
+    items: List[ReportCardItem] = []
+    delete_ids: List[str] = []
+
+
+_RC_PERIODS = {"quarter", "trimester", "semester", "year_end", "mid_year", "final",
+               "first_marking", "second_marking", "third_marking", "fourth_marking",
+               "progress", "other"}
+
+
+@router.get("/student/{student_id}/report-cards")
+async def get_report_cards(request: Request, student_id: str,
+                           grade_level: Optional[int] = None):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        if grade_level is not None:
+            rows = await conn.fetch(
+                "SELECT id::text AS id, school_name, school_year, grade_level, "
+                "period_kind, period_label, period_end_date, gpa_unweighted, "
+                "gpa_weighted, class_rank, class_size, days_present, days_absent, "
+                "days_tardy, subjects, teacher_comments, evidence_urls, notes, "
+                "public_description, (visibility='public') AS show_on_showcase "
+                "FROM report_cards WHERE student_id=$1::uuid AND deleted_at IS NULL "
+                "AND grade_level=$2 "
+                "ORDER BY period_end_date DESC NULLS LAST",
+                student_id, grade_level)
+        else:
+            rows = await conn.fetch(
+                "SELECT id::text AS id, school_name, school_year, grade_level, "
+                "period_kind, period_label, period_end_date, gpa_unweighted, "
+                "gpa_weighted, class_rank, class_size, days_present, days_absent, "
+                "days_tardy, subjects, teacher_comments, evidence_urls, notes, "
+                "public_description, (visibility='public') AS show_on_showcase "
+                "FROM report_cards WHERE student_id=$1::uuid AND deleted_at IS NULL "
+                "ORDER BY grade_level, period_end_date DESC NULLS LAST",
+                student_id)
+    import json as _json
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["period_end_date"] = d["period_end_date"].isoformat() if d["period_end_date"] else None
+        for k in ("gpa_unweighted", "gpa_weighted"):
+            d[k] = float(d[k]) if d[k] is not None else None
+        for k in ("subjects", "evidence_urls"):
+            v = d.get(k)
+            if isinstance(v, str):
+                try: d[k] = _json.loads(v)
+                except Exception: d[k] = []
+        out.append(d)
+    return {"student_id": student_id, "report_cards": out}
+
+
+@router.post("/student/{student_id}/report-cards")
+async def post_report_cards(request: Request, student_id: str, body: ReportCardsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    import json as _json
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE report_cards SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                if not it.school_year or it.grade_level is None: continue
+                if it.grade_level < 0 or it.grade_level > 12: continue
+                pk = it.period_kind if it.period_kind in _RC_PERIODS else "other"
+                subs = _json.dumps([s.model_dump() for s in it.subjects]) if it.subjects else "[]"
+                urls = _json.dumps(list(it.evidence_urls or []))
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE report_cards SET school_name=$3, school_year=$4, "
+                        "grade_level=$5, period_kind=$6, period_label=$7, "
+                        "period_end_date=$8::date, gpa_unweighted=$9, gpa_weighted=$10, "
+                        "class_rank=$11, class_size=$12, days_present=$13, days_absent=$14, "
+                        "days_tardy=$15, subjects=$16::jsonb, teacher_comments=$17, "
+                        "evidence_urls=$18::jsonb, notes=$19, public_description=$20, "
+                        "updated_at=now(), updated_by=$21::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.school_name, it.school_year, it.grade_level,
+                        pk, it.period_label, it.period_end_date, it.gpa_unweighted,
+                        it.gpa_weighted, it.class_rank, it.class_size, it.days_present,
+                        it.days_absent, it.days_tardy, subs, it.teacher_comments,
+                        urls, it.notes, it.public_description, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute(
+                                "UPDATE report_cards SET visibility='public' "
+                                "WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute(
+                                "UPDATE report_cards SET visibility='private' "
+                                "WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO report_cards (tenant_id, student_id, school_name, "
+                        "school_year, grade_level, period_kind, period_label, period_end_date, "
+                        "gpa_unweighted, gpa_weighted, class_rank, class_size, days_present, "
+                        "days_absent, days_tardy, subjects, teacher_comments, evidence_urls, "
+                        "notes, public_description, visibility, source_system, "
+                        "created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8::date,$9,$10,$11,$12,$13,"
+                        "$14,$15,$16::jsonb,$17,$18::jsonb,$19,$20,'private','parent_portal',"
+                        "$21::uuid,$21::uuid) RETURNING id",
+                        tenant_id, student_id, it.school_name, it.school_year, it.grade_level,
+                        pk, it.period_label, it.period_end_date, it.gpa_unweighted,
+                        it.gpa_weighted, it.class_rank, it.class_size, it.days_present,
+                        it.days_absent, it.days_tardy, subs, it.teacher_comments,
+                        urls, it.notes, it.public_description, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute(
+                            "UPDATE report_cards SET visibility='public' "
+                            "WHERE id=$1::uuid AND visibility_locked=false", rid)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
