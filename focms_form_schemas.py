@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.20 · fix: enum-safe event_type cast in inference engine (500 on auto-run).
+v0.12.21 · fix: tenant GUC now set via SET LOCAL inside one transaction per handler (_tenant_conn); cures intermittent empty RLS reads through PgBouncer.
+         v0.12.20 · fix: enum-safe event_type cast in inference engine (500 on auto-run).
          v0.12.19 · SPS fixes: skills bucket excluded when no student signal; inference engine auto-runs when empty (internal).
          v0.12.18 · Success Predictor Score: weighted A/E/S/M buckets per major with meta-alignment boost.
          v0.12.17 · meta-skills internal-only: parent-portal scope blocked from all meta endpoints; major-gap serves hard-skills-only basis to parent audiences.
@@ -45,6 +46,24 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger("focms-form-schemas")
 router = APIRouter(prefix="/focms/v1", tags=["form-schemas"])
+
+# v0.12.21: tenant-scoped connection. SELECT set_config(...,true) is
+# transaction-local; through PgBouncer transaction pooling each statement can
+# land on a different server connection, so the GUC silently evaporates and
+# RLS reads come back empty (playbook rule: f-string SET LOCAL inside one
+# explicit transaction). Every handler now does all DB work inside a single
+# transaction opened by this context manager.
+import uuid as _uuid
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _tenant_conn(pool, tenant_id: str):
+    _uuid.UUID(tenant_id)  # validate before literal interpolation
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            yield conn
+
 
 # ---------------------------------------------------------------------------
 # Auth dependency — reuse focms_api.authenticate (validates against
@@ -169,11 +188,7 @@ async def get_form_schemas(
     tenant_id = context["tenant_id"]
 
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "SELECT set_config('app.current_tenant_id', $1, true)",
-            str(tenant_id),
-        )
+    async with _tenant_conn(pool, str(tenant_id)) as conn:
 
         where = ["is_active = true", "shown_in_parent_form = true"]
         args: list[Any] = []
@@ -251,11 +266,7 @@ async def get_entries(
     tenant_id = context["tenant_id"]
 
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "SELECT set_config('app.current_tenant_id', $1, true)",
-            str(tenant_id),
-        )
+    async with _tenant_conn(pool, str(tenant_id)) as conn:
 
         # Fetch all catalog fields (optionally filtered by pillar)
         where = ["is_active = true", "shown_in_parent_form = true"]
@@ -552,11 +563,7 @@ async def post_entries(request: Request, body: EntriesRequest):
     saved_count = 0
 
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "SELECT set_config('app.current_tenant_id', $1, true)",
-            str(tenant_id),
-        )
+    async with _tenant_conn(pool, str(tenant_id)) as conn:
 
         async with conn.transaction():
             # ----- students (UPDATE only; row already exists) -----
@@ -783,7 +790,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.20)
+# Parent-portal capture endpoints (v0.12.21)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -920,8 +927,7 @@ class MilestonesRequest(BaseModel):
 async def get_student_milestones(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT milestone_code, custom_title, custom_category, happened, event_date, event_notes, "
             "artifact_url FROM student_life_milestones WHERE student_id=$1::uuid AND deleted_at IS NULL",
@@ -941,10 +947,9 @@ async def post_student_milestones(request: Request, student_id: str, body: Miles
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = cleared = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             # replace all parent-entered CUSTOM rows (no catalog code) up front
             await conn.execute(
                 "DELETE FROM student_life_milestones WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
@@ -1014,8 +1019,7 @@ class AcademicsRequest(BaseModel):
 async def get_student_academics(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         school = await conn.fetchrow(
             "SELECT school_name, school_ceeb_code, school_type, counselor_name, counselor_email, "
             "start_date, expected_graduation_date FROM student_school_enrollments "
@@ -1056,10 +1060,9 @@ async def post_student_academics(request: Request, student_id: str, body: Academ
     tenant_id, user_id = await _pp_context(request, student_id)
     written = []
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             sname = (body.school.school_name or "").strip()
             if sname:
                 await conn.execute(
@@ -1133,8 +1136,7 @@ class CoursesRequest(BaseModel):
 async def get_student_courses(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT course_name, school_name, subject, school_year, grade_level, term, grade_received, "
             "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
@@ -1164,10 +1166,9 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             default_school = await _pp_current_school_name(conn, student_id)
             await conn.execute("DELETE FROM courses_taken WHERE tenant_id=$1::uuid "
                                "AND student_id=$2::uuid AND source_system='parent_portal'",
@@ -1224,8 +1225,7 @@ class TestsRequest(BaseModel):
 async def get_student_tests(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT test_code, sitting_date, score_overall, percentile, notes, "
             "admission_traits_developed, evidence_artifact_ids FROM standardized_test_scores "
@@ -1245,10 +1245,9 @@ async def post_student_tests(request: Request, student_id: str, body: TestsReque
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             await conn.execute("DELETE FROM standardized_test_scores WHERE tenant_id=$1::uuid "
                                "AND student_id=$2::uuid AND source_system='parent_portal'",
                                tenant_id, student_id)
@@ -1360,8 +1359,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
 async def get_student_family(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             """
             SELECT relationship, is_legal_guardian, prefix,
@@ -1414,10 +1412,9 @@ async def post_student_family(request: Request, student_id: str, body: FamilyReq
         raise HTTPException(status_code=503, detail="pii_encryption_unavailable")
     written = []
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             await conn.execute(
                 "DELETE FROM family_members WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
                 "AND source_system='parent_portal' AND relationship IN ('father','mother')",
@@ -1451,8 +1448,7 @@ class ReligionRequest(BaseModel):
 async def get_student_religion(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         row = await conn.fetchrow(
             "SELECT details->'religion' AS religion FROM student_personal_details "
             "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
@@ -1478,10 +1474,9 @@ async def post_student_religion(request: Request, student_id: str, body: Religio
     }
     rel_json = json.dumps(rel)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
@@ -1535,8 +1530,7 @@ class PersonalDetailsRequest(BaseModel):
 async def get_student_personal_details(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         row = await conn.fetchrow(
             "SELECT chosen_name, pronouns, gender_identity, legal_sex_at_birth, email_primary, "
             "phone_primary, citizenship_status, place_of_birth_country, is_hispanic_or_latino, "
@@ -1579,10 +1573,9 @@ async def post_student_personal_details(request: Request, student_id: str, body:
         return [s.strip() for s in (x or []) if str(s).strip()]
 
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
@@ -1687,8 +1680,7 @@ class SkillsRequest(BaseModel):
 async def get_student_skills(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         age = await _pp_student_age(conn, student_id)
         rows = await conn.fetch(
             "SELECT skill_code, custom_title, custom_domain, acquired, acquired_date, proficiency, "
@@ -1711,14 +1703,13 @@ async def post_student_skills(request: Request, student_id: str, body: SkillsReq
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = overrides = cleared = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         age = await _pp_student_age(conn, student_id)
         age_max_by_code = {
             r["code"]: (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None)
             for r in await conn.fetch("SELECT code, typical_age_max FROM skills_catalog WHERE is_active")}
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             await conn.execute(
                 "DELETE FROM student_skills WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
                 "AND source_system='parent_portal' AND skill_code IS NULL", tenant_id, student_id)
@@ -1799,8 +1790,7 @@ class IdentityDocsRequest(BaseModel):
 async def get_identity_documents(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT doc_type, artifact_id, status, verified_at, notes "
             "FROM student_identity_documents WHERE student_id=$1::uuid AND deleted_at IS NULL "
@@ -1830,10 +1820,9 @@ async def post_identity_documents(request: Request, student_id: str, body: Ident
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for it in body.items:
                 dt = (it.doc_type or "").strip().lower()
                 if dt not in _DOC_TYPES or not (it.artifact_id or "").strip():
@@ -1915,8 +1904,7 @@ class MetaSkillsRequest(BaseModel):
 async def get_student_meta_skills(request: Request, student_id: str):
     tenant_id, _ = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT meta_skill_code, current_level, target_level, notes, updated_at "
             "FROM student_meta_skills WHERE student_id=$1::uuid AND deleted_at IS NULL",
@@ -1945,12 +1933,11 @@ async def post_student_meta_skills(request: Request, student_id: str, body: Meta
     tenant_id, user_id = await _pp_internal_context(request, student_id)
     saved = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         valid = {r["code"] for r in await conn.fetch(
             "SELECT code FROM meta_skills_catalog WHERE is_active")}
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for it in body.items:
                 code = (it.meta_skill_code or "").strip()
                 if code not in valid:
@@ -1990,8 +1977,7 @@ class PracticeRequest(BaseModel):
 async def get_meta_skill_practice(request: Request, student_id: str, meta_skill_code: Optional[str] = None):
     tenant_id, _ = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         if meta_skill_code:
             rows = await conn.fetch(
                 "SELECT meta_skill_code, practice_date, duration_minutes, practice_type, "
@@ -2018,12 +2004,11 @@ async def post_meta_skill_practice(request: Request, student_id: str, body: Prac
     tenant_id, user_id = await _pp_internal_context(request, student_id)
     logged = 0
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         valid = {r["code"] for r in await conn.fetch(
             "SELECT code FROM meta_skills_catalog WHERE is_active")}
         async with conn.transaction():
-            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for it in body.items:
                 code = (it.meta_skill_code or "").strip()
                 pdate = _pp_parse_date(it.practice_date)
@@ -2101,8 +2086,7 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str, audien
     parent_view = (ctx.get("scope") == "parent_portal") or ((audience or "").strip().lower() == "parent")
     cip = (cip_code or "").strip()
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
 
         major = await conn.fetchrow(
             "SELECT cip_code, title, cip_family FROM cip_majors WHERE cip_code=$1 AND is_active", cip)
@@ -2461,7 +2445,7 @@ async def _write_inferences(conn, tenant_id: str, student_id: str, user_id):
     valid = {r["code"] for r in await conn.fetch("SELECT code FROM meta_skills_catalog WHERE is_active")}
     findings = await _run_meta_inference(conn, tenant_id, student_id)
     async with conn.transaction():
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
         await conn.execute(
             "DELETE FROM meta_skill_inferences WHERE tenant_id=$1::uuid AND student_id=$2::uuid",
             tenant_id, student_id)
@@ -2495,8 +2479,7 @@ async def run_meta_skill_inference(request: Request, student_id: str):
     replace the stored capability read."""
     tenant_id, user_id = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         written = await _write_inferences(conn, tenant_id, student_id, user_id)
     return {"student_id": student_id, "inferred": written}
 
@@ -2507,8 +2490,7 @@ async def get_inferred_meta_skills(request: Request, student_id: str):
     evidence. Skills without findings are listed as 'awaiting evidence'."""
     tenant_id, _ = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         cat = await conn.fetch(
             "SELECT code, title, framework, sort_order FROM meta_skills_catalog "
             "WHERE is_active ORDER BY sort_order")
@@ -2608,8 +2590,7 @@ async def get_major_sps(request: Request, student_id: str, cip_code: str, audien
     parent_view = (ctx.get("scope") == "parent_portal") or ((audience or "").strip().lower() == "parent")
     cip = (cip_code or "").strip()
     pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
         major = await conn.fetchrow(
             "SELECT cip_code, title, weight_academics, weight_engagement, weight_skills, weight_milestones "
             "FROM cip_majors WHERE cip_code=$1 AND is_active", cip)
