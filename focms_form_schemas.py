@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.28 · Academics grade-band scoping: summary + courses GET/POST filtered by band (preschool/elementary/middle/high).
+v0.12.28a · Academics band summary: coerce text grade values (PK, K, "9") to int before comparison.
+         v0.12.28 · Academics grade-band scoping: summary + courses GET/POST filtered by band (preschool/elementary/middle/high).
          v0.12.27a · fix: details column arrives as str via asyncpg; json-decode before .get.
          v0.12.27 · Higher Education: applications GET/POST + CIP majors catalog.
          v0.12.26 · Higher Education: universities catalog + target-schools GET/POST.
@@ -3475,13 +3476,25 @@ async def get_academics_summary(request: Request, student_id: str):
             "WHERE student_id=$1::uuid AND deleted_at IS NULL "
             "GROUP BY grade_at_test", student_id)
     bands = {b: {"courses": 0, "assessments": 0} for b in BAND_RANGES}
+    def _coerce(v):
+        if v is None: return None
+        if isinstance(v, int): return v
+        s = str(v).strip().lower()
+        if not s: return None
+        if s in ("pk","prek","pre-k","preschool","p"): return 0
+        if s in ("k","kg","kindergarten"): return 0
+        try: return int(s)
+        except Exception:
+            import re as _re
+            m = _re.search(r"\d+", s)
+            return int(m.group(0)) if m else None
     for r in crows:
-        g = r["grade_level"]
+        g = _coerce(r["grade_level"])
         if g is None: continue
         for b, (lo, hi) in BAND_RANGES.items():
             if lo <= g <= hi: bands[b]["courses"] += r["n"]; break
     for r in arows:
-        g = r["grade_at_test"]
+        g = _coerce(r["grade_at_test"])
         if g is None: continue
         for b, (lo, hi) in BAND_RANGES.items():
             if lo <= g <= hi: bands[b]["assessments"] += r["n"]; break
