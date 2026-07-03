@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.16 · evidence-based meta-skill inference engine (200-skill taxonomy).
+v0.12.17 · meta-skills internal-only: parent-portal scope blocked from all meta endpoints; major-gap serves hard-skills-only basis to parent audiences.
+         v0.12.16 · evidence-based meta-skill inference engine (200-skill taxonomy).
          v0.12.15 · meta-skills tracking + major-gap report engine.
          v0.12.2 · Session 1 of the schema-driven parent portal build.
          v0.12.1 fixes veteran_military_status placeholder alignment.
@@ -779,7 +780,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.16)
+# Parent-portal capture endpoints (v0.12.17)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -871,6 +872,17 @@ async def _pp_context(request: Request, student_id: str):
     ctx = await _resolve_context(request)
     if ctx.get("scope") == "parent_portal" and student_id not in (ctx.get("student_ids") or []):
         raise HTTPException(status_code=403, detail="student_not_authorized")
+    uid = ctx.get("user_id")
+    return str(ctx["tenant_id"]), (str(uid) if uid else None)
+
+
+async def _pp_internal_context(request: Request, student_id: str):
+    """Like _pp_context but rejects parent-portal tokens outright.
+    Meta-skills are INTERNAL engine signal - parents never see or set them
+    (decision of record 2026-07-02)."""
+    ctx = await _resolve_context(request)
+    if ctx.get("scope") == "parent_portal":
+        raise HTTPException(status_code=403, detail="internal_only")
     uid = ctx.get("user_id")
     return str(ctx["tenant_id"]), (str(uid) if uid else None)
 
@@ -1869,7 +1881,9 @@ def _clamp_level(v):
 
 @router.get("/meta-skills-catalog")
 async def get_meta_skills_catalog(request: Request):
-    await _resolve_context(request)
+    ctx = await _resolve_context(request)
+    if ctx.get("scope") == "parent_portal":
+        raise HTTPException(status_code=403, detail="internal_only")
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -1896,7 +1910,7 @@ class MetaSkillsRequest(BaseModel):
 
 @router.get("/student/{student_id}/meta-skills")
 async def get_student_meta_skills(request: Request, student_id: str):
-    tenant_id, _ = await _pp_context(request, student_id)
+    tenant_id, _ = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
@@ -1925,7 +1939,7 @@ async def get_student_meta_skills(request: Request, student_id: str):
 
 @router.post("/student/{student_id}/meta-skills")
 async def post_student_meta_skills(request: Request, student_id: str, body: MetaSkillsRequest):
-    tenant_id, user_id = await _pp_context(request, student_id)
+    tenant_id, user_id = await _pp_internal_context(request, student_id)
     saved = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -1971,7 +1985,7 @@ class PracticeRequest(BaseModel):
 
 @router.get("/student/{student_id}/meta-skills/practice")
 async def get_meta_skill_practice(request: Request, student_id: str, meta_skill_code: Optional[str] = None):
-    tenant_id, _ = await _pp_context(request, student_id)
+    tenant_id, _ = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
@@ -1998,7 +2012,7 @@ async def get_meta_skill_practice(request: Request, student_id: str, meta_skill_
 async def post_meta_skill_practice(request: Request, student_id: str, body: PracticeRequest):
     """Append-only practice log. Each item is a dated session; optionally
     updates the meta-skill's current_level when level_after is supplied."""
-    tenant_id, user_id = await _pp_context(request, student_id)
+    tenant_id, user_id = await _pp_internal_context(request, student_id)
     logged = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -2069,11 +2083,19 @@ _IMP_WEIGHT = {1: 1.0, 2: 2.0, 3: 3.0, 4: 4.0, 5: 5.0}
 
 
 @router.get("/student/{student_id}/major-gap")
-async def get_major_gap(request: Request, student_id: str, cip_code: str):
+async def get_major_gap(request: Request, student_id: str, cip_code: str, audience: str = None):
     """Differential of a student's capability inventory against a major's
     required skill cluster. Returns per-skill status, weighted coverage,
-    strengths, and gaps ranked by importance."""
-    tenant_id, _ = await _pp_context(request, student_id)
+    strengths, and gaps ranked by importance.
+
+    v0.12.17: meta-skills are INTERNAL-ONLY. Parent-portal tokens (and any
+    caller passing audience=parent) get a hard-skills-only report - meta
+    requirements are excluded from items, coverage, and next actions."""
+    ctx = await _resolve_context(request)
+    if ctx.get("scope") == "parent_portal" and student_id not in (ctx.get("student_ids") or []):
+        raise HTTPException(status_code=403, detail="student_not_authorized")
+    tenant_id = str(ctx["tenant_id"])
+    parent_view = (ctx.get("scope") == "parent_portal") or ((audience or "").strip().lower() == "parent")
     cip = (cip_code or "").strip()
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -2087,6 +2109,8 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
         reqs = await conn.fetch(
             "SELECT skill_code, meta_skill_code, importance, rationale "
             "FROM major_skill_requirements WHERE cip_code=$1 AND is_active", cip)
+        if parent_view:
+            reqs = [r for r in reqs if r["skill_code"] is not None]
         if not reqs:
             raise HTTPException(status_code=404, detail="no_requirements_for_major")
 
@@ -2193,6 +2217,7 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
     return {
         "student_id": student_id,
         "student_age": age,
+        "basis": ("hard_skills_only" if parent_view else "full"),
         "major": {"cip_code": major["cip_code"], "title": major["title"],
                   "cip_family": major["cip_family"]},
         "coverage_pct": coverage,
@@ -2430,7 +2455,7 @@ async def _run_meta_inference(conn, tenant_id: str, student_id: str):
 async def run_meta_skill_inference(request: Request, student_id: str):
     """Run the inference engine over the student's activity record and
     replace the stored capability read."""
-    tenant_id, user_id = await _pp_context(request, student_id)
+    tenant_id, user_id = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
@@ -2459,7 +2484,7 @@ async def run_meta_skill_inference(request: Request, student_id: str):
 async def get_inferred_meta_skills(request: Request, student_id: str):
     """The capability read: inferred meta-skills grouped by category, with
     evidence. Skills without findings are listed as 'awaiting evidence'."""
-    tenant_id, _ = await _pp_context(request, student_id)
+    tenant_id, _ = await _pp_internal_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
