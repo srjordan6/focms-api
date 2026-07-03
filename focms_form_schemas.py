@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
+v0.12.37 · UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
+         v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
          v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
          v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
          v0.12.33a · school-search K-12 queries k12_schools (per-school CCD, pg_trgm); state optional, no live DOE call.
@@ -4355,3 +4356,74 @@ async def get_languages_catalog(request: Request, target: str = "en"):
     _LANG_CACHE["data"] = langs
     _LANG_CACHE["ts"] = now
     return {"languages": langs, "cached": False}
+
+
+# ======================================================================
+# v0.12.37 - Runtime UI-string translation (Google Translate, DB-cached)
+# ======================================================================
+
+
+class UiStringsBody(BaseModel):
+    locale: str
+    strings: List[str] = []
+
+
+@router.post("/catalogs/ui-strings")
+async def translate_ui_strings(request: Request, body: UiStringsBody):
+    """Translate a batch of English UI strings into the requested locale.
+    Cached per-locale in ui_string_translations (jsonb map en->translated).
+    Only missing keys are sent to Google; the merged map is returned."""
+    _ = await _resolve_context(request)
+    import json as _json
+    locale = (body.locale or "en-US").strip()
+    lang = locale.split("-")[0].lower()
+    if lang == "en" or not body.strings:
+        return {"locale": locale, "strings": {}}
+
+    pool: asyncpg.Pool = request.app.state.pool
+    cached: dict = {}
+    async with pool.acquire() as conn:
+        row = await conn.fetchval(
+            "SELECT strings FROM ui_string_translations WHERE locale=$1", locale)
+        if row:
+            cached = row if isinstance(row, dict) else _json.loads(row)
+
+    missing = [s for s in body.strings if s and s not in cached]
+    if not missing:
+        return {"locale": locale, "strings": {k: cached[k] for k in body.strings if k in cached}}
+
+    key = _pp_os.environ.get("GOOGLE_TRANSLATE_API_KEY") or _pp_os.environ.get("GOOGLE_PLACES_API_KEY")
+    if not key:
+        return {"locale": locale, "strings": cached, "error": "no_api_key"}
+
+    import urllib.request as _u, urllib.parse as _up
+    newly: dict = {}
+    # Google Translate v2 accepts multiple q params per call; batch in chunks.
+    CHUNK = 100
+    try:
+        for i in range(0, len(missing), CHUNK):
+            batch = missing[i:i + CHUNK]
+            params = [("key", key), ("target", lang), ("source", "en"), ("format", "text")]
+            params += [("q", b) for b in batch]
+            url = "https://translation.googleapis.com/language/translate/v2?" + _up.urlencode(params)
+            req = _u.Request(url, headers={"Accept": "application/json"})
+            with _u.urlopen(req, timeout=30) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            trans = data.get("data", {}).get("translations", [])
+            for src, tr in zip(batch, trans):
+                newly[src] = tr.get("translatedText", src)
+    except Exception as e:
+        # Return whatever we have cached; client falls back to English for the rest.
+        return {"locale": locale, "strings": cached, "error": "translate_failed"}
+
+    merged = dict(cached)
+    merged.update(newly)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO ui_string_translations (locale, strings, updated_at) "
+                "VALUES ($1,$2::jsonb, now()) "
+                "ON CONFLICT (locale) DO UPDATE SET strings=$2::jsonb, updated_at=now()",
+                locale, _json.dumps(merged))
+
+    return {"locale": locale, "strings": {k: merged[k] for k in body.strings if k in merged}}
