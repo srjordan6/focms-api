@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.15 · meta-skills tracking + major-gap report engine.
+v0.12.16 · evidence-based meta-skill inference engine (200-skill taxonomy).
+         v0.12.15 · meta-skills tracking + major-gap report engine.
          v0.12.2 · Session 1 of the schema-driven parent portal build.
          v0.12.1 fixes veteran_military_status placeholder alignment.
          v0.12.2 adds GET /entries/{student_id} for form pre-population.
@@ -778,7 +779,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.15)
+# Parent-portal capture endpoints (v0.12.16)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2101,9 +2102,9 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
         titles = {r["code"]: r["title"]
                   for r in await conn.fetch("SELECT code, title FROM skills_catalog WHERE is_active")}
 
-        # student's meta-skill levels
+        # student's inferred meta-skill read (evidence-based; parents do not self-rate)
         mrows = await conn.fetch(
-            "SELECT meta_skill_code, current_level, target_level FROM student_meta_skills "
+            "SELECT meta_skill_code, score, confidence FROM meta_skill_inferences "
             "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
         mlevel = {r["meta_skill_code"]: r for r in mrows}
         mtitles = {r["code"]: (r["title"], r["framework"])
@@ -2122,18 +2123,18 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
         return "gap", "not yet acquired"
 
     def meta_status(code, imp):
+        """Evidence-based: reads the inference engine's output (1-5 + confidence).
+        No inference row means not enough life evidence yet - never a deficiency."""
         row = mlevel.get(code)
-        target = _META_TARGET_DEFAULT
-        if row and row["target_level"] is not None:
-            target = row["target_level"]
-        cur = row["current_level"] if row and row["current_level"] is not None else None
-        if cur is None:
-            return "gap", None, target, "no level recorded"
-        if cur >= target:
-            return "have", cur, target, "at or above target"
-        if cur >= max(0, target - 20):
-            return "developing", cur, target, "approaching target"
-        return "gap", cur, target, "below target"
+        if row is None:
+            return "gap", None, None, "no evidence captured yet"
+        score = row["score"]
+        conf = row["confidence"]
+        if score >= 4:
+            return "have", score, conf, "evidenced (" + str(conf) + " confidence)"
+        if score == 3:
+            return "developing", score, conf, "emerging in the activity record"
+        return "gap", score, conf, "early evidence only"
 
     have_w = total_w = 0.0
     strengths, gaps, developing = [], [], []
@@ -2156,11 +2157,11 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
             else:
                 gaps.append(item)
         else:
-            status, cur, tgt, detail = meta_status(r["meta_skill_code"], imp)
+            status, score, conf, detail = meta_status(r["meta_skill_code"], imp)
             t, fw = mtitles.get(r["meta_skill_code"], (r["meta_skill_code"], None))
             item = {"kind": "meta_skill", "code": r["meta_skill_code"], "title": t,
                     "framework": fw, "importance": imp, "status": status,
-                    "current_level": cur, "target_level": tgt, "detail": detail,
+                    "score": score, "confidence": conf, "detail": detail,
                     "rationale": r["rationale"]}
             meta_items.append(item)
             if status == "have":
@@ -2176,13 +2177,16 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
     gaps.sort(key=lambda x: -x["importance"])
     strengths.sort(key=lambda x: -x["importance"])
 
-    # top next actions: the highest-importance gaps
+    # top next actions: the highest-importance gaps, framed as evidence to build
     next_actions = []
     for g in gaps[:5]:
         if g["kind"] == "meta_skill":
-            next_actions.append(
-                f"Build {g['title']} (currently {g.get('current_level') if g.get('current_level') is not None else 'unrated'}, "
-                f"target {g.get('target_level')}). {g['rationale']}")
+            if g.get("score") is not None:
+                next_actions.append(
+                    f"Grow the evidence for {g['title']} (early signals at {g['score']}/5). {g['rationale']}")
+            else:
+                next_actions.append(
+                    f"Create opportunities that demonstrate {g['title']} - no life evidence captured yet. {g['rationale']}")
         else:
             next_actions.append(f"Develop: {g['title']} ({g['rationale']})")
 
@@ -2211,3 +2215,275 @@ async def get_major_gap(request: Request, student_id: str, cip_code: str):
                     "federal CIP taxonomy. Skill presumption uses catalog typical-age bands.",
         },
     }
+
+
+# ======================================================================
+# v0.12.16 - Meta-skill INFERENCE ENGINE (evidence-based, not self-rated)
+# ----------------------------------------------------------------------
+# Principle: do not ask the family to name the child's meta-skills.
+# Examine the life they have built - the activity record - and infer.
+# Deterministic rules read events, personal_records, and logs; each
+# finding carries a strength score (1-5), a confidence (low/medium/high),
+# and cited evidence. Patterns across time, never single events.
+# Positive evidence only: absence of a finding means "not enough
+# evidence yet", never a deficiency.
+#
+# Parent slider endpoints from v0.12.15 remain for API compatibility but
+# are DEPRECATED - nothing reads student_meta_skills any more. The
+# major-gap report and the Capability Read both consume
+# meta_skill_inferences written by this engine.
+# ======================================================================
+
+_CONF_RANK = {"low": 1, "medium": 2, "high": 3}
+
+
+def _infer_add(findings, code, score, confidence, rule, evidence_line):
+    """Merge a finding: keep the max score, max confidence, union evidence."""
+    f = findings.get(code)
+    if f is None:
+        findings[code] = {"score": score, "confidence": confidence,
+                          "rules": [rule], "evidence": [evidence_line]}
+        return
+    if score > f["score"]:
+        f["score"] = score
+    if _CONF_RANK.get(confidence, 0) > _CONF_RANK.get(f["confidence"], 0):
+        f["confidence"] = confidence
+    if rule not in f["rules"]:
+        f["rules"].append(rule)
+    if evidence_line not in f["evidence"]:
+        f["evidence"].append(evidence_line)
+
+
+async def _run_meta_inference(conn, tenant_id: str, student_id: str):
+    """Compute the evidence-based meta-skill read from the activity record."""
+    findings = {}
+
+    # ---------- Signal A: activity events grouped by type ----------
+    ev = await conn.fetch(
+        "SELECT event_type, count(*) AS n, min(event_date) AS first, max(event_date) AS last, "
+        "count(DISTINCT date_part('year', event_date)) AS years, "
+        "array_agg(DISTINCT source_system) AS sources "
+        "FROM events WHERE student_id=$1::uuid AND deleted_at IS NULL AND event_date IS NOT NULL "
+        "GROUP BY event_type", student_id)
+    by_type = {r["event_type"]: r for r in ev}
+
+    def span_months(r):
+        if not r or not r["first"] or not r["last"]:
+            return 0
+        return round((r["last"] - r["first"]).days / 30.44, 1)
+
+    # competition-style activities (extendable as new activity types arrive)
+    COMPETITION_TYPES = {"swim_race", "meet", "match", "tournament", "competition", "race"}
+    PERFORMANCE_TYPES = {"music_performance", "recital", "concert", "theater_performance"}
+
+    # ---------- Rule R1: sustained practice in one activity ----------
+    for etype, r in by_type.items():
+        n, months, years = r["n"], span_months(r), int(r["years"])
+        src = ", ".join(s for s in (r["sources"] or []) if s)
+        label = etype.replace("_", " ")
+        if n >= 100 and months >= 24:
+            ev_line = f"{n} logged {label} events over {months} months across {years} calendar years (sources: {src})"
+            for code, sc in [("wd_consistency", 5), ("wd_discipline", 5), ("wd_sustained_effort", 5),
+                             ("la_practice_discipline", 5), ("wd_habit_formation", 4),
+                             ("es_persistence", 5), ("es_grit", 4)]:
+                _infer_add(findings, code, sc, "high", "sustained_practice", ev_line)
+            _infer_add(findings, "sm_long_term_growth_orientation", 4, "medium", "sustained_practice", ev_line)
+        elif n >= 30 and months >= 12:
+            ev_line = f"{n} logged {label} events over {months} months (sources: {src})"
+            for code, sc in [("wd_consistency", 4), ("wd_discipline", 4), ("wd_sustained_effort", 4),
+                             ("la_practice_discipline", 4), ("es_persistence", 4)]:
+                _infer_add(findings, code, sc, "medium", "sustained_practice", ev_line)
+        elif n >= 10 and months >= 6:
+            ev_line = f"{n} logged {label} events over {months} months (sources: {src})"
+            for code, sc in [("wd_consistency", 3), ("la_practice_discipline", 3)]:
+                _infer_add(findings, code, sc, "medium", "sustained_practice", ev_line)
+
+    # ---------- Rule R3: repeated voluntary competition ----------
+    comp_n = sum(r["n"] for t, r in by_type.items() if t in COMPETITION_TYPES)
+    comp_years = max((int(r["years"]) for t, r in by_type.items() if t in COMPETITION_TYPES), default=0)
+    if comp_n >= 50 and comp_years >= 3:
+        ev_line = (f"{comp_n} timed, officiated competition entries across {comp_years} calendar years - "
+                   "repeatedly returning to judged competition and continuing to improve")
+        for code, sc in [("es_calmness_under_pressure", 4), ("es_stress_tolerance", 4),
+                         ("es_mental_toughness", 4), ("es_confidence", 3)]:
+            _infer_add(findings, code, sc, "medium", "competition_exposure", ev_line)
+        _infer_add(findings, "tj_judgment_under_pressure", 3, "medium", "competition_exposure", ev_line)
+    elif comp_n >= 15:
+        ev_line = f"{comp_n} competition entries logged"
+        for code, sc in [("es_stress_tolerance", 3), ("es_confidence", 3)]:
+            _infer_add(findings, code, sc, "medium", "competition_exposure", ev_line)
+
+    # ---------- Signals from event titles/details (competition detail) ----------
+    trows = await conn.fetch(
+        "SELECT title, details->>'meet' AS meet FROM events "
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL AND event_type = ANY($2::text[])",
+        student_id, list(COMPETITION_TYPES))
+    import re as _re
+    disciplines = set()
+    relay_n = 0
+    champ_n = 0
+    for t in trows:
+        title = t["title"] or ""
+        m = _re.match(r"^(\d+\s+[A-Za-z]+(?:\s+[A-Za-z]+)?)\s", title)
+        if m:
+            disciplines.add(m.group(1).lower())
+        if "relay" in title.lower():
+            relay_n += 1
+        meet = (t["meet"] or "").lower()
+        if "championship" in meet or "champs" in meet or "sectional" in meet or "state" in meet:
+            champ_n += 1
+
+    # ---------- Rule R4: high-stakes scheduled events ----------
+    if champ_n >= 5:
+        ev_line = f"{champ_n} races swum at championship-level meets - qualifying for and performing on the scheduled day"
+        for code, sc in [("es_composure", 3), ("wd_preparation", 3)]:
+            _infer_add(findings, code, sc, "medium", "high_stakes_events", ev_line)
+        _infer_add(findings, "wd_reliability_under_deadlines", 3, "low", "high_stakes_events", ev_line)
+
+    # ---------- Rule R5: team events ----------
+    if relay_n >= 3:
+        ev_line = f"{relay_n} relay entries - performing as one leg of a team where others depend on the result"
+        for code, sc in [("rs_collaboration", 3), ("rs_reliability", 3)]:
+            _infer_add(findings, code, sc, "medium", "team_events", ev_line)
+        _infer_add(findings, "li_team_alignment", 2, "low", "team_events", ev_line)
+
+    # ---------- Rule R6: versatility across disciplines ----------
+    if len(disciplines) >= 8:
+        ev_line = f"{len(disciplines)} distinct race disciplines (stroke/distance combinations) competed in"
+        _infer_add(findings, "la_adaptability", 3, "medium", "versatility", ev_line)
+        _infer_add(findings, "tj_mental_flexibility", 3, "low", "versatility", ev_line)
+        _infer_add(findings, "la_skill_transfer", 3, "low", "versatility", ev_line)
+
+    # ---------- Rule R2: measured improvement over time ----------
+    pr = await conn.fetchrow(
+        "SELECT count(*) AS bests, "
+        "count(*) FILTER (WHERE total_drop_numeric IS NOT NULL AND total_drop_numeric > 0) AS drops, "
+        "min(achieved_date) AS first, max(achieved_date) AS last "
+        "FROM personal_records WHERE student_id=$1::uuid AND deleted_at IS NULL "
+        "AND record_kind='swim_best'", student_id)
+    if pr and pr["bests"]:
+        drops = int(pr["drops"] or 0)
+        pmonths = 0
+        if pr["first"] and pr["last"]:
+            pmonths = round((pr["last"] - pr["first"]).days / 30.44, 1)
+        if drops >= 15 and pmonths >= 18:
+            ev_line = (f"{drops} measured personal-best improvements over {pmonths} months "
+                       f"({int(pr['bests'])} tracked bests) - objective, repeated time drops under coaching")
+            for code, sc, cf in [("la_iterative_improvement", 5, "high"), ("la_coachability", 4, "high"),
+                                 ("la_feedback_application", 4, "medium"), ("sm_self_correction", 4, "medium"),
+                                 ("la_growth_mindset", 4, "medium"), ("la_learning_agility", 3, "medium")]:
+                _infer_add(findings, code, sc, cf, "measured_improvement", ev_line)
+        elif drops >= 5:
+            ev_line = f"{drops} measured personal-best improvements ({int(pr['bests'])} tracked bests)"
+            for code, sc in [("la_iterative_improvement", 4), ("la_coachability", 3), ("sm_self_correction", 3)]:
+                _infer_add(findings, code, sc, "medium", "measured_improvement", ev_line)
+
+    # ---------- Rule R8: public performance ----------
+    perf_n = sum(r["n"] for t, r in by_type.items() if t in PERFORMANCE_TYPES)
+    if perf_n >= 3:
+        ev_line = f"{perf_n} public performances logged"
+        for code, sc in [("cm_public_speaking_presence", 3), ("rs_social_confidence", 3), ("es_courage", 3)]:
+            _infer_add(findings, code, sc, "medium", "public_performance", ev_line)
+    elif perf_n >= 1:
+        ev_line = f"{perf_n} public performance logged - early evidence"
+        for code, sc in [("cm_public_speaking_presence", 2), ("rs_social_confidence", 2), ("es_courage", 2)]:
+            _infer_add(findings, code, sc, "low", "public_performance", ev_line)
+
+    # ---------- Rule R9: reflection practice ----------
+    dl = await conn.fetchrow(
+        "SELECT count(*) AS n FROM personal_records WHERE student_id=$1::uuid "
+        "AND deleted_at IS NULL AND record_kind='daily_log'", student_id)
+    if dl and int(dl["n"]) >= 10:
+        ev_line = f"{int(dl['n'])} daily log entries - a maintained reflection habit"
+        _infer_add(findings, "sm_self_reflection", 3, "medium", "reflection_practice", ev_line)
+        _infer_add(findings, "sm_attention_to_personal_habits", 3, "low", "reflection_practice", ev_line)
+        _infer_add(findings, "sm_self_awareness", 2, "low", "reflection_practice", ev_line)
+
+    # ---------- Rule R7: cross-domain engagement ----------
+    domains = set()
+    for t in by_type:
+        if t in COMPETITION_TYPES:
+            domains.add("athletics")
+        elif t in PERFORMANCE_TYPES:
+            domains.add("performing arts")
+        elif t == "summer_experience":
+            domains.add("exploration")
+        else:
+            domains.add(t)
+    mr = await conn.fetchrow(
+        "SELECT count(*) AS n FROM personal_records WHERE student_id=$1::uuid "
+        "AND deleted_at IS NULL AND record_kind='music_repertoire'", student_id)
+    if mr and int(mr["n"]) >= 1:
+        domains.add("performing arts")
+    if dl and int(dl["n"]) >= 10:
+        domains.add("reflection")
+    if len(domains) >= 3:
+        ev_line = "active across " + str(len(domains)) + " distinct life domains: " + ", ".join(sorted(domains))
+        _infer_add(findings, "la_curiosity", 3, "medium", "cross_domain", ev_line)
+        _infer_add(findings, "ci_curiosity_driven_exploration", 3, "low", "cross_domain", ev_line)
+        _infer_add(findings, "sm_life_balance", 3, "low", "cross_domain", ev_line)
+
+    return findings
+
+
+@router.post("/student/{student_id}/meta-skills/infer")
+async def run_meta_skill_inference(request: Request, student_id: str):
+    """Run the inference engine over the student's activity record and
+    replace the stored capability read."""
+    tenant_id, user_id = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        valid = {r["code"] for r in await conn.fetch("SELECT code FROM meta_skills_catalog WHERE is_active")}
+        findings = await _run_meta_inference(conn, tenant_id, student_id)
+        async with conn.transaction():
+            await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+            await conn.execute(
+                "DELETE FROM meta_skill_inferences WHERE tenant_id=$1::uuid AND student_id=$2::uuid",
+                tenant_id, student_id)
+            written = 0
+            for code, f in findings.items():
+                if code not in valid:
+                    continue
+                await conn.execute(
+                    "INSERT INTO meta_skill_inferences (tenant_id, student_id, meta_skill_code, "
+                    "score, confidence, evidence, rule_code, engine_version, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6::jsonb,$7,'v1',$8::uuid,$8::uuid)",
+                    tenant_id, student_id, code, int(f["score"]), f["confidence"],
+                    json.dumps(f["evidence"]), ",".join(f["rules"]), user_id)
+                written += 1
+    return {"student_id": student_id, "inferred": written}
+
+
+@router.get("/student/{student_id}/meta-skills/inferred")
+async def get_inferred_meta_skills(request: Request, student_id: str):
+    """The capability read: inferred meta-skills grouped by category, with
+    evidence. Skills without findings are listed as 'awaiting evidence'."""
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('app.current_tenant_id', $1, true)", tenant_id)
+        cat = await conn.fetch(
+            "SELECT code, title, framework, sort_order FROM meta_skills_catalog "
+            "WHERE is_active ORDER BY sort_order")
+        inf = await conn.fetch(
+            "SELECT meta_skill_code, score, confidence, evidence, rule_code, computed_at "
+            "FROM meta_skill_inferences WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+    imap = {r["meta_skill_code"]: r for r in inf}
+    out = []
+    computed_at = None
+    for c in cat:
+        r = imap.get(c["code"])
+        if r and (computed_at is None or r["computed_at"] > computed_at):
+            computed_at = r["computed_at"]
+        out.append({
+            "code": c["code"], "title": c["title"], "category": c["framework"],
+            "score": (r["score"] if r else None),
+            "confidence": (r["confidence"] if r else None),
+            "evidence": (json.loads(r["evidence"]) if r and isinstance(r["evidence"], str)
+                         else (r["evidence"] if r else [])),
+            "rules": (r["rule_code"].split(",") if r and r["rule_code"] else []),
+        })
+    return {"student_id": student_id,
+            "computed_at": computed_at.isoformat() if computed_at else None,
+            "found": len(inf), "total": len(cat), "skills": out}
