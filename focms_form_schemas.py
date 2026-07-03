@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.21 · fix: tenant GUC now set via SET LOCAL inside one transaction per handler (_tenant_conn); cures intermittent empty RLS reads through PgBouncer.
+v0.12.22 · SPS skills bucket is age-aware: denominator = age-appropriate + evidenced requirements; ahead-of-age skills count fully.
+         v0.12.21 · fix: tenant GUC now set via SET LOCAL inside one transaction per handler (_tenant_conn); cures intermittent empty RLS reads through PgBouncer.
          v0.12.20 · fix: enum-safe event_type cast in inference engine (500 on auto-run).
          v0.12.19 · SPS fixes: skills bucket excluded when no student signal; inference engine auto-runs when empty (internal).
          v0.12.18 · Success Predictor Score: weighted A/E/S/M buckets per major with meta-alignment boost.
@@ -790,7 +791,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.21)
+# Parent-portal capture endpoints (v0.12.22)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2599,7 +2600,12 @@ async def get_major_sps(request: Request, student_id: str, cip_code: str, audien
 
         buckets = await _sps_buckets(conn, student_id)
 
-        # S - hard-skill coverage vs this major (same math as the gap report)
+        # S - hard-skill coverage vs this major, AGE-AWARE (v0.12.22).
+        # Denominator = requirements answerable now: typical_age_min at or
+        # below the student's age, plus anything explicitly evidenced (skills
+        # earned ahead of age count fully). A young student is never penalized
+        # for skills that are not age-appropriate yet - the denominator grows
+        # as they age. Trajectory over point-in-time.
         reqs = await conn.fetch(
             "SELECT skill_code, importance FROM major_skill_requirements "
             "WHERE cip_code=$1 AND is_active AND skill_code IS NOT NULL", cip)
@@ -2609,25 +2615,28 @@ async def get_major_sps(request: Request, student_id: str, cip_code: str, audien
                 "SELECT skill_code, acquired FROM student_skills "
                 "WHERE student_id=$1::uuid AND deleted_at IS NULL AND skill_code IS NOT NULL", student_id)
             explicit = {r["skill_code"]: r["acquired"] for r in srows}
-            amax = {r["code"]: (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None)
-                    for r in await conn.fetch("SELECT code, typical_age_max FROM skills_catalog WHERE is_active")}
-            have_w = total_w = 0.0
-            signal_hits = 0
+            bands = {r["code"]: (
+                        (float(r["typical_age_min"]) if r["typical_age_min"] is not None else None),
+                        (float(r["typical_age_max"]) if r["typical_age_max"] is not None else None))
+                     for r in await conn.fetch(
+                        "SELECT code, typical_age_min, typical_age_max FROM skills_catalog WHERE is_active")}
+            have_w = due_w = 0.0
+            eligible = 0
             for r in reqs:
-                total_w += r["importance"]
                 acq = explicit.get(r["skill_code"])
-                presumed = (acq is None and age is not None and amax.get(r["skill_code"]) is not None
-                            and age > amax[r["skill_code"]])
-                if acq is not None or presumed:
-                    signal_hits += 1
-                if acq is True or presumed:
-                    have_w += r["importance"]
-            # no explicit rows and no presumable requirements = no signal at all:
-            # exclude the bucket (renormalize) instead of scoring a false zero
-            if total_w and (explicit or signal_hits):
-                buckets["skills"] = {
-                    "score": round(have_w / total_w, 3),
-                    "evidence": [f"Hard-skill coverage of {len(reqs)} requirements for {major['title']}"]}
+                amin, amax_v = bands.get(r["skill_code"], (None, None))
+                presumed = (acq is None and age is not None and amax_v is not None and age > amax_v)
+                age_due = (age is None or amin is None or amin <= age)
+                if acq is not None or presumed or age_due:
+                    eligible += 1
+                    due_w += r["importance"]
+                    if acq is True or presumed:
+                        have_w += r["importance"]
+            if eligible:
+                later = len(reqs) - eligible
+                ev = ("Coverage of " + str(eligible) + " age-appropriate requirements for " + major["title"]
+                      + ((" (" + str(later) + " more unlock with age)") if later else ""))
+                buckets["skills"] = {"score": round(have_w / due_w, 3), "evidence": [ev]}
 
         # meta-alignment boost: share of the major's meta requirements evidenced at 4+
         boost = 0.0
