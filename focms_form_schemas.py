@@ -1,7 +1,9 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.33a · school-search K-12 queries k12_schools (per-school CCD, pg_trgm); state optional, no live DOE call.
+v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
+         v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
+         v0.12.33a · school-search K-12 queries k12_schools (per-school CCD, pg_trgm); state optional, no live DOE call.
          v0.12.32 · Teacher registry (GET/POST) + universal band-aware school search proxy (DOE k12 / IPEDS college).
          v0.12.31 · Academics: per-grade year records with mid-year school-transfer support.
          v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
@@ -430,6 +432,7 @@ STUDENTS_COLS = {
 }
 SPD_COLS = {
     "chosen_name", "previous_last_names", "legal_sex_at_birth",
+    "residence_country",
     "pronouns", "gender_identity", "marital_status",
     "place_of_birth_city", "place_of_birth_state_province",
     "place_of_birth_country", "place_of_birth_country_iso2",
@@ -804,7 +807,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.32)
+# Parent-portal capture endpoints (v0.12.35)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -4269,3 +4272,40 @@ async def school_search(request: Request, q: str, level: str = "k12",
         "district": r["district_name"] or "",
     } for r in rows]
     return {"results": out}
+
+
+# ======================================================================
+# v0.12.35 - Tenant locale (UI language)
+# ======================================================================
+
+_SUPPORTED_LOCALES = {"en-US", "es-ES"}
+
+
+@router.get("/tenant/locale")
+async def get_tenant_locale(request: Request):
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        loc = await conn.fetchval(
+            "SELECT locale FROM tenants WHERE id=$1::uuid", tenant_id)
+    return {"tenant_id": tenant_id, "locale": loc or "en-US"}
+
+
+class LocaleBody(BaseModel):
+    locale: str
+
+
+@router.post("/tenant/locale")
+async def set_tenant_locale(request: Request, body: LocaleBody):
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    loc = body.locale if body.locale in _SUPPORTED_LOCALES else "en-US"
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            await conn.execute(
+                "UPDATE tenants SET locale=$2, updated_at=now() WHERE id=$1::uuid",
+                tenant_id, loc)
+    return {"tenant_id": tenant_id, "locale": loc}
