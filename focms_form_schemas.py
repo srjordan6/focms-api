@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.27a · fix: details column arrives as str via asyncpg; json-decode before .get.
+v0.12.28 · Academics grade-band scoping: summary + courses GET/POST filtered by band (preschool/elementary/middle/high).
+         v0.12.27a · fix: details column arrives as str via asyncpg; json-decode before .get.
          v0.12.27 · Higher Education: applications GET/POST + CIP majors catalog.
          v0.12.26 · Higher Education: universities catalog + target-schools GET/POST.
          v0.12.25 · universal activity fields: skills_gained + show_on_showcase across affiliations, awards, sessions.
@@ -797,7 +798,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.27)
+# Parent-portal capture endpoints (v0.12.28)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -3439,3 +3440,189 @@ async def get_cip_majors_catalog(request: Request, q: Optional[str] = None):
             rows = await conn.fetch(
                 "SELECT cip_code, title FROM cip_majors WHERE is_active ORDER BY title")
     return {"majors": [dict(r) for r in rows]}
+
+
+# ======================================================================
+# v0.12.28 - Academics grade-band scoping
+# ======================================================================
+# Bands: preschool (0-K), elementary (1-5), middle (6-8), high (9-12)
+# Derived from grade_level integer stored on each row.
+
+BAND_RANGES = {
+    "preschool":  (0, 0),
+    "elementary": (1, 5),
+    "middle":     (6, 8),
+    "high":       (9, 12),
+}
+
+
+def _band_bounds(band: Optional[str]) -> Optional[tuple[int, int]]:
+    return BAND_RANGES.get((band or "").lower())
+
+
+@router.get("/student/{student_id}/academics-summary")
+async def get_academics_summary(request: Request, student_id: str):
+    """Counts by grade band. Cheap dashboard query."""
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        crows = await conn.fetch(
+            "SELECT grade_level, count(*) n FROM courses_taken "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "GROUP BY grade_level", student_id)
+        arows = await conn.fetch(
+            "SELECT grade_at_test, count(*) n FROM assessments "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "GROUP BY grade_at_test", student_id)
+    bands = {b: {"courses": 0, "assessments": 0} for b in BAND_RANGES}
+    for r in crows:
+        g = r["grade_level"]
+        if g is None: continue
+        for b, (lo, hi) in BAND_RANGES.items():
+            if lo <= g <= hi: bands[b]["courses"] += r["n"]; break
+    for r in arows:
+        g = r["grade_at_test"]
+        if g is None: continue
+        for b, (lo, hi) in BAND_RANGES.items():
+            if lo <= g <= hi: bands[b]["assessments"] += r["n"]; break
+    return {"student_id": student_id, "bands": bands}
+
+
+@router.get("/student/{student_id}/courses")
+async def get_student_courses(request: Request, student_id: str,
+                              band: Optional[str] = None):
+    tenant_id, _ = await _pp_context(request, student_id)
+    bounds = _band_bounds(band) if band else None
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        if bounds:
+            rows = await conn.fetch(
+                "SELECT id::text AS id, course_name, school_name, course_type, "
+                "subject, grade_level, school_year, term, credit_hours, "
+                "grade_received, grade_points_4_0, grade_points_weighted, "
+                "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
+                "teacher_name, notes, "
+                "(visibility='public') AS show_on_showcase "
+                "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL "
+                "AND grade_level BETWEEN $2 AND $3 "
+                "ORDER BY grade_level, school_year, term, course_name",
+                student_id, bounds[0], bounds[1])
+        else:
+            rows = await conn.fetch(
+                "SELECT id::text AS id, course_name, school_name, course_type, "
+                "subject, grade_level, school_year, term, credit_hours, "
+                "grade_received, grade_points_4_0, grade_points_weighted, "
+                "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
+                "teacher_name, notes, "
+                "(visibility='public') AS show_on_showcase "
+                "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL "
+                "ORDER BY grade_level, school_year, term, course_name", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("credit_hours", "grade_points_4_0", "grade_points_weighted"):
+            d[k] = float(d[k]) if d[k] is not None else None
+        out.append(d)
+    return {"student_id": student_id, "band": band, "courses": out}
+
+
+class CourseItem(BaseModel):
+    id: Optional[str] = None
+    course_name: str
+    school_name: Optional[str] = None
+    course_type: Optional[str] = None
+    subject: Optional[str] = None
+    grade_level: int
+    school_year: Optional[str] = None
+    term: Optional[str] = None
+    credit_hours: Optional[float] = None
+    grade_received: Optional[str] = None
+    grade_points_4_0: Optional[float] = None
+    grade_points_weighted: Optional[float] = None
+    is_honors: Optional[bool] = None
+    is_ap: Optional[bool] = None
+    is_ib: Optional[bool] = None
+    is_dual_credit: Optional[bool] = None
+    ap_exam_score: Optional[int] = None
+    teacher_name: Optional[str] = None
+    notes: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class CoursesRequest(BaseModel):
+    items: List[CourseItem] = []
+    delete_ids: List[str] = []
+
+
+@router.post("/student/{student_id}/courses")
+async def post_student_courses(request: Request, student_id: str, body: CoursesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE courses_taken SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                name = (it.course_name or "").strip()
+                if not name: continue
+                if it.grade_level is None or it.grade_level < 0 or it.grade_level > 13:
+                    continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE courses_taken SET course_name=$3, school_name=$4, "
+                        "course_type=$5, subject=$6, grade_level=$7, school_year=$8, "
+                        "term=$9, credit_hours=$10, grade_received=$11, "
+                        "grade_points_4_0=$12, grade_points_weighted=$13, "
+                        "is_honors=$14, is_ap=$15, is_ib=$16, is_dual_credit=$17, "
+                        "ap_exam_score=$18, teacher_name=$19, notes=$20, "
+                        "updated_at=now(), updated_by=$21::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, name, it.school_name, it.course_type,
+                        it.subject, it.grade_level, it.school_year, it.term,
+                        it.credit_hours, it.grade_received, it.grade_points_4_0,
+                        it.grade_points_weighted, it.is_honors, it.is_ap, it.is_ib,
+                        it.is_dual_credit, it.ap_exam_score, it.teacher_name,
+                        it.notes, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute(
+                                "UPDATE courses_taken SET visibility='public' "
+                                "WHERE id=$1::uuid", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute(
+                                "UPDATE courses_taken SET visibility='private' "
+                                "WHERE id=$1::uuid", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO courses_taken (tenant_id, student_id, course_name, "
+                        "school_name, course_type, subject, grade_level, school_year, "
+                        "term, credit_hours, grade_received, grade_points_4_0, "
+                        "grade_points_weighted, is_honors, is_ap, is_ib, is_dual_credit, "
+                        "ap_exam_score, teacher_name, notes, visibility, source_system, "
+                        "created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
+                        "$14,$15,$16,$17,$18,$19,$20,'private','parent_portal',"
+                        "$21::uuid,$21::uuid) RETURNING id",
+                        tenant_id, student_id, name, it.school_name, it.course_type,
+                        it.subject, it.grade_level, it.school_year, it.term,
+                        it.credit_hours, it.grade_received, it.grade_points_4_0,
+                        it.grade_points_weighted, it.is_honors, it.is_ap, it.is_ib,
+                        it.is_dual_credit, it.ap_exam_score, it.teacher_name,
+                        it.notes, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute(
+                            "UPDATE courses_taken SET visibility='public' "
+                            "WHERE id=$1::uuid", rid)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
