@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.23 · Extra Curricular pillar: affiliations GET/POST for programs, activities, service orgs, coach relationships.
+v0.12.24 · Extracurricular expansion: programs picker, named-awards catalog, EC milestones catalog, awards GET/POST, sessions log GET/POST.
+         v0.12.23 · Extra Curricular pillar: affiliations GET/POST for programs, activities, service orgs, coach relationships.
          v0.12.22 · SPS skills bucket is age-aware: denominator = age-appropriate + evidenced requirements; ahead-of-age skills count fully.
          v0.12.21 · fix: tenant GUC now set via SET LOCAL inside one transaction per handler (_tenant_conn); cures intermittent empty RLS reads through PgBouncer.
          v0.12.20 · fix: enum-safe event_type cast in inference engine (500 on auto-run).
@@ -792,7 +793,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.23)
+# Parent-portal capture endpoints (v0.12.24)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2806,5 +2807,233 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.24 - Extracurricular expansion
+# picker: programs catalog; sub-domains: awards, sessions, milestones
+# ======================================================================
+
+
+@router.get("/catalogs/affiliation-programs")
+async def get_affiliation_programs(request: Request):
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT code, title, category, capstone_award FROM affiliation_programs_catalog "
+            "WHERE is_active ORDER BY sort_order, title")
+    return {"programs": [dict(r) for r in rows]}
+
+
+@router.get("/catalogs/named-awards")
+async def get_named_awards(request: Request):
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, title, category, granting_organization "
+            "FROM named_awards_catalog WHERE is_active ORDER BY category, title")
+    return {"named_awards": [dict(r) for r in rows]}
+
+
+@router.get("/catalogs/ec-milestones")
+async def get_ec_milestones(request: Request):
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT code, title, sub_pillar, category, typical_age_min, typical_age_max "
+            "FROM life_milestones_catalog WHERE is_active AND pillar='Extra Curricular' "
+            "ORDER BY sub_pillar, sort_order, title")
+    return {"milestones": [dict(r) for r in rows]}
+
+
+class AwardItem(BaseModel):
+    id: Optional[str] = None
+    award_name: str
+    granting_organization: Optional[str] = None
+    awarded_date: Optional[str] = None
+    level: Optional[str] = None
+    category: Optional[str] = None
+    rank_or_placement: Optional[str] = None
+    competing_pool_size: Optional[int] = None
+    monetary_value_usd: Optional[float] = None
+    named_award_catalog_id: Optional[str] = None
+    related_affiliation_id: Optional[str] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+
+
+class AwardsRequest(BaseModel):
+    items: List[AwardItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/awards")
+async def get_student_awards(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, award_name, granting_organization, awarded_date, level, "
+            "category, rank_or_placement, competing_pool_size, monetary_value_usd, "
+            "named_award_catalog_id::text AS named_award_catalog_id, "
+            "related_affiliation_id::text AS related_affiliation_id, "
+            "notes, public_description, source_system "
+            "FROM awards_honors WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY awarded_date DESC NULLS LAST, created_at DESC", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["awarded_date"] = d["awarded_date"].isoformat() if d["awarded_date"] else None
+        d["monetary_value_usd"] = float(d["monetary_value_usd"]) if d["monetary_value_usd"] is not None else None
+        out.append(d)
+    return {"student_id": student_id, "awards": out}
+
+
+@router.post("/student/{student_id}/awards")
+async def post_student_awards(request: Request, student_id: str, body: AwardsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE awards_honors SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                name = (it.award_name or "").strip()
+                if not name: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE awards_honors SET award_name=$3, granting_organization=$4, "
+                        "awarded_date=$5::date, level=$6, category=$7, rank_or_placement=$8, "
+                        "competing_pool_size=$9, monetary_value_usd=$10, "
+                        "named_award_catalog_id=NULLIF($11,'')::uuid, "
+                        "related_affiliation_id=NULLIF($12,'')::uuid, notes=$13, "
+                        "public_description=$14, updated_at=now(), updated_by=$15::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, name, it.granting_organization, it.awarded_date,
+                        it.level, it.category, it.rank_or_placement, it.competing_pool_size,
+                        it.monetary_value_usd, it.named_award_catalog_id or '',
+                        it.related_affiliation_id or '', it.notes, it.public_description, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO awards_honors (tenant_id, student_id, award_name, "
+                        "granting_organization, awarded_date, level, category, rank_or_placement, "
+                        "competing_pool_size, monetary_value_usd, "
+                        "named_award_catalog_id, related_affiliation_id, notes, "
+                        "public_description, visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5::date,$6,$7,$8,$9,$10,"
+                        "NULLIF($11,'')::uuid,NULLIF($12,'')::uuid,$13,$14,'private',"
+                        "'parent_portal',$15::uuid,$15::uuid)",
+                        tenant_id, student_id, name, it.granting_organization, it.awarded_date,
+                        it.level, it.category, it.rank_or_placement, it.competing_pool_size,
+                        it.monetary_value_usd, it.named_award_catalog_id or '',
+                        it.related_affiliation_id or '', it.notes, it.public_description, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+_EC_EVENT_TYPES = {"service_session", "summer_experience", "leadership_milestone",
+                   "competition", "stem_event", "music_performance"}
+
+
+class EcSessionItem(BaseModel):
+    id: Optional[str] = None
+    event_type: str
+    title: str
+    event_date: str
+    duration_hours: Optional[float] = None
+    location: Optional[str] = None
+    related_affiliation_id: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class EcSessionsRequest(BaseModel):
+    items: List[EcSessionItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/ec-sessions")
+async def get_ec_sessions(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, event_type::text AS event_type, title, event_date, "
+            "duration_minutes, location_name AS location, affiliation_id::text AS related_affiliation_id, "
+            "notes, source_system "
+            "FROM events WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "AND event_type::text = ANY($2::text[]) "
+            "ORDER BY event_date DESC NULLS LAST",
+            student_id, list(_EC_EVENT_TYPES))
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["event_date"] = d["event_date"].isoformat() if d["event_date"] else None
+        d["duration_hours"] = round(d["duration_minutes"]/60.0, 2) if d["duration_minutes"] is not None else None
+        d.pop("duration_minutes", None)
+        out.append(d)
+    return {"student_id": student_id, "sessions": out}
+
+
+@router.post("/student/{student_id}/ec-sessions")
+async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE events SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                etype = (it.event_type or "").strip()
+                if etype not in _EC_EVENT_TYPES: continue
+                title = (it.title or "").strip()
+                edate = (it.event_date or "").strip()
+                if not title or not edate: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE events SET event_type=$3::event_type_enum, title=$4, "
+                        "event_date=$5::date, duration_minutes=$6, location_name=$7, "
+                        "affiliation_id=NULLIF($8,'')::uuid, notes=$9, "
+                        "updated_at=now(), updated_by=$10::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, etype, title, edate,
+                        int(it.duration_hours*60) if it.duration_hours is not None else None,
+                        it.location, it.related_affiliation_id or '', it.notes, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO events (tenant_id, student_id, event_type, title, "
+                        "event_date, duration_minutes, location_name, affiliation_id, notes, "
+                        "visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,$5::date,$6,$7,"
+                        "NULLIF($8,'')::uuid,$9,'private','parent_portal',$10::uuid,$10::uuid)",
+                        tenant_id, student_id, etype, title, edate,
+                        int(it.duration_hours*60) if it.duration_hours is not None else None,
+                        it.location, it.related_affiliation_id or '', it.notes, user_id)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
