@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.37b · languages: seed carries codes + is never cached (avoids poisoning). fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
+v0.12.38 · Career pillar: career-profile + job-experiences + references (covers standard employment application fields).
+         v0.12.37b · languages: seed carries codes + is never cached (avoids poisoning). fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
          v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
          v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
          v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
@@ -4430,3 +4431,291 @@ async def translate_ui_strings(request: Request, body: UiStringsBody):
                 locale, _json.dumps(merged))
 
     return {"locale": locale, "strings": {k: merged[k] for k in body.strings if k in merged}}
+
+
+# ======================================================================
+# v0.12.38 - Career pillar: profile, job experiences, references
+# ======================================================================
+
+
+class CareerProfileBody(BaseModel):
+    authorized_us_work: Optional[bool] = None
+    work_auth_basis: Optional[str] = None
+    has_hs_diploma_or_ged: Optional[bool] = None
+    convicted_felony: Optional[bool] = None
+    felony_explanation: Optional[str] = None
+    special_skills: Optional[str] = None
+    possible_career: Optional[str] = None
+    salary_desired: Optional[str] = None
+    earliest_start_date: Optional[str] = None
+    willing_full_time: Optional[bool] = None
+    willing_part_time: Optional[bool] = None
+    willing_days: Optional[bool] = None
+    willing_evenings: Optional[bool] = None
+    willing_swing: Optional[bool] = None
+    willing_graveyard: Optional[bool] = None
+    willing_weekends: Optional[bool] = None
+    willing_regular: Optional[bool] = None
+    willing_temporary: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+@router.get("/student/{student_id}/career-profile")
+async def get_career_profile(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT authorized_us_work, work_auth_basis, has_hs_diploma_or_ged, "
+            "convicted_felony, felony_explanation, special_skills, possible_career, "
+            "salary_desired, earliest_start_date, willing_full_time, willing_part_time, "
+            "willing_days, willing_evenings, willing_swing, willing_graveyard, "
+            "willing_weekends, willing_regular, willing_temporary, notes "
+            "FROM career_profile WHERE student_id=$1::uuid", student_id)
+    if not row:
+        return {"student_id": student_id, "profile": {}}
+    d = dict(row)
+    if d.get("earliest_start_date"):
+        d["earliest_start_date"] = d["earliest_start_date"].isoformat()
+    return {"student_id": student_id, "profile": d}
+
+
+@router.post("/student/{student_id}/career-profile")
+async def post_career_profile(request: Request, student_id: str, body: CareerProfileBody):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            await conn.execute(
+                "INSERT INTO career_profile (student_id, tenant_id, authorized_us_work, "
+                "work_auth_basis, has_hs_diploma_or_ged, convicted_felony, felony_explanation, "
+                "special_skills, possible_career, salary_desired, earliest_start_date, "
+                "willing_full_time, willing_part_time, willing_days, willing_evenings, "
+                "willing_swing, willing_graveyard, willing_weekends, willing_regular, "
+                "willing_temporary, notes, updated_by) "
+                "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11::date,$12,$13,$14,"
+                "$15,$16,$17,$18,$19,$20,$21,$22::uuid) "
+                "ON CONFLICT (student_id) DO UPDATE SET "
+                "authorized_us_work=$3, work_auth_basis=$4, has_hs_diploma_or_ged=$5, "
+                "convicted_felony=$6, felony_explanation=$7, special_skills=$8, "
+                "possible_career=$9, salary_desired=$10, earliest_start_date=$11::date, "
+                "willing_full_time=$12, willing_part_time=$13, willing_days=$14, "
+                "willing_evenings=$15, willing_swing=$16, willing_graveyard=$17, "
+                "willing_weekends=$18, willing_regular=$19, willing_temporary=$20, "
+                "notes=$21, updated_at=now(), updated_by=$22::uuid",
+                student_id, tenant_id, body.authorized_us_work, body.work_auth_basis,
+                body.has_hs_diploma_or_ged, body.convicted_felony, body.felony_explanation,
+                body.special_skills, body.possible_career, body.salary_desired,
+                body.earliest_start_date, body.willing_full_time, body.willing_part_time,
+                body.willing_days, body.willing_evenings, body.willing_swing,
+                body.willing_graveyard, body.willing_weekends, body.willing_regular,
+                body.willing_temporary, body.notes, user_id)
+    return {"student_id": student_id, "saved": True}
+
+
+class JobExperienceItem(BaseModel):
+    id: Optional[str] = None
+    job_title: Optional[str] = None
+    company_name: Optional[str] = None
+    supervisor_name: Optional[str] = None
+    supervisor_phone: Optional[str] = None
+    street_address: Optional[str] = None
+    city_town: Optional[str] = None
+    state_province: Optional[str] = None
+    zip_postal_code: Optional[str] = None
+    country: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    is_current: Optional[bool] = None
+    is_paid: Optional[bool] = None
+    duties: Optional[str] = None
+    reason_for_leaving: Optional[str] = None
+    starting_salary: Optional[str] = None
+    ending_salary: Optional[str] = None
+    may_contact: Optional[bool] = None
+    hours_type: Optional[str] = None
+    employment_status: Optional[str] = None
+    skills_gained: List[str] = []
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class JobExperiencesRequest(BaseModel):
+    items: List[JobExperienceItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/job-experiences")
+async def get_job_experiences(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, job_title, company_name, supervisor_name, "
+            "supervisor_phone, street_address, city_town, state_province, "
+            "zip_postal_code, country, start_date, end_date, is_current, is_paid, "
+            "duties, reason_for_leaving, starting_salary, ending_salary, may_contact, "
+            "hours_type, employment_status, skills_gained, notes, public_description, "
+            "(visibility='public') AS show_on_showcase "
+            "FROM job_experiences WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY is_current DESC, start_date DESC NULLS LAST", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("start_date", "end_date"):
+            d[k] = d[k].isoformat() if d[k] else None
+        d["skills_gained"] = list(d["skills_gained"] or [])
+        out.append(d)
+    return {"student_id": student_id, "jobs": out}
+
+
+@router.post("/student/{student_id}/job-experiences")
+async def post_job_experiences(request: Request, student_id: str, body: JobExperiencesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE job_experiences SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                if not (it.job_title or it.company_name): continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE job_experiences SET job_title=$3, company_name=$4, "
+                        "supervisor_name=$5, supervisor_phone=$6, street_address=$7, "
+                        "city_town=$8, state_province=$9, zip_postal_code=$10, country=$11, "
+                        "start_date=$12::date, end_date=$13::date, is_current=$14, is_paid=$15, "
+                        "duties=$16, reason_for_leaving=$17, starting_salary=$18, "
+                        "ending_salary=$19, may_contact=$20, hours_type=$21, "
+                        "employment_status=$22, skills_gained=$23, notes=$24, "
+                        "public_description=$25, updated_at=now(), updated_by=$26::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.job_title, it.company_name, it.supervisor_name,
+                        it.supervisor_phone, it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.country, it.start_date, it.end_date,
+                        it.is_current, it.is_paid, it.duties, it.reason_for_leaving,
+                        it.starting_salary, it.ending_salary, it.may_contact, it.hours_type,
+                        it.employment_status, list(it.skills_gained or []), it.notes,
+                        it.public_description, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute("UPDATE job_experiences SET visibility='public' WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute("UPDATE job_experiences SET visibility='private' WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO job_experiences (tenant_id, student_id, job_title, "
+                        "company_name, supervisor_name, supervisor_phone, street_address, "
+                        "city_town, state_province, zip_postal_code, country, start_date, "
+                        "end_date, is_current, is_paid, duties, reason_for_leaving, "
+                        "starting_salary, ending_salary, may_contact, hours_type, "
+                        "employment_status, skills_gained, notes, public_description, "
+                        "visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::date,"
+                        "$13::date,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,"
+                        "'private','parent_portal',$26::uuid,$26::uuid) RETURNING id",
+                        tenant_id, student_id, it.job_title, it.company_name, it.supervisor_name,
+                        it.supervisor_phone, it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.country, it.start_date, it.end_date,
+                        it.is_current, it.is_paid, it.duties, it.reason_for_leaving,
+                        it.starting_salary, it.ending_salary, it.may_contact, it.hours_type,
+                        it.employment_status, list(it.skills_gained or []), it.notes,
+                        it.public_description, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute("UPDATE job_experiences SET visibility='public' WHERE id=$1::uuid AND visibility_locked=false", rid)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+class ReferenceItem(BaseModel):
+    id: Optional[str] = None
+    ref_name: str
+    relationship: Optional[str] = None
+    is_professional: Optional[bool] = None
+    street_address: Optional[str] = None
+    city_town: Optional[str] = None
+    state_province: Optional[str] = None
+    zip_postal_code: Optional[str] = None
+    country: Optional[str] = None
+    phone: Optional[str] = None
+    email: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class ReferencesRequest(BaseModel):
+    items: List[ReferenceItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/references")
+async def get_references(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, ref_name, relationship, is_professional, "
+            "street_address, city_town, state_province, zip_postal_code, country, "
+            "phone, email, notes FROM career_references "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL ORDER BY ref_name",
+            student_id)
+    return {"student_id": student_id, "references": [dict(r) for r in rows]}
+
+
+@router.post("/student/{student_id}/references")
+async def post_references(request: Request, student_id: str, body: ReferencesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE career_references SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                nm = (it.ref_name or "").strip()
+                if not nm: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE career_references SET ref_name=$3, relationship=$4, "
+                        "is_professional=$5, street_address=$6, city_town=$7, "
+                        "state_province=$8, zip_postal_code=$9, country=$10, phone=$11, "
+                        "email=$12, notes=$13, updated_at=now(), updated_by=$14::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, nm, it.relationship, it.is_professional,
+                        it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.country, it.phone, it.email, it.notes, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO career_references (tenant_id, student_id, ref_name, "
+                        "relationship, is_professional, street_address, city_town, "
+                        "state_province, zip_postal_code, country, phone, email, notes, "
+                        "source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
+                        "'parent_portal',$14::uuid,$14::uuid)",
+                        tenant_id, student_id, nm, it.relationship, it.is_professional,
+                        it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.country, it.phone, it.email, it.notes, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
