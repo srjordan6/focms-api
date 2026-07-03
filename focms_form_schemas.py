@@ -1,7 +1,7 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.32a · school-search: CCD name filter needs exact match; switch to state(fips)+substring scan; require state for K-12.
+v0.12.33 · school-search K-12 queries locally loaded CCD (schools, pg_trgm); state optional, no live DOE call.
          v0.12.32 · Teacher registry (GET/POST) + universal band-aware school search proxy (DOE k12 / IPEDS college).
          v0.12.31 · Academics: per-grade year records with mid-year school-transfer support.
          v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
@@ -4241,64 +4241,31 @@ async def school_search(request: Request, q: str, level: str = "k12",
              "city": r["city"], "state": r["state"], "leaid": r["leaid"],
              "us_news_rank": r["us_news_rank"], "street": None,
              "zip": None, "phone": None} for r in rows]}
-    # k12 -> DOE CCD directory proxy.
-    # The CCD `school_name` filter requires an EXACT uppercase match, so a partial
-    # query returns nothing. Instead we filter by state (fips) and substring-match
-    # names server-side. State is required for a bounded result set.
-    import urllib.request as _u, urllib.parse as _up, json as _json
-    _FIPS = {"AL":"1","AK":"2","AZ":"4","AR":"5","CA":"6","CO":"8","CT":"9","DE":"10",
-        "DC":"11","FL":"12","GA":"13","HI":"15","ID":"16","IL":"17","IN":"18","IA":"19",
-        "KS":"20","KY":"21","LA":"22","ME":"23","MD":"24","MA":"25","MI":"26","MN":"27",
-        "MS":"28","MO":"29","MT":"30","NE":"31","NV":"32","NH":"33","NJ":"34","NM":"35",
-        "NY":"36","NC":"37","ND":"38","OH":"39","OK":"40","OR":"41","PA":"42","RI":"44",
-        "SC":"45","SD":"46","TN":"47","TX":"48","UT":"49","VT":"50","VA":"51","WA":"53",
-        "WV":"54","WI":"55","WY":"56"}
-    if not state or state.upper() not in _FIPS:
-        return {"results": [], "need_state": True,
-                "message": "Add a 2-letter state code to search K-12 schools, e.g. 'Roach Middle TX'."}
-    fips = _FIPS[state.upper()]
-    ql = q.lower()
-    out = []
-    try:
-        url = ("https://educationdata.urban.org/api/v1/schools/ccd/directory/2021/?fips="
-               + fips + "&school_name=" + _up.quote(q.upper()))
-        req = _u.Request(url, headers={"Accept": "application/json"})
-        with _u.urlopen(req, timeout=20) as resp:
-            data = _json.loads(resp.read().decode("utf-8"))
-        rows = data.get("results", []) or []
-        # exact-name path returned hits
-        for r in rows[:limit]:
-            if not r.get("school_name"): continue
-            out.append(_ccd_row(r))
-        # if exact-name filter found nothing, fall back to substring scan of first pages
-        if not out:
-            url2 = ("https://educationdata.urban.org/api/v1/schools/ccd/directory/2021/?fips="
-                    + fips)
-            pages = 0
-            nxt = url2
-            while nxt and pages < 6 and len(out) < limit:
-                req2 = _u.Request(nxt, headers={"Accept": "application/json"})
-                with _u.urlopen(req2, timeout=20) as resp2:
-                    d2 = _json.loads(resp2.read().decode("utf-8"))
-                for r in d2.get("results", []) or []:
-                    nm = r.get("school_name") or ""
-                    if ql in nm.lower():
-                        out.append(_ccd_row(r))
-                        if len(out) >= limit: break
-                nxt = d2.get("next")
-                pages += 1
-    except Exception:
-        return {"results": out, "error": "doe_unavailable"}
+    # k12 -> query the locally loaded CCD directory in `schools` (pg_trgm).
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        if state:
+            rows = await conn.fetch(
+                "SELECT ncessch, name, address_line1, city, state, zip, phone, "
+                "district_name FROM schools "
+                "WHERE state = $1 AND lower(name) LIKE '%' || lower($2) || '%' "
+                "ORDER BY name LIMIT $3",
+                state.upper(), q, limit)
+        else:
+            rows = await conn.fetch(
+                "SELECT ncessch, name, address_line1, city, state, zip, phone, "
+                "district_name FROM schools "
+                "WHERE lower(name) LIKE '%' || lower($1) || '%' "
+                "ORDER BY name LIMIT $2",
+                q, limit)
+    out = [{
+        "name": r["name"],
+        "city": r["city"] or "",
+        "state": r["state"] or "",
+        "street": r["address_line1"] or "",
+        "zip": r["zip"] or "",
+        "leaid": r["ncessch"] or "",
+        "phone": r["phone"] or "",
+        "district": r["district_name"] or "",
+    } for r in rows]
     return {"results": out}
-
-
-def _ccd_row(r: dict) -> dict:
-    return {
-        "name": r.get("school_name"),
-        "city": r.get("city_location") or r.get("city_mailing") or "",
-        "state": r.get("state_location") or r.get("state_mailing") or "",
-        "street": r.get("street_mailing") or r.get("street_location") or "",
-        "zip": r.get("zip_mailing") or r.get("zip_location") or "",
-        "leaid": str(r.get("ncessch") or r.get("leaid") or ""),
-        "phone": r.get("phone") or "",
-    }
