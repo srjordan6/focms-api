@@ -1,7 +1,7 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.36 · Languages catalog from Google Translate (24h cache, seed fallback).
+v0.12.36a · Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
          v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
          v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
          v0.12.33a · school-search K-12 queries k12_schools (per-school CCD, pg_trgm); state optional, no live DOE call.
@@ -4329,7 +4329,7 @@ async def get_languages_catalog(request: Request, target: str = "en"):
     now = _t.time()
     if _LANG_CACHE["data"] and now - _LANG_CACHE["ts"] < 86400:
         return {"languages": _LANG_CACHE["data"], "cached": True}
-    key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    key = os.environ.get("GOOGLE_TRANSLATE_API_KEY") or os.environ.get("GOOGLE_PLACES_API_KEY")
     langs = None
     if key:
         import urllib.request as _u, urllib.parse as _up, json as _json
