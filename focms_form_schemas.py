@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.22 · SPS skills bucket is age-aware: denominator = age-appropriate + evidenced requirements; ahead-of-age skills count fully.
+v0.12.23 · Extra Curricular pillar: affiliations GET/POST for programs, activities, service orgs, coach relationships.
+         v0.12.22 · SPS skills bucket is age-aware: denominator = age-appropriate + evidenced requirements; ahead-of-age skills count fully.
          v0.12.21 · fix: tenant GUC now set via SET LOCAL inside one transaction per handler (_tenant_conn); cures intermittent empty RLS reads through PgBouncer.
          v0.12.20 · fix: enum-safe event_type cast in inference engine (500 on auto-run).
          v0.12.19 · SPS fixes: skills bucket excluded when no student signal; inference engine auto-runs when empty (internal).
@@ -791,7 +792,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.22)
+# Parent-portal capture endpoints (v0.12.23)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -2681,3 +2682,129 @@ async def get_major_sps(request: Request, student_id: str, cip_code: str, audien
     if not parent_view:
         resp["alignment_matched_meta_skills"] = matched_codes
     return resp
+
+
+# ======================================================================
+# v0.12.23 - Extra Curricular pillar (affiliations)
+# ----------------------------------------------------------------------
+# Parent captures programs, activities, service organizations, and coach
+# relationships. Feeds SPS engagement bucket + inference engine (breadth,
+# leadership, sustained involvement).
+# ======================================================================
+
+_AFFIL_TYPES = {"program", "activity", "service_org", "coach_relationship"}
+
+
+class AffiliationItem(BaseModel):
+    id: Optional[str] = None
+    affiliation_type: str
+    organization_name: str
+    organization_url: Optional[str] = None
+    organization_city: Optional[str] = None
+    organization_state: Optional[str] = None
+    role: Optional[str] = None
+    role_start_date: Optional[str] = None
+    role_end_date: Optional[str] = None
+    weekly_hours: Optional[float] = None
+    total_hours: Optional[float] = None
+    coach_name: Optional[str] = None
+    coach_email: Optional[str] = None
+    coach_role: Optional[str] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+
+
+class AffiliationsRequest(BaseModel):
+    items: List[AffiliationItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/affiliations")
+async def get_student_affiliations(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id, affiliation_type::text AS affiliation_type, organization_name, "
+            "organization_url, organization_city, organization_state, role, "
+            "role_start_date, role_end_date, weekly_hours, total_hours, "
+            "coach_name, coach_email, coach_role, notes, public_description, "
+            "is_verified, source_system "
+            "FROM affiliations WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY affiliation_type, coalesce(role_start_date, created_at::date) DESC",
+            student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["id"] = str(d["id"])
+        for k in ("role_start_date", "role_end_date"):
+            d[k] = d[k].isoformat() if d[k] else None
+        for k in ("weekly_hours", "total_hours"):
+            d[k] = float(d[k]) if d[k] is not None else None
+        out.append(d)
+    return {"student_id": student_id, "affiliations": out}
+
+
+@router.post("/student/{student_id}/affiliations")
+async def post_student_affiliations(request: Request, student_id: str, body: AffiliationsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try:
+                    _ = _uuid.UUID(did)
+                except Exception:
+                    continue
+                r = await conn.execute(
+                    "UPDATE affiliations SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"):
+                    deleted += 1
+            for it in body.items or []:
+                atype = (it.affiliation_type or "").strip()
+                if atype not in _AFFIL_TYPES:
+                    continue
+                name = (it.organization_name or "").strip()
+                if not name:
+                    continue
+                if it.id:
+                    try:
+                        _ = _uuid.UUID(it.id)
+                    except Exception:
+                        continue
+                    r = await conn.execute(
+                        "UPDATE affiliations SET affiliation_type=$3::affiliation_type_enum, "
+                        "organization_name=$4, organization_url=$5, organization_city=$6, "
+                        "organization_state=$7, role=$8, role_start_date=$9::date, "
+                        "role_end_date=$10::date, weekly_hours=$11, total_hours=$12, "
+                        "coach_name=$13, coach_email=$14, coach_role=$15, notes=$16, "
+                        "public_description=$17, updated_at=now(), updated_by=$18::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, atype, name, it.organization_url,
+                        it.organization_city, it.organization_state, it.role,
+                        it.role_start_date, it.role_end_date, it.weekly_hours,
+                        it.total_hours, it.coach_name, it.coach_email, it.coach_role,
+                        it.notes, it.public_description, user_id)
+                    if r and r.endswith(" 1"):
+                        updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO affiliations (tenant_id, student_id, affiliation_type, "
+                        "organization_name, organization_url, organization_city, organization_state, "
+                        "role, role_start_date, role_end_date, weekly_hours, total_hours, "
+                        "coach_name, coach_email, coach_role, notes, public_description, "
+                        "visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3::affiliation_type_enum,$4,$5,$6,$7,$8,"
+                        "$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,'private','parent_portal',"
+                        "$18::uuid,$18::uuid)",
+                        tenant_id, student_id, atype, name, it.organization_url,
+                        it.organization_city, it.organization_state, it.role,
+                        it.role_start_date, it.role_end_date, it.weekly_hours,
+                        it.total_hours, it.coach_name, it.coach_email, it.coach_role,
+                        it.notes, it.public_description, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
