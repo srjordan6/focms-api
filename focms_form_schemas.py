@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.27 · Higher Education: applications GET/POST + CIP majors catalog.
+v0.12.27a · fix: details column arrives as str via asyncpg; json-decode before .get.
+         v0.12.27 · Higher Education: applications GET/POST + CIP majors catalog.
          v0.12.26 · Higher Education: universities catalog + target-schools GET/POST.
          v0.12.25 · universal activity fields: skills_gained + show_on_showcase across affiliations, awards, sessions.
          v0.12.24 · Extracurricular expansion: programs picker, named-awards catalog, EC milestones catalog, awards GET/POST, sessions log GET/POST.
@@ -3330,7 +3331,12 @@ async def get_student_applications(request: Request, student_id: str):
         d["fee_paid_usd"] = float(d["fee_paid_usd"]) if d["fee_paid_usd"] is not None else None
         for k in ("deadline", "decision_release_date", "submitted_at"):
             d[k] = d[k].isoformat() if d[k] else None
+        import json as _json
         det = d.pop("details", None) or {}
+        if isinstance(det, str):
+            try: det = _json.loads(det)
+            except Exception: det = {}
+        if not isinstance(det, dict): det = {}
         d["term_starting"] = det.get("term_starting")
         d["possible_major_cip"] = det.get("possible_major_cip")
         d["possible_career"] = det.get("possible_career")
