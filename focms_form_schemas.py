@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.31 · Academics: per-grade year records with mid-year school-transfer support.
+v0.12.32 · Teacher registry (GET/POST) + universal band-aware school search proxy (DOE k12 / IPEDS college).
+         v0.12.31 · Academics: per-grade year records with mid-year school-transfer support.
          v0.12.30 · Academics: full school profile (CEEB, grading scale, class size, boarding, counselor) + report_cards GET/POST.
          v0.12.29 · Academics: current-school helper for prefill (name, address, phone).
          v0.12.28a · Academics band summary: coerce text grade values (PK, K, "9") to int before comparison.
@@ -802,7 +803,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.31)
+# Parent-portal capture endpoints (v0.12.32)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -4124,3 +4125,146 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
                             "WHERE id=$1::uuid AND visibility_locked=false", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.32 - Teacher registry + universal school search proxy
+# ======================================================================
+
+
+class TeacherItem(BaseModel):
+    id: Optional[str] = None
+    teacher_name: str
+    school_name: Optional[str] = None
+    school_leaid: Optional[str] = None
+    street_address: Optional[str] = None
+    city_town: Optional[str] = None
+    state_province: Optional[str] = None
+    zip_postal_code: Optional[str] = None
+    school_phone: Optional[str] = None
+    teacher_email: Optional[str] = None
+    subject_taught: Optional[str] = None
+    title_position: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TeachersRequest(BaseModel):
+    items: List[TeacherItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/teachers")
+async def get_teachers(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, teacher_name, school_name, school_leaid, "
+            "street_address, city_town, state_province, zip_postal_code, "
+            "school_phone, teacher_email, subject_taught, title_position, notes "
+            "FROM teachers WHERE (student_id=$1::uuid OR student_id IS NULL) "
+            "AND deleted_at IS NULL ORDER BY teacher_name",
+            student_id)
+    return {"student_id": student_id, "teachers": [dict(r) for r in rows]}
+
+
+@router.post("/student/{student_id}/teachers")
+async def post_teachers(request: Request, student_id: str, body: TeachersRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE teachers SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                nm = (it.teacher_name or "").strip()
+                if not nm: continue
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE teachers SET teacher_name=$2, school_name=$3, "
+                        "school_leaid=$4, street_address=$5, city_town=$6, "
+                        "state_province=$7, zip_postal_code=$8, school_phone=$9, "
+                        "teacher_email=$10, subject_taught=$11, title_position=$12, "
+                        "notes=$13, updated_at=now(), updated_by=$14::uuid "
+                        "WHERE id=$1::uuid AND deleted_at IS NULL",
+                        it.id, nm, it.school_name, it.school_leaid, it.street_address,
+                        it.city_town, it.state_province, it.zip_postal_code,
+                        it.school_phone, it.teacher_email, it.subject_taught,
+                        it.title_position, it.notes, user_id)
+                    if r and r.endswith(" 1"): updated += 1
+                else:
+                    await conn.execute(
+                        "INSERT INTO teachers (tenant_id, student_id, teacher_name, "
+                        "school_name, school_leaid, street_address, city_town, "
+                        "state_province, zip_postal_code, school_phone, teacher_email, "
+                        "subject_taught, title_position, notes, source_system, "
+                        "created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
+                        "$14,'parent_portal',$15::uuid,$15::uuid)",
+                        tenant_id, student_id, nm, it.school_name, it.school_leaid,
+                        it.street_address, it.city_town, it.state_province,
+                        it.zip_postal_code, it.school_phone, it.teacher_email,
+                        it.subject_taught, it.title_position, it.notes, user_id)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+@router.get("/catalogs/school-search")
+async def school_search(request: Request, q: str, level: str = "k12",
+                        state: Optional[str] = None, limit: int = 12):
+    """Band-aware school search. level=k12 -> DOE CCD; level=college -> IPEDS universities."""
+    _ = await _resolve_context(request)
+    q = (q or "").strip()
+    if len(q) < 3:
+        return {"results": []}
+    if level == "college":
+        pool: asyncpg.Pool = request.app.state.pool
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT leaid, name, common_name, city, state, us_news_rank "
+                "FROM universities WHERE name ILIKE $1 OR common_name ILIKE $1 "
+                "ORDER BY us_news_rank NULLS LAST, name LIMIT $2",
+                f"%{q}%", limit)
+        return {"results": [
+            {"name": r["name"], "common_name": r["common_name"],
+             "city": r["city"], "state": r["state"], "leaid": r["leaid"],
+             "us_news_rank": r["us_news_rank"], "street": None,
+             "zip": None, "phone": None} for r in rows]}
+    # k12 -> DOE CCD directory proxy
+    import urllib.request as _u, urllib.parse as _up, json as _json
+    url = ("https://educationdata.urban.org/api/v1/schools/ccd/directory/2021/?school_name="
+           + _up.quote(q))
+    try:
+        req = _u.Request(url, headers={"Accept": "application/json"})
+        with _u.urlopen(req, timeout=15) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        rows = data.get("results", []) or []
+    except Exception:
+        return {"results": [], "error": "doe_unavailable"}
+    if state:
+        st = state.upper()
+        rows = [r for r in rows
+                if str(r.get("state_location") or r.get("state_mailing") or "").upper() == st]
+    out = []
+    for r in rows[:limit]:
+        if not r.get("school_name"): continue
+        out.append({
+            "name": r.get("school_name"),
+            "city": r.get("city_location") or "",
+            "state": r.get("state_location") or "",
+            "street": r.get("street_mailing") or r.get("street_location") or "",
+            "zip": r.get("zip_mailing") or r.get("zip_location") or "",
+            "leaid": str(r.get("ncessch") or r.get("leaid") or ""),
+            "phone": r.get("phone") or "",
+        })
+    return {"results": out}
