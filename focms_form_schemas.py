@@ -1,7 +1,7 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.37 · UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
+v0.12.37a · fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
          v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
          v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
          v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
@@ -55,7 +55,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, List, Optional
 from uuid import UUID
 
 import asyncpg
