@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.25 · universal activity fields: skills_gained + show_on_showcase across affiliations, awards, sessions.
+v0.12.26 · Higher Education: universities catalog + target-schools GET/POST.
+         v0.12.25 · universal activity fields: skills_gained + show_on_showcase across affiliations, awards, sessions.
          v0.12.24 · Extracurricular expansion: programs picker, named-awards catalog, EC milestones catalog, awards GET/POST, sessions log GET/POST.
          v0.12.23 · Extra Curricular pillar: affiliations GET/POST for programs, activities, service orgs, coach relationships.
          v0.12.22 · SPS skills bucket is age-aware: denominator = age-appropriate + evidenced requirements; ahead-of-age skills count fully.
@@ -794,7 +795,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.25)
+# Parent-portal capture endpoints (v0.12.26)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -3110,5 +3111,154 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.location, it.related_affiliation_id or '', it.notes, user_id)
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.26 - Higher Education pillar: Target Universities
+# ======================================================================
+
+
+@router.get("/catalogs/universities")
+async def get_universities_catalog(request: Request, q: Optional[str] = None, limit: int = 50):
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        if q:
+            rows = await conn.fetch(
+                "SELECT leaid, name, common_name, city, state, us_news_rank, "
+                "admit_rate, has_rotc, has_d1_swim, is_service_academy, common_app_member "
+                "FROM universities WHERE name ILIKE $1 OR common_name ILIKE $1 "
+                "ORDER BY us_news_rank NULLS LAST, name LIMIT $2",
+                f"%{q}%", limit)
+        else:
+            rows = await conn.fetch(
+                "SELECT leaid, name, common_name, city, state, us_news_rank, "
+                "admit_rate, has_rotc, has_d1_swim, is_service_academy, common_app_member "
+                "FROM universities WHERE us_news_rank IS NOT NULL "
+                "ORDER BY us_news_rank NULLS LAST, name LIMIT $1", limit)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["admit_rate"] = float(d["admit_rate"]) if d["admit_rate"] is not None else None
+        out.append(d)
+    return {"universities": out}
+
+
+class TargetSchoolItem(BaseModel):
+    id: Optional[str] = None
+    university_leaid: str
+    priority: Optional[int] = None
+    pathways_pursuing: List[str] = []
+    fit_category: Optional[str] = None
+    interest_level: Optional[int] = None
+    program_of_interest: Optional[str] = None
+    why_interested: Optional[str] = None
+    advantages: Optional[str] = None
+    blockers: Optional[str] = None
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class TargetsRequest(BaseModel):
+    items: List[TargetSchoolItem] = []
+    delete_ids: List[str] = []
+
+
+_FIT_CATS = {"reach", "target", "likely", "safety"}
+_PATHWAYS = {"service_academy", "rotc", "academic_merit", "athletic", "regular"}
+
+
+@router.get("/student/{student_id}/target-schools")
+async def get_target_schools(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT t.id::text AS id, t.university_leaid, t.priority, t.pathways_pursuing, "
+            "t.fit_category, t.interest_level, t.program_of_interest, t.why_interested, "
+            "t.advantages, t.blockers, t.notes, t.public_description, "
+            "(t.visibility='public') AS show_on_showcase, "
+            "u.name AS university_name, u.common_name, u.city AS university_city, "
+            "u.state AS university_state, u.us_news_rank, u.admit_rate, "
+            "u.has_rotc, u.has_d1_swim, u.is_service_academy, u.common_app_member "
+            "FROM target_universities t "
+            "LEFT JOIN universities u ON u.leaid = t.university_leaid "
+            "WHERE t.student_id=$1::uuid AND t.deleted_at IS NULL AND t.is_active "
+            "ORDER BY t.priority NULLS LAST, u.us_news_rank NULLS LAST",
+            student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["admit_rate"] = float(d["admit_rate"]) if d["admit_rate"] is not None else None
+        d["pathways_pursuing"] = list(d["pathways_pursuing"] or [])
+        out.append(d)
+    return {"student_id": student_id, "targets": out}
+
+
+@router.post("/student/{student_id}/target-schools")
+async def post_target_schools(request: Request, student_id: str, body: TargetsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE target_universities SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                leaid = (it.university_leaid or "").strip()
+                if not leaid: continue
+                fit = it.fit_category if it.fit_category in _FIT_CATS else None
+                pathways = [p for p in (it.pathways_pursuing or []) if p in _PATHWAYS]
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE target_universities SET university_leaid=$3, priority=$4, "
+                        "pathways_pursuing=$5, fit_category=$6, interest_level=$7, "
+                        "program_of_interest=$8, why_interested=$9, advantages=$10, "
+                        "blockers=$11, notes=$12, public_description=$13, "
+                        "updated_at=now(), updated_by=$14::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, leaid, it.priority, pathways, fit,
+                        it.interest_level, it.program_of_interest, it.why_interested,
+                        it.advantages, it.blockers, it.notes, it.public_description, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute(
+                                "UPDATE target_universities SET visibility='public' "
+                                "WHERE id=$1::uuid AND student_id=$2::uuid AND visibility_locked=false",
+                                it.id, student_id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute(
+                                "UPDATE target_universities SET visibility='private' "
+                                "WHERE id=$1::uuid AND student_id=$2::uuid AND visibility_locked=false",
+                                it.id, student_id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO target_universities (tenant_id, student_id, university_leaid, "
+                        "priority, pathways_pursuing, fit_category, interest_level, "
+                        "program_of_interest, why_interested, advantages, blockers, notes, "
+                        "public_description, is_active, visibility, source_system, "
+                        "created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
+                        "true,'private','parent_portal',$14::uuid,$14::uuid) RETURNING id",
+                        tenant_id, student_id, leaid, it.priority, pathways, fit,
+                        it.interest_level, it.program_of_interest, it.why_interested,
+                        it.advantages, it.blockers, it.notes, it.public_description, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute(
+                            "UPDATE target_universities SET visibility='public' "
+                            "WHERE id=$1::uuid AND visibility_locked=false", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
