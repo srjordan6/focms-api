@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.38 · Career pillar: career-profile + job-experiences + references (covers standard employment application fields).
+v0.12.39 · Career: job_description field + meta-skill inference rule R10 (job title/description/skills -> meta-skills).
+         v0.12.38 · Career pillar: career-profile + job-experiences + references (covers standard employment application fields).
          v0.12.37b · languages: seed carries codes + is never cached (avoids poisoning). fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
          v0.12.36b · fix: use _pp_os (os not imported at module top). Languages catalog accepts GOOGLE_TRANSLATE_API_KEY or GOOGLE_PLACES_API_KEY.
          v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
@@ -2456,6 +2457,67 @@ async def _run_meta_inference(conn, tenant_id: str, student_id: str):
         _infer_add(findings, "ci_curiosity_driven_exploration", 3, "low", "cross_domain", ev_line)
         _infer_add(findings, "sm_life_balance", 3, "low", "cross_domain", ev_line)
 
+    # ---------- Rule R10: work experience -> meta-skills ----------
+    jobs = await conn.fetch(
+        "SELECT job_title, job_description, duties, skills_gained, is_paid, "
+        "start_date, end_date, is_current FROM job_experiences "
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+    if jobs:
+        n_jobs = len(jobs)
+        # Any job at all signals responsibility/work ethic.
+        titles = ", ".join([j["job_title"] for j in jobs if j["job_title"]][:4])
+        ev0 = f"{n_jobs} work experience record(s)" + (f": {titles}" if titles else "")
+        _infer_add(findings, "wd_responsibility", 3, "medium", "work_experience", ev0)
+        _infer_add(findings, "wd_work_ethic", 3, "medium", "work_experience", ev0)
+        _infer_add(findings, "rs_reliability", 3, "low", "work_experience", ev0)
+        if n_jobs >= 2:
+            _infer_add(findings, "wd_sustained_effort", 3, "low", "work_experience", ev0)
+
+        # Keyword map: token -> list of (meta_skill_code, score, confidence)
+        KW = {
+            "lead": [("rs_leadership", 4, "medium"), ("rs_delegation", 3, "low")],
+            "manage": [("rs_leadership", 4, "medium"), ("wd_organization", 3, "low")],
+            "supervis": [("rs_leadership", 4, "medium")],
+            "train": [("cm_teaching_others", 3, "medium"), ("rs_leadership", 3, "low")],
+            "mentor": [("cm_teaching_others", 3, "medium")],
+            "custom": [("rs_customer_orientation", 4, "medium"), ("cm_interpersonal_communication", 3, "low")],
+            "client": [("rs_customer_orientation", 4, "medium")],
+            "serv": [("rs_customer_orientation", 3, "low")],
+            "cash": [("wd_accountability", 3, "medium"), ("wd_attention_to_detail", 3, "low")],
+            "sale": [("cm_persuasion", 3, "medium"), ("rs_customer_orientation", 3, "low")],
+            "team": [("rs_collaboration", 4, "medium")],
+            "cook": [("wd_attention_to_detail", 3, "low"), ("es_stress_tolerance", 3, "low")],
+            "tutor": [("cm_teaching_others", 4, "medium"), ("la_knowledge_sharing", 3, "low")],
+            "coach": [("rs_leadership", 3, "medium"), ("cm_teaching_others", 3, "low")],
+            "volunteer": [("ci_service_orientation", 4, "medium")],
+            "intern": [("ci_professional_curiosity", 3, "low"), ("la_curiosity", 3, "low")],
+            "research": [("la_analytical_thinking", 3, "medium"), ("ci_curiosity_driven_exploration", 3, "low")],
+            "code": [("la_analytical_thinking", 3, "medium"), ("sm_self_direction", 3, "low")],
+            "design": [("ci_creativity", 3, "medium")],
+            "write": [("cm_written_communication", 3, "medium")],
+            "organiz": [("wd_organization", 3, "medium")],
+            "schedul": [("wd_time_management", 3, "medium")],
+            "deadline": [("wd_time_management", 3, "medium"), ("es_stress_tolerance", 3, "low")],
+            "budget": [("la_analytical_thinking", 3, "low"), ("wd_accountability", 3, "low")],
+            "safe": [("wd_conscientiousness", 3, "low")],
+            "detail": [("wd_attention_to_detail", 4, "medium")],
+        }
+        for j in jobs:
+            blob = " ".join(filter(None, [
+                (j["job_title"] or "").lower(),
+                (j["job_description"] or "").lower(),
+                (j["duties"] or "").lower(),
+                " ".join(j["skills_gained"] or []).lower(),
+            ]))
+            if not blob.strip():
+                continue
+            label = (j["job_title"] or "job").strip()
+            for token, metas in KW.items():
+                if token in blob:
+                    ev = f"work as '{label}' (matched '{token}' in role/description/skills)"
+                    for code, sc, cf in metas:
+                        _infer_add(findings, code, sc, cf, "work_experience", ev)
+
     return findings
 
 
@@ -4100,7 +4162,7 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
                         it.school_name, it.is_full_year, it.attendance_from,
                         it.attendance_to, it.gpa_unweighted, it.gpa_weighted,
                         it.days_present, it.days_absent, it.days_tardy, it.notes,
-                        it.public_description, user_id)
+                        it.public_description, user_id, it.job_description)
                     if r and r.endswith(" 1"):
                         if it.show_on_showcase is True:
                             await conn.execute(
@@ -4529,6 +4591,7 @@ class JobExperienceItem(BaseModel):
     end_date: Optional[str] = None
     is_current: Optional[bool] = None
     is_paid: Optional[bool] = None
+    job_description: Optional[str] = None
     duties: Optional[str] = None
     reason_for_leaving: Optional[str] = None
     starting_salary: Optional[str] = None
@@ -4556,7 +4619,7 @@ async def get_job_experiences(request: Request, student_id: str):
             "SELECT id::text AS id, job_title, company_name, supervisor_name, "
             "supervisor_phone, street_address, city_town, state_province, "
             "zip_postal_code, country, start_date, end_date, is_current, is_paid, "
-            "duties, reason_for_leaving, starting_salary, ending_salary, may_contact, "
+            "job_description, duties, reason_for_leaving, starting_salary, ending_salary, may_contact, "
             "hours_type, employment_status, skills_gained, notes, public_description, "
             "(visibility='public') AS show_on_showcase "
             "FROM job_experiences WHERE student_id=$1::uuid AND deleted_at IS NULL "
@@ -4597,7 +4660,7 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                         "supervisor_name=$5, supervisor_phone=$6, street_address=$7, "
                         "city_town=$8, state_province=$9, zip_postal_code=$10, country=$11, "
                         "start_date=$12::date, end_date=$13::date, is_current=$14, is_paid=$15, "
-                        "duties=$16, reason_for_leaving=$17, starting_salary=$18, "
+                        "job_description=$27, duties=$16, reason_for_leaving=$17, starting_salary=$18, "
                         "ending_salary=$19, may_contact=$20, hours_type=$21, "
                         "employment_status=$22, skills_gained=$23, notes=$24, "
                         "public_description=$25, updated_at=now(), updated_by=$26::uuid "
@@ -4623,9 +4686,9 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                         "end_date, is_current, is_paid, duties, reason_for_leaving, "
                         "starting_salary, ending_salary, may_contact, hours_type, "
                         "employment_status, skills_gained, notes, public_description, "
-                        "visibility, source_system, created_by, updated_by) "
+                        "job_description, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::date,"
-                        "$13::date,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,"
+                        "$13::date,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$27,"
                         "'private','parent_portal',$26::uuid,$26::uuid) RETURNING id",
                         tenant_id, student_id, it.job_title, it.company_name, it.supervisor_name,
                         it.supervisor_phone, it.street_address, it.city_town, it.state_province,
@@ -4633,10 +4696,14 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                         it.is_current, it.is_paid, it.duties, it.reason_for_leaving,
                         it.starting_salary, it.ending_salary, it.may_contact, it.hours_type,
                         it.employment_status, list(it.skills_gained or []), it.notes,
-                        it.public_description, user_id)
+                        it.public_description, user_id, it.job_description)
                     if it.show_on_showcase is True:
                         await conn.execute("UPDATE job_experiences SET visibility='public' WHERE id=$1::uuid AND visibility_locked=false", rid)
                     saved += 1
+        try:
+            await _write_inferences(conn, tenant_id, student_id, user_id)
+        except Exception:
+            pass
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
 
