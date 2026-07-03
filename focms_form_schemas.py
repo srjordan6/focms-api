@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.40 · Higher-Ed: essays + recommenders + financial-aid + college-tests GET/POST.
+v0.12.41 · Essay Studio: /catalogs/essay-guidance, /essays/sample (AI, env-swappable), /essays/{id}/autosave (versioned), /essays/{id}/versions.
+         v0.12.40 · Higher-Ed: essays + recommenders + financial-aid + college-tests GET/POST.
          v0.12.39 · Career: job_description field + meta-skill inference rule R10 (job title/description/skills -> meta-skills).
          v0.12.38 · Career pillar: career-profile + job-experiences + references (covers standard employment application fields).
          v0.12.37b · languages: seed carries codes + is never cached (avoids poisoning). fix: import List (Pydantic rebuild). UI-string runtime translation via Google (DB-cached per locale) — every Google language works, English is source.
@@ -5180,3 +5181,225 @@ async def post_college_tests(request: Request, student_id: str, body: ColTestReq
                         await conn.execute("UPDATE college_test_scores SET visibility='public' WHERE id=$1::uuid", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.41 - Essay Studio: prompt guidance, AI sample, versioned autosave
+# ======================================================================
+
+import os as _es_os
+try:
+    import httpx as _es_httpx
+except Exception:
+    _es_httpx = None
+
+
+@router.get("/catalogs/essay-guidance")
+async def get_essay_guidance(request: Request):
+    """Public reference catalog: the 7 Common App prompts with strategy notes."""
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT code, prompt_number, title, prompt_text, hidden_question, best_for, "
+            "common_trap, strategy, route FROM essay_prompt_guidance "
+            "WHERE is_active ORDER BY sort_order")
+    return {"prompts": [dict(r) for r in rows]}
+
+
+async def _gather_student_essay_context(conn, student_id: str) -> dict:
+    """Pull the strongest narrative signals from the student's record."""
+    ctx = {}
+    srow = await conn.fetchrow(
+        "SELECT first_name, current_grade FROM students WHERE id=$1::uuid", student_id)
+    if srow:
+        ctx["first_name"] = srow["first_name"]
+        ctx["grade_level"] = srow["current_grade"]
+    # top awards
+    aw = await conn.fetch(
+        "SELECT award_name, description, granting_organization, level, rank_or_placement, awarded_date "
+        "FROM awards_honors WHERE student_id=$1::uuid AND deleted_at IS NULL "
+        "ORDER BY awarded_date DESC NULLS LAST LIMIT 8", student_id)
+    ctx["awards"] = [
+        {"award_name": r["award_name"], "description": r["description"],
+         "organization": r["granting_organization"], "level": r["level"],
+         "placement": r["rank_or_placement"],
+         "date": r["awarded_date"].isoformat() if r["awarded_date"] else None}
+        for r in aw]
+    # affiliations / activities with sustained involvement
+    af = await conn.fetch(
+        "SELECT organization_name, role, affiliation_type, notes, weekly_hours, total_hours, "
+        "role_start_date, role_end_date FROM affiliations "
+        "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+        "ORDER BY role_start_date DESC NULLS LAST LIMIT 10", student_id)
+    ctx["affiliations"] = [
+        {"organization_name": r["organization_name"], "role": r["role"],
+         "type": r["affiliation_type"], "notes": r["notes"],
+         "weekly_hours": float(r["weekly_hours"]) if r["weekly_hours"] is not None else None,
+         "total_hours": float(r["total_hours"]) if r["total_hours"] is not None else None,
+         "start": r["role_start_date"].isoformat() if r["role_start_date"] else None,
+         "end": r["role_end_date"].isoformat() if r["role_end_date"] else None}
+        for r in af]
+    # event volume by type (shows sustained practice)
+    ev = await conn.fetch(
+        "SELECT event_type, count(*) AS n, min(event_date) AS first, max(event_date) AS last "
+        "FROM events WHERE student_id=$1::uuid AND deleted_at IS NULL AND event_date IS NOT NULL "
+        "GROUP BY event_type ORDER BY count(*) DESC LIMIT 6", student_id)
+    ctx["activity_volume"] = [
+        {"event_type": r["event_type"], "count": int(r["n"]),
+         "first": r["first"].isoformat() if r["first"] else None,
+         "last": r["last"].isoformat() if r["last"] else None} for r in ev]
+    # inferred meta-skills (top signals)
+    ms = await conn.fetch(
+        "SELECT meta_skill_code, score, evidence FROM meta_skill_inferences "
+        "WHERE student_id=$1::uuid ORDER BY score DESC LIMIT 12", student_id)
+    ctx["meta_skills"] = [
+        {"code": r["meta_skill_code"], "score": r["score"]} for r in ms]
+    return ctx
+
+
+class EssaySampleRequest(BaseModel):
+    prompt_code: Optional[str] = None
+    prompt_text: Optional[str] = None
+    word_limit: Optional[int] = 650
+
+
+@router.post("/student/{student_id}/essays/sample")
+async def generate_essay_sample(request: Request, student_id: str, body: EssaySampleRequest):
+    """Generate a first-person sample essay grounded in the student's real record.
+    Model provider is swappable via env (ANTHROPIC_API_KEY / FOCMS_LLM_*)."""
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        sctx = await _gather_student_essay_context(conn, student_id)
+        guide = None
+        if body.prompt_code:
+            g = await conn.fetchrow(
+                "SELECT title, prompt_text, hidden_question, common_trap, strategy "
+                "FROM essay_prompt_guidance WHERE code=$1", body.prompt_code)
+            guide = dict(g) if g else None
+
+    prompt_text = body.prompt_text or (guide or {}).get("prompt_text") or "Share a meaningful story about yourself."
+    strategy = (guide or {}).get("strategy", "")
+    trap = (guide or {}).get("common_trap", "")
+    hidden = (guide or {}).get("hidden_question", "")
+    wl = body.word_limit or 650
+
+    api_key = _es_os.environ.get("ANTHROPIC_API_KEY") or _es_os.environ.get("FOCMS_LLM_API_KEY")
+    model = _es_os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
+    if not api_key or _es_httpx is None:
+        return {
+            "sample": None,
+            "unavailable": True,
+            "reason": "No LLM provider configured. Set ANTHROPIC_API_KEY (or FOCMS_LLM_API_KEY) in the environment.",
+            "context_used": sctx,
+        }
+
+    sys = (
+        "You are helping a high-school student see what a strong Common App essay could look like, "
+        "written in their own authentic first-person voice. Use ONLY the facts provided about the student. "
+        "Do not invent achievements, awards, or events not in the record. If the record is thin, write a "
+        "smaller, honest, sensory story rather than fabricating accomplishments. This is a SAMPLE to inspire "
+        "their own writing, not a final essay. Aim for about " + str(wl) + " words."
+    )
+    user = (
+        "PROMPT:\n" + prompt_text + "\n\n"
+        + ("WHAT ADMISSIONS IS REALLY ASKING: " + hidden + "\n" if hidden else "")
+        + ("STRATEGY TO FOLLOW: " + strategy + "\n" if strategy else "")
+        + ("AVOID THIS TRAP: " + trap + "\n" if trap else "")
+        + "\nSTUDENT RECORD (facts you may draw from):\n"
+        + json.dumps(sctx, default=str, indent=2)
+        + "\n\nWrite the sample essay now, first person, no title, no preamble."
+    )
+    try:
+        async with _es_httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": model, "max_tokens": 1500,
+                      "system": sys, "messages": [{"role": "user", "content": user}]})
+        if resp.status_code != 200:
+            return {"sample": None, "unavailable": True,
+                    "reason": f"LLM error {resp.status_code}", "context_used": sctx}
+        data = resp.json()
+        text = "".join([b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"])
+        return {"sample": text.strip(), "context_used": sctx, "model": model}
+    except Exception as e:
+        return {"sample": None, "unavailable": True, "reason": str(e), "context_used": sctx}
+
+
+class EssayAutosaveRequest(BaseModel):
+    body_content: str = ""
+    essay_title: Optional[str] = None
+    snapshot: bool = False   # True = commit a numbered version into draft_history
+
+
+@router.post("/student/{student_id}/essays/{essay_id}/autosave")
+async def autosave_essay(request: Request, student_id: str, essay_id: str, body: EssayAutosaveRequest):
+    """Debounced autosave. Always updates body_content + word_count.
+    When snapshot=True, also appends the prior body to draft_history and bumps current_version."""
+    tenant_id, user_id = await _pp_context(request, student_id)
+    try:
+        _uuid.UUID(essay_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad essay id")
+    wc = len([w for w in (body.body_content or "").split() if w])
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            cur = await conn.fetchrow(
+                "SELECT body_content, current_version, draft_history FROM essays "
+                "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                essay_id, student_id)
+            if not cur:
+                raise HTTPException(status_code=404, detail="essay not found")
+            new_version = cur["current_version"] or 1
+            if body.snapshot:
+                hist = cur["draft_history"]
+                if isinstance(hist, str):
+                    try: hist = json.loads(hist)
+                    except Exception: hist = []
+                hist = hist or []
+                prev = cur["body_content"] or ""
+                prev_wc = len([w for w in prev.split() if w])
+                hist.append({
+                    "version": cur["current_version"] or 1,
+                    "saved_at": datetime.utcnow().isoformat() + "Z",
+                    "word_count": prev_wc,
+                    "body_content": prev,
+                })
+                hist = hist[-30:]  # cap stored versions
+                new_version = (cur["current_version"] or 1) + 1
+                await conn.execute(
+                    "UPDATE essays SET body_content=$3, word_count=$4, essay_title=COALESCE($5, essay_title), "
+                    "draft_history=$6::jsonb, current_version=$7, updated_at=now(), updated_by=$8::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid",
+                    essay_id, student_id, body.body_content, wc, body.essay_title,
+                    json.dumps(hist), new_version, user_id)
+            else:
+                await conn.execute(
+                    "UPDATE essays SET body_content=$3, word_count=$4, essay_title=COALESCE($5, essay_title), "
+                    "updated_at=now(), updated_by=$6::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
+                    essay_id, student_id, body.body_content, wc, body.essay_title, user_id)
+    return {"saved": True, "word_count": wc, "current_version": new_version, "snapshot": body.snapshot}
+
+
+@router.get("/student/{student_id}/essays/{essay_id}/versions")
+async def get_essay_versions(request: Request, student_id: str, essay_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT current_version, draft_history FROM essays "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+            essay_id, student_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="essay not found")
+    hist = row["draft_history"]
+    if isinstance(hist, str):
+        try: hist = json.loads(hist)
+        except Exception: hist = []
+    return {"current_version": row["current_version"], "versions": hist or []}
