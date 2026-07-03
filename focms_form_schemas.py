@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
+v0.12.36 · Languages catalog from Google Translate (24h cache, seed fallback).
+         v0.12.35 · Tenant locale GET/POST (UI language en-US/es-ES).
          v0.12.34 · Personal: residence_country persisted on SPD; used as global default country for all address/school pickers.
          v0.12.33a · school-search K-12 queries k12_schools (per-school CCD, pg_trgm); state optional, no live DOE call.
          v0.12.32 · Teacher registry (GET/POST) + universal band-aware school search proxy (DOE k12 / IPEDS college).
@@ -4309,3 +4310,48 @@ async def set_tenant_locale(request: Request, body: LocaleBody):
                 "UPDATE tenants SET locale=$2, updated_at=now() WHERE id=$1::uuid",
                 tenant_id, loc)
     return {"tenant_id": tenant_id, "locale": loc}
+
+
+# ======================================================================
+# v0.12.36 - Google-supported languages catalog (for demographic dropdowns)
+# ======================================================================
+
+_LANG_CACHE: dict = {"ts": 0, "data": None}
+
+
+@router.get("/catalogs/languages")
+async def get_languages_catalog(request: Request, target: str = "en"):
+    """Return Google Cloud Translation supported languages. Cached 24h.
+    Falls back to a built-in seed list if GOOGLE_TRANSLATE_API_KEY is unset
+    or the call fails."""
+    import time as _t
+    _ = await _resolve_context(request)
+    now = _t.time()
+    if _LANG_CACHE["data"] and now - _LANG_CACHE["ts"] < 86400:
+        return {"languages": _LANG_CACHE["data"], "cached": True}
+    key = os.environ.get("GOOGLE_TRANSLATE_API_KEY")
+    langs = None
+    if key:
+        import urllib.request as _u, urllib.parse as _up, json as _json
+        try:
+            url = ("https://translation.googleapis.com/language/translate/v2/languages?"
+                   + _up.urlencode({"key": key, "target": target}))
+            req = _u.Request(url, headers={"Accept": "application/json"})
+            with _u.urlopen(req, timeout=15) as resp:
+                data = _json.loads(resp.read().decode("utf-8"))
+            rows = data.get("data", {}).get("languages", [])
+            langs = [{"code": r.get("language"), "name": r.get("name") or r.get("language")}
+                     for r in rows if r.get("language")]
+            langs.sort(key=lambda x: x["name"].lower())
+        except Exception:
+            langs = None
+    if not langs:
+        seed = ["English","Spanish","Mandarin Chinese","Cantonese","Hindi","Arabic",
+                "French","Korean","Vietnamese","Tagalog","Portuguese","Russian","German",
+                "Japanese","Urdu","Punjabi","Bengali","Persian","Gujarati","Tamil","Telugu",
+                "Italian","Polish","Turkish","Ukrainian","Hebrew","Thai","Amharic","Somali",
+                "Haitian Creole","Nepali","Burmese","Swahili"]
+        langs = [{"code": None, "name": n} for n in seed]
+    _LANG_CACHE["data"] = langs
+    _LANG_CACHE["ts"] = now
+    return {"languages": langs, "cached": False}
