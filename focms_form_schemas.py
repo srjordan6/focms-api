@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.28a · Academics band summary: coerce text grade values (PK, K, "9") to int before comparison.
+v0.12.29 · Academics: current-school helper for prefill (name, address, phone).
+         v0.12.28a · Academics band summary: coerce text grade values (PK, K, "9") to int before comparison.
          v0.12.28 · Academics grade-band scoping: summary + courses GET/POST filtered by band (preschool/elementary/middle/high).
          v0.12.27a · fix: details column arrives as str via asyncpg; json-decode before .get.
          v0.12.27 · Higher Education: applications GET/POST + CIP majors catalog.
@@ -799,7 +800,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.28)
+# Parent-portal capture endpoints (v0.12.29)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -3639,3 +3640,31 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                             "WHERE id=$1::uuid", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.29 - Current school context helper
+# ======================================================================
+
+
+@router.get("/student/{student_id}/current-school")
+async def get_current_school(request: Request, student_id: str):
+    """Best-effort current-school context for prefilling course/school fields."""
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT school_name, school_ceeb_code, street_address, city_town, "
+            "state_province, zip_postal_code, formatted_address, "
+            "counselor_phone, counselor_phone_e164, "
+            "grade_levels_attended, is_current_school "
+            "FROM student_school_enrollments "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY is_current_school DESC NULLS LAST, "
+            "coalesce(end_date, current_date + 3650) DESC "
+            "LIMIT 1", student_id)
+    if not row:
+        return {"student_id": student_id, "school": None}
+    d = dict(row)
+    d["grade_levels_attended"] = list(d["grade_levels_attended"] or [])
+    return {"student_id": student_id, "school": d}
