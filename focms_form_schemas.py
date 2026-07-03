@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.26 · Higher Education: universities catalog + target-schools GET/POST.
+v0.12.27 · Higher Education: applications GET/POST + CIP majors catalog.
+         v0.12.26 · Higher Education: universities catalog + target-schools GET/POST.
          v0.12.25 · universal activity fields: skills_gained + show_on_showcase across affiliations, awards, sessions.
          v0.12.24 · Extracurricular expansion: programs picker, named-awards catalog, EC milestones catalog, awards GET/POST, sessions log GET/POST.
          v0.12.23 · Extra Curricular pillar: affiliations GET/POST for programs, activities, service orgs, coach relationships.
@@ -795,7 +796,7 @@ def _row_to_dict(row: asyncpg.Record) -> dict:
 
 
 # ===========================================================================
-# Parent-portal capture endpoints (v0.12.26)
+# Parent-portal capture endpoints (v0.12.27)
 #   + identity-documents: proof of age gates under-10 free access
 # ===========================================================================
 from datetime import date as _pp_date
@@ -3262,3 +3263,173 @@ async def post_target_schools(request: Request, student_id: str, body: TargetsRe
                             "WHERE id=$1::uuid AND visibility_locked=false", rid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# ======================================================================
+# v0.12.27 - Higher Education: Applications & Deadlines
+# ======================================================================
+
+_DECISION_PLANS = {"ed1", "ed2", "ea", "rea", "rd", "rd2", "rolling", "priority"}
+_APP_PLATFORMS  = {"common_app", "coalition", "uca", "institutional", "questbridge", "scoir", "other"}
+
+
+class ApplicationItem(BaseModel):
+    id: Optional[str] = None
+    university_leaid: str
+    target_university_id: Optional[str] = None
+    application_year: Optional[int] = None
+    term_starting: Optional[str] = None   # stored in details.term_starting
+    possible_major_cip: Optional[str] = None
+    possible_career: Optional[str] = None
+    decision_plan: Optional[str] = None
+    application_platform: Optional[str] = None
+    pathway_track: Optional[str] = None
+    status: Optional[str] = None
+    deadline: Optional[str] = None
+    decision_release_date: Optional[str] = None
+    submitted_at: Optional[str] = None
+    portal_url: Optional[str] = None       # stored in details.portal_url
+    portal_username: Optional[str] = None  # stored in details.portal_username
+    fee_paid_usd: Optional[float] = None
+    fee_waiver_used: Optional[bool] = None
+    ed_signature_date: Optional[str] = None  # details.ed_signature_date
+    notes: Optional[str] = None
+    public_description: Optional[str] = None
+    show_on_showcase: Optional[bool] = None
+
+
+class ApplicationsRequest(BaseModel):
+    items: List[ApplicationItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/applications")
+async def get_student_applications(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT a.id::text AS id, a.university_leaid, "
+            "a.target_university_id::text AS target_university_id, "
+            "a.application_year, a.decision_plan, a.application_platform, "
+            "a.status::text AS status, a.pathway_track::text AS pathway_track, "
+            "a.deadline, a.decision_release_date, a.submitted_at, "
+            "a.fee_paid_usd, a.fee_waiver_used, a.details, "
+            "a.notes, a.public_description, "
+            "(a.visibility='public') AS show_on_showcase, "
+            "u.name AS university_name, u.common_name, u.city AS university_city, "
+            "u.state AS university_state, u.us_news_rank "
+            "FROM applications a "
+            "LEFT JOIN universities u ON u.leaid = a.university_leaid "
+            "WHERE a.student_id=$1::uuid AND a.deleted_at IS NULL "
+            "ORDER BY a.deadline NULLS LAST, u.us_news_rank NULLS LAST",
+            student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["fee_paid_usd"] = float(d["fee_paid_usd"]) if d["fee_paid_usd"] is not None else None
+        for k in ("deadline", "decision_release_date", "submitted_at"):
+            d[k] = d[k].isoformat() if d[k] else None
+        det = d.pop("details", None) or {}
+        d["term_starting"] = det.get("term_starting")
+        d["possible_major_cip"] = det.get("possible_major_cip")
+        d["possible_career"] = det.get("possible_career")
+        d["portal_url"] = det.get("portal_url")
+        d["portal_username"] = det.get("portal_username")
+        d["ed_signature_date"] = det.get("ed_signature_date")
+        out.append(d)
+    return {"student_id": student_id, "applications": out}
+
+
+@router.post("/student/{student_id}/applications")
+async def post_student_applications(request: Request, student_id: str, body: ApplicationsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = updated = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                r = await conn.execute(
+                    "UPDATE applications SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                if r and r.endswith(" 1"): deleted += 1
+            for it in body.items or []:
+                leaid = (it.university_leaid or "").strip()
+                if not leaid: continue
+                plan = it.decision_plan if (it.decision_plan or "").strip() in _DECISION_PLANS else None
+                plat = it.application_platform if (it.application_platform or "").strip() in _APP_PLATFORMS else None
+                details = {}
+                for k in ("term_starting", "possible_major_cip", "possible_career",
+                          "portal_url", "portal_username", "ed_signature_date"):
+                    v = getattr(it, k, None)
+                    if v: details[k] = v
+                import json as _json
+                det_json = _json.dumps(details) if details else None
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    r = await conn.execute(
+                        "UPDATE applications SET university_leaid=$3, "
+                        "application_year=$4, decision_plan=$5, application_platform=$6, "
+                        "pathway_track=$7::pathway_enum, deadline=$8::date, "
+                        "decision_release_date=$9::date, submitted_at=$10::date, "
+                        "fee_paid_usd=$11, fee_waiver_used=$12, "
+                        "details = COALESCE(details, '{}'::jsonb) || COALESCE($13::jsonb, '{}'::jsonb), "
+                        "notes=$14, public_description=$15, "
+                        "updated_at=now(), updated_by=$16::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, leaid, it.application_year, plan, plat,
+                        it.pathway_track, it.deadline, it.decision_release_date,
+                        it.submitted_at, it.fee_paid_usd, it.fee_waiver_used,
+                        det_json, it.notes, it.public_description, user_id)
+                    if r and r.endswith(" 1"):
+                        if it.show_on_showcase is True:
+                            await conn.execute(
+                                "UPDATE applications SET visibility='public' "
+                                "WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute(
+                                "UPDATE applications SET visibility='private' "
+                                "WHERE id=$1::uuid AND visibility_locked=false", it.id)
+                        updated += 1
+                else:
+                    rid = await conn.fetchval(
+                        "INSERT INTO applications (tenant_id, student_id, university_leaid, "
+                        "application_year, decision_plan, application_platform, "
+                        "pathway_track, deadline, decision_release_date, submitted_at, "
+                        "fee_paid_usd, fee_waiver_used, details, notes, public_description, "
+                        "status, visibility, source_system, created_by, updated_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,"
+                        "NULLIF($7,'')::pathway_enum,$8::date,$9::date,$10::date,"
+                        "$11,$12,$13::jsonb,$14,$15,'planning','private','parent_portal',"
+                        "$16::uuid,$16::uuid) RETURNING id",
+                        tenant_id, student_id, leaid, it.application_year, plan, plat,
+                        it.pathway_track, it.deadline, it.decision_release_date,
+                        it.submitted_at, it.fee_paid_usd, it.fee_waiver_used,
+                        det_json, it.notes, it.public_description, user_id)
+                    if it.show_on_showcase is True:
+                        await conn.execute(
+                            "UPDATE applications SET visibility='public' "
+                            "WHERE id=$1::uuid AND visibility_locked=false", rid)
+                    saved += 1
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+@router.get("/catalogs/cip-majors")
+async def get_cip_majors_catalog(request: Request, q: Optional[str] = None):
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        if q:
+            rows = await conn.fetch(
+                "SELECT cip_code, title FROM cip_majors "
+                "WHERE is_active AND title ILIKE $1 ORDER BY title LIMIT 100",
+                f"%{q}%")
+        else:
+            rows = await conn.fetch(
+                "SELECT cip_code, title FROM cip_majors WHERE is_active ORDER BY title")
+    return {"majors": [dict(r) for r in rows]}
