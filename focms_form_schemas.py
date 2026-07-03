@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.41 · Essay Studio: /catalogs/essay-guidance, /essays/sample (AI, env-swappable), /essays/{id}/autosave (versioned), /essays/{id}/versions.
+v0.12.42 · Essay analysis (/essays/{id}/analyze) + exemplar corpus (/catalogs/essay-exemplars, /admin/essay-exemplars); shared _llm_complete adapter shim (provider-swappable). 
+         v0.12.41 · Essay Studio: /catalogs/essay-guidance, /essays/sample (AI, env-swappable), /essays/{id}/autosave (versioned), /essays/{id}/versions.
          v0.12.40 · Higher-Ed: essays + recommenders + financial-aid + college-tests GET/POST.
          v0.12.39 · Career: job_description field + meta-skill inference rule R10 (job title/description/skills -> meta-skills).
          v0.12.38 · Career pillar: career-profile + job-experiences + references (covers standard employment application fields).
@@ -5286,16 +5287,6 @@ async def generate_essay_sample(request: Request, student_id: str, body: EssaySa
     hidden = (guide or {}).get("hidden_question", "")
     wl = body.word_limit or 650
 
-    api_key = _es_os.environ.get("ANTHROPIC_API_KEY") or _es_os.environ.get("FOCMS_LLM_API_KEY")
-    model = _es_os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
-    if not api_key or _es_httpx is None:
-        return {
-            "sample": None,
-            "unavailable": True,
-            "reason": "No LLM provider configured. Set ANTHROPIC_API_KEY (or FOCMS_LLM_API_KEY) in the environment.",
-            "context_used": sctx,
-        }
-
     sys = (
         "You are helping a high-school student see what a strong Common App essay could look like, "
         "written in their own authentic first-person voice. Use ONLY the facts provided about the student. "
@@ -5312,22 +5303,10 @@ async def generate_essay_sample(request: Request, student_id: str, body: EssaySa
         + json.dumps(sctx, default=str, indent=2)
         + "\n\nWrite the sample essay now, first person, no title, no preamble."
     )
-    try:
-        async with _es_httpx.AsyncClient(timeout=60) as client:
-            resp = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json={"model": model, "max_tokens": 1500,
-                      "system": sys, "messages": [{"role": "user", "content": user}]})
-        if resp.status_code != 200:
-            return {"sample": None, "unavailable": True,
-                    "reason": f"LLM error {resp.status_code}", "context_used": sctx}
-        data = resp.json()
-        text = "".join([b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"])
-        return {"sample": text.strip(), "context_used": sctx, "model": model}
-    except Exception as e:
-        return {"sample": None, "unavailable": True, "reason": str(e), "context_used": sctx}
+    res = await _llm_complete(sys, user, max_tokens=1500)
+    if res.get("unavailable"):
+        return {"sample": None, "unavailable": True, "reason": res["reason"], "context_used": sctx}
+    return {"sample": res.get("text", ""), "context_used": sctx, "model": res.get("model")}
 
 
 class EssayAutosaveRequest(BaseModel):
@@ -5403,3 +5382,230 @@ async def get_essay_versions(request: Request, student_id: str, essay_id: str):
         try: hist = json.loads(hist)
         except Exception: hist = []
     return {"current_version": row["current_version"], "versions": hist or []}
+
+
+# ======================================================================
+# v0.12.42 - Essay analysis + exemplar corpus; shared LLM adapter shim
+# ======================================================================
+
+async def _llm_complete(system: str, user: str, max_tokens: int = 1500) -> dict:
+    """Provider-swappable completion. Set FOCMS_LLM_PROVIDER=anthropic|openai_compatible.
+    Returns {"text": str} or {"unavailable": True, "reason": str}.
+    Interim shim until focms_llm_adapter.py lands; keeps all call sites uniform."""
+    if _es_httpx is None:
+        return {"unavailable": True, "reason": "httpx not installed"}
+    provider = _es_os.environ.get("FOCMS_LLM_PROVIDER", "anthropic").lower()
+    api_key = _es_os.environ.get("FOCMS_LLM_API_KEY") or _es_os.environ.get("ANTHROPIC_API_KEY")
+    model = _es_os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
+    if not api_key:
+        return {"unavailable": True, "reason": "No LLM provider configured. Set FOCMS_LLM_API_KEY (or ANTHROPIC_API_KEY)."}
+    try:
+        if provider == "openai_compatible":
+            base = _es_os.environ.get("FOCMS_LLM_BASE_URL", "").rstrip("/")
+            if not base:
+                return {"unavailable": True, "reason": "FOCMS_LLM_BASE_URL required for openai_compatible."}
+            async with _es_httpx.AsyncClient(timeout=90) as client:
+                r = await client.post(base + "/chat/completions",
+                    headers={"Authorization": "Bearer " + api_key, "content-type": "application/json"},
+                    json={"model": model, "max_tokens": max_tokens,
+                          "messages": [{"role": "system", "content": system},
+                                       {"role": "user", "content": user}]})
+            if r.status_code != 200:
+                return {"unavailable": True, "reason": f"LLM error {r.status_code}: {r.text[:200]}"}
+            d = r.json()
+            return {"text": d["choices"][0]["message"]["content"].strip(), "model": model}
+        else:  # anthropic
+            base = _es_os.environ.get("FOCMS_LLM_BASE_URL", "https://api.anthropic.com").rstrip("/")
+            async with _es_httpx.AsyncClient(timeout=90) as client:
+                r = await client.post(base + "/v1/messages",
+                    headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+                    json={"model": model, "max_tokens": max_tokens, "system": system,
+                          "messages": [{"role": "user", "content": user}]})
+            if r.status_code != 200:
+                return {"unavailable": True, "reason": f"LLM error {r.status_code}: {r.text[:200]}"}
+            d = r.json()
+            txt = "".join([b.get("text", "") for b in d.get("content", []) if b.get("type") == "text"])
+            return {"text": txt.strip(), "model": model}
+    except Exception as e:
+        return {"unavailable": True, "reason": str(e)}
+
+
+def _extract_json(text: str):
+    """Pull the first JSON object from an LLM reply."""
+    import re as _re
+    if not text:
+        return None
+    m = _re.search(r"\{.*\}", text, _re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+@router.post("/student/{student_id}/essays/{essay_id}/analyze")
+async def analyze_essay(request: Request, student_id: str, essay_id: str):
+    """Score the essay against an admissions rubric and return concrete recommendations.
+    Learns the rubric partly from the exemplar corpus (what worked before)."""
+    tenant_id, user_id = await _pp_context(request, student_id)
+    try:
+        _uuid.UUID(essay_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="bad essay id")
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT essay_title, prompt_text, word_limit, body_content FROM essays "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+            essay_id, student_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="essay not found")
+        # pull a few exemplar trait sets for calibration
+        ex = await conn.fetch(
+            "SELECT strengths, techniques, why_it_worked FROM essay_exemplars "
+            "WHERE is_active ORDER BY created_at DESC LIMIT 5")
+    body = (row["body_content"] or "").replace("\n", " ")
+    # strip html tags the rich editor may have added
+    import re as _re2
+    body = _re2.sub(r"<[^>]+>", " ", body)
+    body = _re2.sub(r"\s+", " ", body).strip()
+    if len(body) < 40:
+        return {"unavailable": True, "reason": "Essay is too short to analyze yet. Write a draft first."}
+    calib = [dict(e) for e in ex]
+
+    system = (
+        "You are a veteran US college admissions reader. Evaluate a student's application essay and "
+        "return STRICT JSON only, no prose outside the JSON. Be specific and honest but constructive; "
+        "cite phrases from the essay. Schema: {\"overall_score\": int 1-10, \"scores\": {\"hook\": int 1-5, "
+        "\"authentic_voice\": int 1-5, \"specificity\": int 1-5, \"internal_growth\": int 1-5, "
+        "\"structure\": int 1-5, \"prompt_fit\": int 1-5}, \"strengths\": [str], \"priority_fixes\": "
+        "[{\"issue\": str, \"why\": str, \"how\": str}], \"line_edits\": [{\"quote\": str, \"suggestion\": str}], "
+        "\"one_thing\": str}. line_edits max 5, priority_fixes max 4."
+    )
+    user = (
+        "PROMPT:\n" + (row["prompt_text"] or "(none given)") + "\n"
+        + "WORD LIMIT: " + str(row["word_limit"] or "n/a") + "\n\n"
+        + "ESSAY:\n" + body + "\n\n"
+        + ("WHAT HAS WORKED IN STRONG ESSAYS (for calibration):\n" + json.dumps(calib, default=str)[:1500] + "\n\n" if calib else "")
+        + "Return the JSON now."
+    )
+    res = await _llm_complete(system, user, max_tokens=1800)
+    if res.get("unavailable"):
+        return {"unavailable": True, "reason": res["reason"]}
+    parsed = _extract_json(res.get("text", ""))
+    if not parsed:
+        return {"unavailable": True, "reason": "Could not parse analysis. Try again."}
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            await conn.execute(
+                "UPDATE essays SET analysis=$3::jsonb, analysis_at=now(), updated_by=$4::uuid "
+                "WHERE id=$1::uuid AND student_id=$2::uuid",
+                essay_id, student_id, json.dumps(parsed), user_id)
+    return {"analysis": parsed, "model": res.get("model"), "analyzed_at": datetime.utcnow().isoformat() + "Z"}
+
+
+@router.get("/student/{student_id}/essays/{essay_id}/analysis")
+async def get_essay_analysis(request: Request, student_id: str, essay_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT analysis, analysis_at FROM essays "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+            essay_id, student_id)
+    if not row or not row["analysis"]:
+        return {"analysis": None}
+    a = row["analysis"]
+    if isinstance(a, str):
+        try: a = json.loads(a)
+        except Exception: a = None
+    return {"analysis": a, "analyzed_at": row["analysis_at"].isoformat() if row["analysis_at"] else None}
+
+
+# ---- Exemplar corpus (framework IP layer: what a winning essay looks like) ----
+
+@router.get("/catalogs/essay-exemplars")
+async def list_essay_exemplars(request: Request, prompt_code: Optional[str] = None, route: Optional[str] = None):
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    pool: asyncpg.Pool = request.app.state.pool
+    q = ("SELECT id::text AS id, title, prompt_code, route, word_count, outcome_school, "
+         "outcome_scholarship, admit_cycle, selectivity_tier, strengths, techniques, "
+         "why_it_worked, essay_text FROM essay_exemplars WHERE is_active")
+    args = []
+    if prompt_code:
+        args.append(prompt_code); q += f" AND prompt_code=${len(args)}"
+    if route:
+        args.append(route); q += f" AND route=${len(args)}"
+    q += " ORDER BY created_at DESC LIMIT 25"
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(q, *args)
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("strengths", "techniques"):
+            v = d.get(k)
+            if isinstance(v, str):
+                try: d[k] = json.loads(v)
+                except Exception: d[k] = []
+        out.append(d)
+    return {"exemplars": out}
+
+
+class ExemplarIn(BaseModel):
+    title: Optional[str] = None
+    prompt_code: Optional[str] = None
+    route: Optional[str] = None
+    essay_text: str
+    outcome_school: Optional[str] = None
+    outcome_scholarship: Optional[str] = None
+    admit_cycle: Optional[str] = None
+    selectivity_tier: Optional[str] = None
+    source_note: Optional[str] = None
+    auto_extract: bool = True   # run LLM to extract traits/techniques/why
+
+
+@router.post("/admin/essay-exemplars")
+async def add_essay_exemplar(request: Request, body: ExemplarIn):
+    """Internal-only. Adds a successful essay to the corpus and (optionally) extracts
+    the traits/techniques that made it work, so future students learn from it."""
+    ctx = await _resolve_context(request)
+    if ctx.get("scope") == "parent_portal":
+        raise HTTPException(status_code=403, detail="internal_only")
+    tenant_id = ctx["tenant_id"]
+    uid = ctx.get("user_id")
+    text = (body.essay_text or "").strip()
+    if len(text) < 100:
+        raise HTTPException(status_code=400, detail="essay_text too short")
+    wc = len([w for w in text.split() if w])
+    strengths, techniques, why = [], [], None
+    if body.auto_extract:
+        system = ("You analyze a successful US college admissions essay and return STRICT JSON only: "
+                  "{\"strengths\":[str],\"techniques\":[str],\"why_it_worked\":str,\"route\":str}. "
+                  "route is one of: Nerdy/Passionate, Growth/Resilience, Empathy/Intellectual, Open. "
+                  "techniques = concrete craft moves (e.g., 'opens in medias res', 'uses a recurring motif').")
+        user = "ESSAY:\n" + text + "\n\nReturn the JSON."
+        res = await _llm_complete(system, user, max_tokens=900)
+        if not res.get("unavailable"):
+            parsed = _extract_json(res.get("text", "")) or {}
+            strengths = parsed.get("strengths", []) or []
+            techniques = parsed.get("techniques", []) or []
+            why = parsed.get("why_it_worked")
+            if not body.route and parsed.get("route"):
+                body.route = parsed["route"]
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            rid = await conn.fetchval(
+                "INSERT INTO essay_exemplars (title, prompt_code, route, essay_text, word_count, "
+                "outcome_school, outcome_scholarship, admit_cycle, selectivity_tier, strengths, "
+                "techniques, why_it_worked, source_note, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,"
+                "$9,$10::jsonb,$11::jsonb,$12,$13,$14::uuid) RETURNING id",
+                body.title, body.prompt_code, body.route, text, wc, body.outcome_school,
+                body.outcome_scholarship, body.admit_cycle, body.selectivity_tier,
+                json.dumps(strengths), json.dumps(techniques), why, body.source_note, uid)
+    return {"id": str(rid), "word_count": wc, "strengths": strengths,
+            "techniques": techniques, "why_it_worked": why}
