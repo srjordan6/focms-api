@@ -1173,16 +1173,21 @@ class CoursesRequest(BaseModel):
 
 
 @router.get("/student/{student_id}/courses")
-async def get_student_courses(request: Request, student_id: str):
+async def get_student_courses(request: Request, student_id: str, band: Optional[str] = None):
     tenant_id, _ = await _pp_context(request, student_id)
+    bounds = _band_bounds(band) if band else None
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
-        rows = await conn.fetch(
-            "SELECT course_name, course_code, sced_code, school_name, subject, subject_other, school_year, grade_level, term, grade_received, "
-            "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
-            "teacher_name, notes, admission_traits_developed, evidence_artifact_ids "
-            "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL "
-            "AND source_system='parent_portal' ORDER BY grade_level NULLS LAST, course_name", student_id)
+        base = ("SELECT id::text AS id, course_name, course_code, sced_code, school_name, subject, subject_other, school_year, grade_level, term, grade_received, "
+                "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
+                "teacher_name, notes, admission_traits_developed, evidence_artifact_ids, "
+                "(visibility='public') AS show_on_showcase "
+                "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL ")
+        if bounds:
+            rows = await conn.fetch(base + "AND grade_level BETWEEN $2 AND $3 ORDER BY grade_level NULLS LAST, course_name",
+                                    student_id, bounds[0], bounds[1])
+        else:
+            rows = await conn.fetch(base + "ORDER BY grade_level NULLS LAST, course_name", student_id)
 
     def rigor_of(r):
         if r["is_ap"]: return "ap"
@@ -1191,15 +1196,18 @@ async def get_student_courses(request: Request, student_id: str):
         if r["is_honors"]: return "honors"
         return r["course_type"] or "regular"
 
-    return {"student_id": student_id, "items": [
-        {"course_name": r["course_name"], "course_code": r["course_code"], "sced_code": r["sced_code"], "school_name": r["school_name"], "subject": r["subject"],
+    out = [
+        {"id": r["id"], "course_name": r["course_name"], "course_code": r["course_code"], "sced_code": r["sced_code"], "school_name": r["school_name"], "subject": r["subject"],
          "subject_other": r["subject_other"],
          "school_year": r["school_year"], "grade_level": r["grade_level"], "term": r["term"],
          "grade_received": r["grade_received"],
          "credit_hours": float(r["credit_hours"]) if r["credit_hours"] is not None else None,
-         "rigor": rigor_of(r), "ap_exam_score": r["ap_exam_score"], "teacher_name": r["teacher_name"],
+         "rigor": rigor_of(r), "is_honors": r["is_honors"], "is_ap": r["is_ap"], "is_ib": r["is_ib"], "is_dual_credit": r["is_dual_credit"],
+         "ap_exam_score": r["ap_exam_score"], "teacher_name": r["teacher_name"],
+         "show_on_showcase": r["show_on_showcase"],
          "notes": r["notes"], "skills": _pp_skills(r["admission_traits_developed"]),
-         "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]}
+         "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]
+    return {"student_id": student_id, "band": band, "items": out, "courses": out}
 
 
 @router.get("/catalogs/courses")
@@ -3670,7 +3678,7 @@ async def get_student_courses(request: Request, student_id: str,
     return {"student_id": student_id, "band": band, "courses": out}
 
 
-class CourseItem(BaseModel):
+class CourseItemLegacy(BaseModel):
     id: Optional[str] = None
     course_name: str
     school_name: Optional[str] = None
@@ -3693,13 +3701,13 @@ class CourseItem(BaseModel):
     show_on_showcase: Optional[bool] = None
 
 
-class CoursesRequest(BaseModel):
-    items: List[CourseItem] = []
+class CoursesRequestLegacy(BaseModel):
+    items: List[CourseItemLegacy] = []
     delete_ids: List[str] = []
 
 
 @router.post("/student/{student_id}/courses")
-async def post_student_courses(request: Request, student_id: str, body: CoursesRequest):
+async def post_student_courses_legacy(request: Request, student_id: str, body: CoursesRequestLegacy):
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = updated = deleted = 0
     pool: asyncpg.Pool = request.app.state.pool
