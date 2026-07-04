@@ -1,7 +1,9 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.44 · fix: _extract_json tolerates thinking models (strip <think>, code fences, balanced-brace scan) so qwen3.5:cloud analysis parses.
+v0.12.46 · fix: request response_format json_object for analyze/extract; strip injected <span> tags before JSON parse (deepseek pollution).
+         v0.12.45 · fix: openai_compatible reads message.reasoning when content is empty (thinking models like qwen3.5:cloud return reasoning-only).
+         v0.12.44 · fix: _extract_json tolerates thinking models (strip <think>, code fences, balanced-brace scan) so qwen3.5:cloud analysis parses.
          v0.12.43d · fix: default application_type must be common_app (check constraint); common_app_personal rejected.
          v0.12.43c · fix: also default status (NOT NULL) on insert; explicit NULL was overriding column default.
          v0.12.43b · fix: default application_type when unset (NOT NULL) so Studio autosave can create rows.
@@ -5398,7 +5400,7 @@ async def get_essay_versions(request: Request, student_id: str, essay_id: str):
 # v0.12.42 - Essay analysis + exemplar corpus; shared LLM adapter shim
 # ======================================================================
 
-async def _llm_complete(system: str, user: str, max_tokens: int = 1500) -> dict:
+async def _llm_complete(system: str, user: str, max_tokens: int = 1500, want_json: bool = False) -> dict:
     """Provider-swappable completion. Set FOCMS_LLM_PROVIDER=anthropic|openai_compatible.
     Returns {"text": str} or {"unavailable": True, "reason": str}.
     Interim shim until focms_llm_adapter.py lands; keeps all call sites uniform."""
@@ -5414,16 +5416,23 @@ async def _llm_complete(system: str, user: str, max_tokens: int = 1500) -> dict:
             base = _es_os.environ.get("FOCMS_LLM_BASE_URL", "").rstrip("/")
             if not base:
                 return {"unavailable": True, "reason": "FOCMS_LLM_BASE_URL required for openai_compatible."}
-            async with _es_httpx.AsyncClient(timeout=90) as client:
+            payload = {"model": model, "max_tokens": max_tokens,
+                       "messages": [{"role": "system", "content": system},
+                                    {"role": "user", "content": user}]}
+            if want_json:
+                payload["response_format"] = {"type": "json_object"}
+            async with _es_httpx.AsyncClient(timeout=120) as client:
                 r = await client.post(base + "/chat/completions",
                     headers={"Authorization": "Bearer " + api_key, "content-type": "application/json"},
-                    json={"model": model, "max_tokens": max_tokens,
-                          "messages": [{"role": "system", "content": system},
-                                       {"role": "user", "content": user}]})
+                    json=payload)
             if r.status_code != 200:
                 return {"unavailable": True, "reason": f"LLM error {r.status_code}: {r.text[:200]}"}
             d = r.json()
-            return {"text": d["choices"][0]["message"]["content"].strip(), "model": model}
+            msg = d["choices"][0]["message"]
+            txt = (msg.get("content") or "").strip()
+            if not txt:
+                txt = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+            return {"text": txt, "model": model}
         else:  # anthropic
             base = _es_os.environ.get("FOCMS_LLM_BASE_URL", "https://api.anthropic.com").rstrip("/")
             async with _es_httpx.AsyncClient(timeout=90) as client:
@@ -5449,6 +5458,8 @@ def _extract_json(text: str):
     t = text
     # drop <think>...</think> reasoning blocks
     t = _re.sub(r"<think>.*?</think>", " ", t, flags=_re.S | _re.I)
+    # strip stray HTML tags some models inject inside values
+    t = _re.sub(r"</?span[^>]*>", "", t, flags=_re.I)
     # prefer a fenced ```json ... ``` block if present
     fence = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, _re.S)
     candidates = []
@@ -5523,7 +5534,7 @@ async def analyze_essay(request: Request, student_id: str, essay_id: str):
         + ("WHAT HAS WORKED IN STRONG ESSAYS (for calibration):\n" + json.dumps(calib, default=str)[:1500] + "\n\n" if calib else "")
         + "Return the JSON now."
     )
-    res = await _llm_complete(system, user, max_tokens=1800)
+    res = await _llm_complete(system, user, max_tokens=1800, want_json=True)
     if res.get("unavailable"):
         return {"unavailable": True, "reason": res["reason"]}
     parsed = _extract_json(res.get("text", ""))
@@ -5620,7 +5631,7 @@ async def add_essay_exemplar(request: Request, body: ExemplarIn):
                   "route is one of: Nerdy/Passionate, Growth/Resilience, Empathy/Intellectual, Open. "
                   "techniques = concrete craft moves (e.g., 'opens in medias res', 'uses a recurring motif').")
         user = "ESSAY:\n" + text + "\n\nReturn the JSON."
-        res = await _llm_complete(system, user, max_tokens=900)
+        res = await _llm_complete(system, user, max_tokens=900, want_json=True)
         if not res.get("unavailable"):
             parsed = _extract_json(res.get("text", "")) or {}
             strengths = parsed.get("strengths", []) or []
