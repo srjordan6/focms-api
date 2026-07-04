@@ -1352,30 +1352,73 @@ async def rec_form_page(request: Request, token: str):
     rn = tok["recommender_name"] or ""
     html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Recommendation for {student}</title>
-<link href='https://fonts.googleapis.com/css2?family=Lora:wght@600&family=Poppins:wght@400;600&display=swap' rel='stylesheet'>
-<style>body{{font-family:Poppins,sans-serif;background:#FAFAF7;color:#1a1a2e;max-width:640px;margin:0 auto;padding:32px 20px}}
-h1{{font-family:Lora,serif;color:#201868;font-size:24px}}label{{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#7A8A9E;margin:14px 0 4px}}
-input,textarea{{width:100%;padding:10px 12px;border:1px solid #E5E7EB;border-radius:8px;font-family:Poppins,sans-serif;font-size:14px;box-sizing:border-box}}
-textarea{{font-family:Lora,serif;line-height:1.6}}button{{margin-top:18px;background:#F07800;color:#fff;border:0;border-radius:8px;padding:12px 28px;font-weight:600;font-size:14px;cursor:pointer}}
-.ok{{background:#DCFCE7;color:#14532D;padding:14px;border-radius:8px;margin-top:16px;display:none}}</style></head><body>
+<link href='https://fonts.googleapis.com/css2?family=Lora:wght@500;600&family=Poppins:wght@400;600&display=swap' rel='stylesheet'>
+<style>
+:root{{--navy:#201868;--orange:#F07800;--gray:#7A8A9E;}}
+body{{font-family:Poppins,sans-serif;background:#FAFAF7;color:#1a1a2e;max-width:760px;margin:0 auto;padding:32px 20px}}
+h1{{font-family:Lora,serif;color:var(--navy);font-size:26px;margin:0 0 6px}}
+.sub{{color:var(--gray);font-size:14px;margin-bottom:22px}}
+label{{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--gray);margin:14px 0 4px;font-weight:600}}
+input,select{{width:100%;padding:10px 12px;border:1px solid #E5E7EB;border-radius:8px;font-family:Poppins,sans-serif;font-size:14px;box-sizing:border-box;background:#fff}}
+.two{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
+.edwrap{{border:1px solid #D8D6E4;border-radius:8px;overflow:hidden;margin-top:4px;background:#fff}}
+.bar{{display:flex;gap:3px;flex-wrap:wrap;background:#EEEDF7;border-bottom:1px solid #E2E0F0;padding:6px 8px;align-items:center}}
+.fb{{font-family:Poppins,sans-serif;font-size:13px;min-width:30px;color:var(--navy);background:#FFF;border:1px solid #D0CEE0;border-radius:5px;padding:4px 9px;cursor:pointer;line-height:1}}
+.fb:hover{{background:var(--navy);color:#fff}}
+.wc{{margin-left:auto;font-size:12px;color:var(--gray)}}
+.ed{{min-height:320px;padding:18px 20px;font-family:Lora,serif;font-size:16px;line-height:1.75;color:#222;outline:none}}
+.ed:empty:before{{content:attr(data-ph);color:#B4B4C4;font-style:italic}}
+button.go{{margin-top:20px;background:var(--orange);color:#fff;border:0;border-radius:8px;padding:12px 30px;font-weight:600;font-size:14px;cursor:pointer;font-family:Poppins,sans-serif}}
+.ok{{background:#DCFCE7;color:#14532D;padding:14px;border-radius:8px;margin-top:16px;display:none}}
+.note{{font-size:12px;color:var(--gray);margin-top:8px}}
+</style></head><body>
 <h1>Letter of Recommendation for {student}</h1>
-<p>Thank you for supporting {student}. This form submits your letter directly and securely. It takes about 10 minutes.</p>
-<label>Your name</label><input id='n' value="{rn}">
-<label>Your email</label><input id='e' type='email'>
-<label>Relationship to {student} (e.g. Math teacher, Supervisor)</label><input id='r'>
-<label>Years known</label><input id='y' type='number' step='0.5' min='0'>
-<label>Your letter</label><textarea id='l' rows='14' placeholder='Write or paste your letter here'></textarea>
-<button onclick='go()'>Submit recommendation</button>
-<div class='ok' id='ok'>Received — thank you. You can close this page.</div>
+<div class='sub'>Thank you for supporting {student}. This form submits your letter directly and securely \u2014 about 10 minutes.</div>
+<div class='two'>
+<div><label>Your name *</label><input id='n' value="{rn}"></div>
+<div><label>Your email</label><input id='e' type='email'></div>
+</div>
+<div class='two'>
+<div><label>Your role / title</label><input id='t' placeholder='e.g. Math Teacher, Store Manager'></div>
+<div><label>Organization / school</label><input id='o'></div>
+</div>
+<div class='two'>
+<div><label>Relationship to {student}</label><input id='r' placeholder='e.g. Taught Algebra I, Direct supervisor'></div>
+<div><label>Years known</label><input id='y' type='number' step='0.5' min='0'></div>
+</div>
+<label>How strongly do you recommend {student}?</label>
+<select id='q'><option value=''>\u2014 choose \u2014</option><option>Recommend with reservations</option><option>Recommend</option><option>Strongly recommend</option><option>One of the best I have worked with</option></select>
+<label>Your letter *</label>
+<div class='edwrap'>
+<div class='bar'>
+<button class='fb' onmousedown="c(event,'bold')"><b>B</b></button>
+<button class='fb' onmousedown="c(event,'italic')"><i>I</i></button>
+<button class='fb' onmousedown="c(event,'underline')"><u>U</u></button>
+<button class='fb' onmousedown="c(event,'insertUnorderedList')">\u2022</button>
+<button class='fb' onmousedown="c(event,'insertOrderedList')">1.</button>
+<button class='fb' onmousedown="c(event,'undo')">\u21b6</button>
+<button class='fb' onmousedown="c(event,'redo')">\u21b7</button>
+<button class='fb' onmousedown="c(event,'removeFormat')">Clear</button>
+<span class='wc' id='wc'>0 words</span>
+</div>
+<div class='ed' id='l' contenteditable='true' spellcheck='true' data-ph='Write or paste your letter here. Formatting is preserved.' oninput='wcU()'></div>
+</div>
+<div class='note'>Your letter is private: it goes only to {student}'s family record, not to a public site.</div>
+<button class='go' onclick='go()'>Submit recommendation</button>
+<div class='ok' id='ok'>Received \u2014 thank you. You can close this page.</div>
 <script>
+function c(ev,cmd){{ev.preventDefault();document.getElementById('l').focus();document.execCommand(cmd,false,null);wcU();}}
+function wcU(){{var t=document.getElementById('l').textContent||'';var w=(t.trim().match(/\\S+/g)||[]).length;document.getElementById('wc').textContent=w+' words';}}
 async function go(){{
- const b={{submitter_name:document.getElementById('n').value.trim(),submitter_email:document.getElementById('e').value.trim()||null,
- relationship:document.getElementById('r').value.trim()||null,
+ var ed=document.getElementById('l');
+ var b={{submitter_name:document.getElementById('n').value.trim(),
+ submitter_email:document.getElementById('e').value.trim()||null,
+ relationship:[document.getElementById('t').value.trim(),document.getElementById('o').value.trim(),document.getElementById('r').value.trim(),document.getElementById('q').value].filter(Boolean).join(' | ')||null,
  years_known:document.getElementById('y').value?parseFloat(document.getElementById('y').value):null,
- letter_text:document.getElementById('l').value.trim()}};
- if(!b.submitter_name||!b.letter_text){{alert('Name and letter are required.');return;}}
- const r=await fetch(location.pathname,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
- if(r.ok){{document.getElementById('ok').style.display='block';document.querySelector('button').disabled=true;}}
+ letter_text:ed.innerHTML.trim()}};
+ if(!b.submitter_name||!ed.textContent.trim()){{alert('Name and letter are required.');return;}}
+ var r=await fetch(location.pathname,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
+ if(r.ok){{document.getElementById('ok').style.display='block';document.querySelector('button.go').disabled=true;}}
  else{{alert('Submission failed: '+(await r.text()).slice(0,200));}}
 }}
 </script></body></html>"""
