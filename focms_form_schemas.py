@@ -1201,6 +1201,24 @@ async def get_student_courses(request: Request, student_id: str):
          "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]}
 
 
+@router.get("/catalogs/courses")
+async def get_course_catalog(request: Request, subject: Optional[str] = None, q: Optional[str] = None):
+    """SCED v13 course codes. Filter by subject (2-digit area) and/or title search q."""
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    pool: asyncpg.Pool = request.app.state.pool
+    sql = "SELECT code, subject_code, title FROM sced_courses WHERE is_active"
+    args = []
+    if subject:
+        args.append(subject); sql += f" AND subject_code=${len(args)}"
+    if q:
+        args.append("%" + q + "%"); sql += f" AND title ILIKE ${len(args)}"
+    sql += " ORDER BY code LIMIT 500"
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(sql, *args)
+    return {"courses": [dict(r) for r in rows]}
+
+
 @router.get("/catalogs/subjects")
 async def get_subject_catalog(request: Request):
     """SCED (NCES) subject areas — canonical US K-12 subject taxonomy."""
