@@ -1345,16 +1345,18 @@ async def rec_form_page(request: Request, token: str):
                 student_name = await conn.fetchval(
                     "SELECT COALESCE(display_name, first_name || ' ' || last_name) FROM students WHERE id=$1::uuid",
                     tok["student_id"])
-                school_name = await conn.fetchval(
+                school_rows = await conn.fetch(
                     "SELECT school_name FROM student_school_enrollments WHERE student_id=$1::uuid "
-                    "AND deleted_at IS NULL ORDER BY is_current_school DESC, created_at DESC LIMIT 1",
-                    tok["student_id"]) or ""
+                    "AND deleted_at IS NULL AND school_name IS NOT NULL "
+                    "ORDER BY is_current_school DESC, created_at DESC", tok["student_id"])
+                school_names = [r["school_name"] for r in school_rows]
     import datetime as _dt
     if not tok or tok["used_at"] or tok["expires_at"] < _dt.datetime.now(_dt.timezone.utc):
         return HTMLResponse("<h2 style='font-family:sans-serif'>This recommendation link is invalid or has expired.</h2>", status_code=404)
     student = student_name or "the student"
     rn = tok["recommender_name"] or ""
-    sch = (school_name or "").replace('"', "&quot;")
+    _opts = "".join("<option value=\"{0}\">{0}</option>".format(n.replace('"','&quot;').replace('<','&lt;')) for n in school_names)
+    sch_select = ("<select id='o'>" + _opts + "<option value=''>Other / not listed</option></select>") if school_names else "<input id='o' autocomplete='off' data-lpignore='true' data-1p-ignore readonly onfocus=\"this.removeAttribute('readonly')\">"
     html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
 <title>Recommendation for {student}</title>
 <link href='https://fonts.googleapis.com/css2?family=Lora:wght@500;600&family=Poppins:wght@400;600&display=swap' rel='stylesheet'>
@@ -1370,6 +1372,8 @@ input,select{{width:100%;padding:10px 12px;border:1px solid #E5E7EB;border-radiu
 .bar{{display:flex;gap:4px;flex-wrap:wrap;background:#EEEDF7;border-bottom:1px solid #E2E0F0;padding:8px;align-items:center}}
 .fb{{font-family:Poppins,sans-serif;font-size:13px;min-width:30px;height:30px;display:inline-flex;align-items:center;justify-content:center;color:var(--navy);background:#FFF;border:1px solid #D0CEE0;border-radius:5px;padding:0 9px;cursor:pointer;line-height:1;box-sizing:border-box;vertical-align:middle}}
 select.fb{{padding:0 4px}}
+.bar>*{{height:30px;box-sizing:border-box;vertical-align:middle;margin:0}}
+.bar label.fb{{display:inline-flex;align-items:center;justify-content:center}}
 .fb:hover{{background:var(--navy);color:#fff}}
 .wc{{margin-left:auto;font-size:12px;color:var(--gray)}}
 .ed{{min-height:320px;padding:18px 20px;font-family:Lora,serif;font-size:16px;line-height:1.75;color:#222;outline:none}}
@@ -1386,7 +1390,7 @@ button.go{{margin-top:20px;background:var(--orange);color:#fff;border:0;border-r
 </div>
 <div class='two'>
 <div><label>Your role / title</label><input id='t' placeholder='e.g. Math Teacher, Store Manager'></div>
-<div><label>Organization / school</label><input id='o' value="{sch}" autocomplete='off' data-lpignore='true' data-1p-ignore readonly onfocus='this.removeAttribute(\"readonly\")'></div>
+<div><label>Organization / school</label>{sch_select}</div>
 </div>
 <div class='two'>
 <div><label>Relationship to {student}</label><input id='r' placeholder='e.g. Taught Algebra I, Direct supervisor'></div>
