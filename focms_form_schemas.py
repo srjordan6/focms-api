@@ -1216,8 +1216,10 @@ async def get_subject_catalog(request: Request):
 async def post_student_courses(request: Request, student_id: str, body: CoursesRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = 0
+    import traceback as _tb
     pool: asyncpg.Pool = request.app.state.pool
-    async with _tenant_conn(pool, tenant_id) as conn:
+    try:
+      async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             default_school = await _pp_current_school_name(conn, student_id)
@@ -1254,6 +1256,8 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                     gp, gpw, (it.notes or None), json.dumps(_pp_skills(it.skills)),
                     _pp_artifacts(it.artifact_ids), user_id, (it.subject_other or None))
                 saved += 1
+    except Exception as _e:
+        raise HTTPException(status_code=400, detail="course_insert_error: " + str(_e)[:300])
     return {"student_id": student_id, "saved": saved}
 
 
