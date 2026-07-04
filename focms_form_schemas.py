@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.43d · fix: default application_type must be common_app (check constraint); common_app_personal rejected.
+v0.12.44 · fix: _extract_json tolerates thinking models (strip <think>, code fences, balanced-brace scan) so qwen3.5:cloud analysis parses.
+         v0.12.43d · fix: default application_type must be common_app (check constraint); common_app_personal rejected.
          v0.12.43c · fix: also default status (NOT NULL) on insert; explicit NULL was overriding column default.
          v0.12.43b · fix: default application_type when unset (NOT NULL) so Studio autosave can create rows.
          v0.12.43 · fix: essays.topic_themes is jsonb not text[] - cast ::jsonb on write, json-decode on read (was blocking all essay creation).
@@ -5440,17 +5441,40 @@ async def _llm_complete(system: str, user: str, max_tokens: int = 1500) -> dict:
 
 
 def _extract_json(text: str):
-    """Pull the first JSON object from an LLM reply."""
+    """Pull a JSON object from an LLM reply, tolerating thinking models,
+    markdown code fences, and <think> blocks around the JSON."""
     import re as _re
     if not text:
         return None
-    m = _re.search(r"\{.*\}", text, _re.S)
-    if not m:
-        return None
-    try:
-        return json.loads(m.group(0))
-    except Exception:
-        return None
+    t = text
+    # drop <think>...</think> reasoning blocks
+    t = _re.sub(r"<think>.*?</think>", " ", t, flags=_re.S | _re.I)
+    # prefer a fenced ```json ... ``` block if present
+    fence = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, _re.S)
+    candidates = []
+    if fence:
+        candidates.append(fence.group(1))
+    # also scan for balanced top-level {...} objects (last one wins)
+    depth = 0; start = None
+    for i, ch in enumerate(t):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    candidates.append(t[start:i + 1])
+    # try longest/last candidates first (most complete)
+    for cand in sorted(set(candidates), key=len, reverse=True):
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+    return None
 
 
 @router.post("/student/{student_id}/essays/{essay_id}/analyze")
