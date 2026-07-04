@@ -1,7 +1,9 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.48 · fix: sanitize deepseek `"key": word: N` pollution before JSON parse.
+v0.12.50 · feat: job_experiences.supervisor_email (Ask-for-Recommendation mailto); remove temporary debug_raw passthrough.
+         v0.12.49 · fix: coerce em-dash placeholder values to null before parse.
+         v0.12.48 · fix: sanitize deepseek `"key": word: N` pollution before JSON parse.
          v0.12.47 · debug: surface raw LLM text on parse failure (temporary).
          v0.12.46 · fix: request response_format json_object for analyze/extract; strip injected <span> tags before JSON parse (deepseek pollution).
          v0.12.45 · fix: openai_compatible reads message.reasoning when content is empty (thinking models like qwen3.5:cloud return reasoning-only).
@@ -4594,6 +4596,7 @@ class JobExperienceItem(BaseModel):
     company_name: Optional[str] = None
     supervisor_name: Optional[str] = None
     supervisor_phone: Optional[str] = None
+    supervisor_email: Optional[str] = None
     street_address: Optional[str] = None
     city_town: Optional[str] = None
     state_province: Optional[str] = None
@@ -4629,7 +4632,7 @@ async def get_job_experiences(request: Request, student_id: str):
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT id::text AS id, job_title, company_name, supervisor_name, "
-            "supervisor_phone, street_address, city_town, state_province, "
+            "supervisor_phone, supervisor_email, street_address, city_town, state_province, "
             "zip_postal_code, country, start_date, end_date, is_current, is_paid, "
             "job_description, duties, reason_for_leaving, starting_salary, ending_salary, may_contact, "
             "hours_type, employment_status, skills_gained, notes, public_description, "
@@ -4669,7 +4672,7 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                     except Exception: continue
                     r = await conn.execute(
                         "UPDATE job_experiences SET job_title=$3, company_name=$4, "
-                        "supervisor_name=$5, supervisor_phone=$6, street_address=$7, "
+                        "supervisor_name=$5, supervisor_phone=$6, supervisor_email=$28, street_address=$7, "
                         "city_town=$8, state_province=$9, zip_postal_code=$10, country=$11, "
                         "start_date=$12::date, end_date=$13::date, is_current=$14, is_paid=$15, "
                         "job_description=$27, duties=$16, reason_for_leaving=$17, starting_salary=$18, "
@@ -4683,7 +4686,7 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                         it.is_current, it.is_paid, it.duties, it.reason_for_leaving,
                         it.starting_salary, it.ending_salary, it.may_contact, it.hours_type,
                         it.employment_status, list(it.skills_gained or []), it.notes,
-                        it.public_description, user_id)
+                        it.public_description, user_id, it.supervisor_email)
                     if r and r.endswith(" 1"):
                         if it.show_on_showcase is True:
                             await conn.execute("UPDATE job_experiences SET visibility='public' WHERE id=$1::uuid AND visibility_locked=false", it.id)
@@ -4693,13 +4696,13 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                 else:
                     rid = await conn.fetchval(
                         "INSERT INTO job_experiences (tenant_id, student_id, job_title, "
-                        "company_name, supervisor_name, supervisor_phone, street_address, "
+                        "company_name, supervisor_name, supervisor_phone, supervisor_email, street_address, "
                         "city_town, state_province, zip_postal_code, country, start_date, "
                         "end_date, is_current, is_paid, duties, reason_for_leaving, "
                         "starting_salary, ending_salary, may_contact, hours_type, "
                         "employment_status, skills_gained, notes, public_description, "
                         "job_description, visibility, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::date,"
+                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$28,$7,$8,$9,$10,$11,$12::date,"
                         "$13::date,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$27,"
                         "'private','parent_portal',$26::uuid,$26::uuid) RETURNING id",
                         tenant_id, student_id, it.job_title, it.company_name, it.supervisor_name,
@@ -4708,7 +4711,7 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
                         it.is_current, it.is_paid, it.duties, it.reason_for_leaving,
                         it.starting_salary, it.ending_salary, it.may_contact, it.hours_type,
                         it.employment_status, list(it.skills_gained or []), it.notes,
-                        it.public_description, user_id, it.job_description)
+                        it.public_description, user_id, it.job_description, it.supervisor_email)
                     if it.show_on_showcase is True:
                         await conn.execute("UPDATE job_experiences SET visibility='public' WHERE id=$1::uuid AND visibility_locked=false", rid)
                     saved += 1
@@ -5464,6 +5467,8 @@ def _extract_json(text: str):
     t = _re.sub(r"</?span[^>]*>", "", t, flags=_re.I)
     # deepseek pollution: `"key": word: 7` -> `"key": 7`
     t = _re.sub(r'(:\s*)[A-Za-z][\w\- ]*:\s*(-?\d)', r'\1\2', t)
+    # em-dash / en-dash / bare dash used as a value -> null
+    t = _re.sub(r':\s*[\u2014\u2013\-]+\s*([,}])', r': null\1', t)
     # prefer a fenced ```json ... ``` block if present
     fence = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, _re.S)
     candidates = []
@@ -5543,8 +5548,7 @@ async def analyze_essay(request: Request, student_id: str, essay_id: str):
         return {"unavailable": True, "reason": res["reason"]}
     parsed = _extract_json(res.get("text", ""))
     if not parsed:
-        return {"unavailable": True, "reason": "Could not parse analysis. Try again.",
-                "debug_raw": (res.get("text", "") or "")[:800]}
+        return {"unavailable": True, "reason": "Could not parse analysis. Try again."}
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
