@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.46 · fix: request response_format json_object for analyze/extract; strip injected <span> tags before JSON parse (deepseek pollution).
+v0.12.47 · debug: surface raw LLM text on parse failure (temporary).
+         v0.12.46 · fix: request response_format json_object for analyze/extract; strip injected <span> tags before JSON parse (deepseek pollution).
          v0.12.45 · fix: openai_compatible reads message.reasoning when content is empty (thinking models like qwen3.5:cloud return reasoning-only).
          v0.12.44 · fix: _extract_json tolerates thinking models (strip <think>, code fences, balanced-brace scan) so qwen3.5:cloud analysis parses.
          v0.12.43d · fix: default application_type must be common_app (check constraint); common_app_personal rejected.
@@ -5539,7 +5540,8 @@ async def analyze_essay(request: Request, student_id: str, essay_id: str):
         return {"unavailable": True, "reason": res["reason"]}
     parsed = _extract_json(res.get("text", ""))
     if not parsed:
-        return {"unavailable": True, "reason": "Could not parse analysis. Try again."}
+        return {"unavailable": True, "reason": "Could not parse analysis. Try again.",
+                "debug_raw": (res.get("text", "") or "")[:800]}
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
