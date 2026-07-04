@@ -1391,11 +1391,23 @@ button.go{{margin-top:20px;background:var(--orange);color:#fff;border:0;border-r
 <label>Your letter *</label>
 <div class='edwrap'>
 <div class='bar'>
+<select class='fb' style='max-width:120px' onchange="cv(event,'fontName',this.value)"><option>Lora</option><option>Georgia</option><option>Times New Roman</option><option>Arial</option><option>Calibri</option><option>Helvetica</option><option>Verdana</option></select>
+<select class='fb' style='max-width:56px' onchange="cv(event,'fontSize',this.value)"><option value='2'>13</option><option value='3'>16</option><option value='4' selected>18</option><option value='5'>24</option><option value='6'>32</option></select>
 <button class='fb' onmousedown="c(event,'bold')"><b>B</b></button>
 <button class='fb' onmousedown="c(event,'italic')"><i>I</i></button>
 <button class='fb' onmousedown="c(event,'underline')"><u>U</u></button>
+<button class='fb' onmousedown="c(event,'strikeThrough')"><s>S</s></button>
+<button class='fb' onmousedown="c(event,'subscript')">X\u2082</button>
+<button class='fb' onmousedown="c(event,'superscript')">X\u00b2</button>
+<label class='fb' style='position:relative;overflow:hidden'>A<input type='color' value='#201868' style='position:absolute;inset:0;opacity:0;cursor:pointer' oninput="cv(event,'foreColor',this.value)"></label>
+<label class='fb' style='position:relative;overflow:hidden;background:#FFF9C4'>\u25a0<input type='color' value='#FFF176' style='position:absolute;inset:0;opacity:0;cursor:pointer' oninput="cv(event,'hiliteColor',this.value)"></label>
+<button class='fb' onmousedown="c(event,'justifyLeft')">\u2261</button>
+<button class='fb' onmousedown="c(event,'justifyCenter')">\u2263</button>
+<button class='fb' onmousedown="c(event,'justifyRight')">\u2261</button>
 <button class='fb' onmousedown="c(event,'insertUnorderedList')">\u2022</button>
 <button class='fb' onmousedown="c(event,'insertOrderedList')">1.</button>
+<button class='fb' onmousedown="c(event,'outdent')">\u2190|</button>
+<button class='fb' onmousedown="c(event,'indent')">|\u2192</button>
 <button class='fb' onmousedown="c(event,'undo')">\u21b6</button>
 <button class='fb' onmousedown="c(event,'redo')">\u21b7</button>
 <button class='fb' onmousedown="c(event,'removeFormat')">Clear</button>
@@ -1403,11 +1415,13 @@ button.go{{margin-top:20px;background:var(--orange);color:#fff;border:0;border-r
 </div>
 <div class='ed' id='l' contenteditable='true' spellcheck='true' data-ph='Write or paste your letter here. Formatting is preserved.' oninput='wcU()'></div>
 </div>
+<div class='note'>Spelling is checked as you type (red underline \u2014 right-click for suggestions). For grammar checking, your browser's built-in writing assistance (Edge/Chrome \u201cEnhanced spell check\u201d) or Grammarly extension works in this editor.</div>
 <div class='note'>Your letter is private: it goes only to {student}'s family record, not to a public site.</div>
 <button class='go' onclick='go()'>Submit recommendation</button>
 <div class='ok' id='ok'>Received \u2014 thank you. You can close this page.</div>
 <script>
 function c(ev,cmd){{ev.preventDefault();document.getElementById('l').focus();document.execCommand(cmd,false,null);wcU();}}
+function cv(ev,cmd,val){{ev.preventDefault();document.getElementById('l').focus();document.execCommand(cmd,false,val);wcU();}}
 function wcU(){{var t=document.getElementById('l').textContent||'';var w=(t.trim().match(/\\S+/g)||[]).length;document.getElementById('wc').textContent=w+' words';}}
 async function go(){{
  var ed=document.getElementById('l');
