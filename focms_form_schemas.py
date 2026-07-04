@@ -3806,8 +3806,8 @@ async def post_student_applications(request: Request, student_id: str, body: App
                     r = await conn.execute(
                         "UPDATE applications SET university_leaid=$3, "
                         "application_year=$4, decision_plan=$5, application_platform=$6, "
-                        "pathway_track=$7::pathway_enum, deadline=$8::date, "
-                        "decision_release_date=$9::date, submitted_at=$10::date, "
+                        "pathway_track=NULLIF($7,'')::pathway_enum, deadline=NULLIF($8::text,'')::date, "
+                        "decision_release_date=NULLIF($9::text,'')::date, submitted_at=NULLIF($10::text,'')::date, "
                         "fee_paid_usd=$11, fee_waiver_used=$12, "
                         "details = COALESCE(details, '{}'::jsonb) || COALESCE($13::jsonb, '{}'::jsonb), "
                         "notes=$14, public_description=$15, "
@@ -3835,7 +3835,7 @@ async def post_student_applications(request: Request, student_id: str, body: App
                         "fee_paid_usd, fee_waiver_used, details, notes, public_description, "
                         "status, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,"
-                        "NULLIF($7,'')::pathway_enum,$8::date,$9::date,$10::date,"
+                        "NULLIF($7,'')::pathway_enum,NULLIF($8::text,'')::date,NULLIF($9::text,'')::date,NULLIF($10::text,'')::date,"
                         "$11,$12,$13::jsonb,$14,$15,'planned','private','parent_portal',"
                         "$16::uuid,$16::uuid) RETURNING id",
                         tenant_id, student_id, leaid, (it.application_year or __import__('datetime').date.today().year), plan, plat,
