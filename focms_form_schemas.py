@@ -1210,6 +1210,203 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
     return {"student_id": student_id, "band": band, "items": out, "courses": out}
 
 
+# --------------------- Recommendation letters + direct-submit ---------------------
+
+class RecLetterItem(BaseModel):
+    id: Optional[str] = None
+    recommender_id: Optional[str] = None
+    letter_text: Optional[str] = None
+    artifact_id: Optional[str] = None
+    source: Optional[str] = None            # email_paste | upload | direct_form
+    submitter_name: Optional[str] = None
+    submitter_email: Optional[str] = None
+    relationship: Optional[str] = None
+    years_known: Optional[float] = None
+    status: Optional[str] = None
+
+
+class RecLettersRequest(BaseModel):
+    items: List[RecLetterItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/recommendation-letters")
+async def get_rec_letters(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, recommender_id::text AS recommender_id, letter_text, "
+            "artifact_id::text AS artifact_id, source, submitter_name, submitter_email, "
+            "relationship, years_known, ratings, status, submitted_at "
+            "FROM recommendation_letters WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY submitted_at DESC", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["submitted_at"] = d["submitted_at"].isoformat() if d["submitted_at"] else None
+        d["years_known"] = float(d["years_known"]) if d["years_known"] is not None else None
+        d["ratings"] = json.loads(d["ratings"]) if d["ratings"] else None
+        out.append(d)
+    return {"student_id": student_id, "letters": out}
+
+
+@router.post("/student/{student_id}/recommendation-letters")
+async def post_rec_letters(request: Request, student_id: str, body: RecLettersRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = deleted = 0
+    _SRC = {"email_paste", "upload", "direct_form"}
+    _ST = {"received", "reviewed", "submitted_to_school"}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                await conn.execute("UPDATE recommendation_letters SET deleted_at=now() "
+                                   "WHERE id=$1::uuid AND student_id=$2::uuid", did, student_id)
+                deleted += 1
+            for it in body.items or []:
+                if not (it.letter_text or it.artifact_id): continue
+                src = it.source if it.source in _SRC else "email_paste"
+                st = it.status if it.status in _ST else "received"
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    await conn.execute(
+                        "UPDATE recommendation_letters SET letter_text=$3, artifact_id=$4::uuid, "
+                        "source=$5, submitter_name=$6, submitter_email=$7, relationship=$8, "
+                        "years_known=$9, status=$10, recommender_id=$11::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.letter_text, it.artifact_id, src,
+                        it.submitter_name, it.submitter_email, it.relationship,
+                        it.years_known, st, it.recommender_id)
+                else:
+                    await conn.execute(
+                        "INSERT INTO recommendation_letters (tenant_id, student_id, recommender_id, "
+                        "letter_text, artifact_id, source, submitter_name, submitter_email, "
+                        "relationship, years_known, status, created_by) "
+                        "VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5::uuid,$6,$7,$8,$9,$10,$11,$12::uuid)",
+                        tenant_id, student_id, it.recommender_id, it.letter_text, it.artifact_id,
+                        src, it.submitter_name, it.submitter_email, it.relationship,
+                        it.years_known, st, user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved, "deleted": deleted}
+
+
+class RecTokenRequest(BaseModel):
+    recommender_id: Optional[str] = None
+    recommender_name: Optional[str] = None
+    recommender_email: Optional[str] = None
+    role: Optional[str] = None              # teacher | employer
+
+
+@router.post("/student/{student_id}/recommendation-links")
+async def create_rec_link(request: Request, student_id: str, body: RecTokenRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    import secrets as _secrets
+    token = _secrets.token_urlsafe(24)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            await conn.execute(
+                "INSERT INTO recommendation_request_tokens (token, tenant_id, student_id, "
+                "recommender_id, recommender_name, recommender_email, role, expires_at, created_by) "
+                "VALUES ($1,$2::uuid,$3::uuid,$4::uuid,$5,$6,$7, now() + interval '30 days', $8::uuid)",
+                token, tenant_id, student_id, body.recommender_id, body.recommender_name,
+                body.recommender_email, body.role or "teacher", user_id)
+    return {"token": token, "url": "https://focms-api.onrender.com/focms/v1/recommend/" + token,
+            "expires_days": 30}
+
+
+class RecSubmitBody(BaseModel):
+    submitter_name: str
+    submitter_email: Optional[str] = None
+    relationship: Optional[str] = None
+    years_known: Optional[float] = None
+    letter_text: str
+
+
+@router.get("/recommend/{token}")
+async def rec_form_page(request: Request, token: str):
+    """Public tokenized form — no auth. Teacher fills and submits."""
+    from fastapi.responses import HTMLResponse
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        tok = await conn.fetchrow(
+            "SELECT token, tenant_id, student_id, recommender_name, role, expires_at, used_at "
+            "FROM recommendation_request_tokens WHERE token=$1", token)
+        student_name = None
+        if tok and not tok["used_at"]:
+            async with conn.transaction():
+                await conn.execute(f"SET LOCAL app.current_tenant_id = '{tok['tenant_id']}'")
+                student_name = await conn.fetchval(
+                    "SELECT COALESCE(display_name, first_name || ' ' || last_name) FROM students WHERE id=$1::uuid",
+                    tok["student_id"])
+    import datetime as _dt
+    if not tok or tok["used_at"] or tok["expires_at"] < _dt.datetime.now(_dt.timezone.utc):
+        return HTMLResponse("<h2 style='font-family:sans-serif'>This recommendation link is invalid or has expired.</h2>", status_code=404)
+    student = student_name or "the student"
+    rn = tok["recommender_name"] or ""
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Recommendation for {student}</title>
+<link href='https://fonts.googleapis.com/css2?family=Lora:wght@600&family=Poppins:wght@400;600&display=swap' rel='stylesheet'>
+<style>body{{font-family:Poppins,sans-serif;background:#FAFAF7;color:#1a1a2e;max-width:640px;margin:0 auto;padding:32px 20px}}
+h1{{font-family:Lora,serif;color:#201868;font-size:24px}}label{{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:#7A8A9E;margin:14px 0 4px}}
+input,textarea{{width:100%;padding:10px 12px;border:1px solid #E5E7EB;border-radius:8px;font-family:Poppins,sans-serif;font-size:14px;box-sizing:border-box}}
+textarea{{font-family:Lora,serif;line-height:1.6}}button{{margin-top:18px;background:#F07800;color:#fff;border:0;border-radius:8px;padding:12px 28px;font-weight:600;font-size:14px;cursor:pointer}}
+.ok{{background:#DCFCE7;color:#14532D;padding:14px;border-radius:8px;margin-top:16px;display:none}}</style></head><body>
+<h1>Letter of Recommendation for {student}</h1>
+<p>Thank you for supporting {student}. This form submits your letter directly and securely. It takes about 10 minutes.</p>
+<label>Your name</label><input id='n' value="{rn}">
+<label>Your email</label><input id='e' type='email'>
+<label>Relationship to {student} (e.g. Math teacher, Supervisor)</label><input id='r'>
+<label>Years known</label><input id='y' type='number' step='0.5' min='0'>
+<label>Your letter</label><textarea id='l' rows='14' placeholder='Write or paste your letter here'></textarea>
+<button onclick='go()'>Submit recommendation</button>
+<div class='ok' id='ok'>Received — thank you. You can close this page.</div>
+<script>
+async function go(){{
+ const b={{submitter_name:document.getElementById('n').value.trim(),submitter_email:document.getElementById('e').value.trim()||null,
+ relationship:document.getElementById('r').value.trim()||null,
+ years_known:document.getElementById('y').value?parseFloat(document.getElementById('y').value):null,
+ letter_text:document.getElementById('l').value.trim()}};
+ if(!b.submitter_name||!b.letter_text){{alert('Name and letter are required.');return;}}
+ const r=await fetch(location.pathname,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(b)}});
+ if(r.ok){{document.getElementById('ok').style.display='block';document.querySelector('button').disabled=true;}}
+ else{{alert('Submission failed: '+(await r.text()).slice(0,200));}}
+}}
+</script></body></html>"""
+    return HTMLResponse(html)
+
+
+@router.post("/recommend/{token}")
+async def rec_form_submit(request: Request, token: str, body: RecSubmitBody):
+    """Public tokenized submit — no auth; token is the credential."""
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT token, tenant_id, student_id, recommender_id, role, expires_at, used_at "
+            "FROM recommendation_request_tokens WHERE token=$1", token)
+        if not row or row["used_at"]:
+            raise HTTPException(status_code=404, detail="invalid or used link")
+        import datetime as _dt
+        if row["expires_at"] < _dt.datetime.now(_dt.timezone.utc):
+            raise HTTPException(status_code=404, detail="link expired")
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{row['tenant_id']}'")
+            await conn.execute(
+                "INSERT INTO recommendation_letters (tenant_id, student_id, recommender_id, "
+                "letter_text, source, submitter_name, submitter_email, relationship, years_known, status) "
+                "VALUES ($1::uuid,$2::uuid,$3::uuid,$4,'direct_form',$5,$6,$7,$8,'received')",
+                row["tenant_id"], row["student_id"], row["recommender_id"], body.letter_text,
+                body.submitter_name, body.submitter_email, body.relationship, body.years_known)
+            await conn.execute("UPDATE recommendation_request_tokens SET used_at=now() WHERE token=$1", token)
+    return {"ok": True}
+
+
 @router.get("/catalogs/courses")
 async def get_course_catalog(request: Request, subject: Optional[str] = None, q: Optional[str] = None):
     """SCED v13 course codes. Filter by subject (2-digit area) and/or title search q."""
