@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.50 · feat: job_experiences.supervisor_email (Ask-for-Recommendation mailto); remove temporary debug_raw passthrough.
+v0.12.51 · fix: courses subject must match check-constraint enum (invalid->other); add courses_taken.subject_other free-text; GRANT DELETE done via MCP.
+         v0.12.50 · feat: job_experiences.supervisor_email (Ask-for-Recommendation mailto); remove temporary debug_raw passthrough.
          v0.12.49 · fix: coerce em-dash placeholder values to null before parse.
          v0.12.48 · fix: sanitize deepseek `"key": word: N` pollution before JSON parse.
          v0.12.47 · debug: surface raw LLM text on parse failure (temporary).
@@ -1150,6 +1151,7 @@ class CourseItem(BaseModel):
     course_name: Optional[str] = None
     school_name: Optional[str] = None
     subject: Optional[str] = None
+    subject_other: Optional[str] = None
     school_year: Optional[str] = None
     grade_level: Optional[int] = None
     term: Optional[str] = None
@@ -1173,7 +1175,7 @@ async def get_student_courses(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
-            "SELECT course_name, school_name, subject, school_year, grade_level, term, grade_received, "
+            "SELECT course_name, school_name, subject, subject_other, school_year, grade_level, term, grade_received, "
             "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
             "teacher_name, notes, admission_traits_developed, evidence_artifact_ids "
             "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL "
@@ -1188,6 +1190,7 @@ async def get_student_courses(request: Request, student_id: str):
 
     return {"student_id": student_id, "items": [
         {"course_name": r["course_name"], "school_name": r["school_name"], "subject": r["subject"],
+         "subject_other": r["subject_other"],
          "school_year": r["school_year"], "grade_level": r["grade_level"], "term": r["term"],
          "grade_received": r["grade_received"],
          "credit_hours": float(r["credit_hours"]) if r["credit_hours"] is not None else None,
@@ -1213,6 +1216,10 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 if not name:
                     continue
                 school = (it.school_name or "").strip() or default_school or "Unspecified"
+                _ALLOWED_SUBJ = {"mathematics","english","science","social_studies","foreign_language","computer_science","arts","music","health_pe","career_tech","elective","religion","other"}
+                subj = (it.subject or "").strip().lower() or None
+                if subj is not None and subj not in _ALLOWED_SUBJ:
+                    subj = "other"
                 rigor = (it.rigor or "regular").lower()
                 if rigor not in _RIGOR:
                     rigor = "regular"
@@ -1220,19 +1227,19 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 gpw = (gp + _RIGOR_BONUS.get(rigor, 0.0)) if gp is not None else None
                 await conn.execute(
                     "INSERT INTO courses_taken (tenant_id, student_id, course_name, school_name, "
-                    "course_type, subject, grade_level, school_year, term, credit_hours, grade_received, "
+                    "course_type, subject, subject_other, grade_level, school_year, term, credit_hours, grade_received, "
                     "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, teacher_name, "
                     "grade_points_4_0, grade_points_weighted, notes, admission_traits_developed, "
                     "evidence_artifact_ids, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,"
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$24,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,"
                     "$18,$19,$20,$21::jsonb,$22::text[]::uuid[],'parent_portal',$23::uuid,$23::uuid)",
-                    tenant_id, student_id, name, school, rigor, (it.subject or None),
+                    tenant_id, student_id, name, school, rigor, subj,
                     _pp_int(it.grade_level), (it.school_year or None), (it.term or None),
                     _pp_num(it.credit_hours), (it.grade_received or None),
                     rigor == "honors", rigor == "ap", rigor == "ib", rigor == "dual",
                     _pp_int(it.ap_exam_score), (it.teacher_name or None),
                     gp, gpw, (it.notes or None), json.dumps(_pp_skills(it.skills)),
-                    _pp_artifacts(it.artifact_ids), user_id)
+                    _pp_artifacts(it.artifact_ids), user_id, (it.subject_other or None))
                 saved += 1
     return {"student_id": student_id, "saved": saved}
 
