@@ -3821,7 +3821,7 @@ class SchoolProfileItem(BaseModel):
     counselor_phone: Optional[str] = None
     counselor_email: Optional[str] = None
     counselor_fax: Optional[str] = None
-    is_current_school: Optional[bool] = None
+    is_current_school: Optional[bool] = False
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     grade_levels_attended: List[str] = []
@@ -3921,7 +3921,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         it.school_type, it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.country, it.counselor_name, it.counselor_position,
                         it.counselor_phone, it.counselor_email, it.counselor_fax,
-                        it.is_current_school, it.start_date, it.end_date, it.grade_levels_attended,
+                        (it.is_current_school or False), it.start_date, it.end_date, it.grade_levels_attended,
                         it.grading_scale, it.max_grade_offered, it.schedule_type,
                         caf, it.courses_available_notes, it.graduating_class_size,
                         it.boarding_students, it.curriculum_notes, it.notes, user_id)
@@ -3949,7 +3949,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         it.school_type, it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.country, it.counselor_name, it.counselor_position,
                         it.counselor_phone, it.counselor_email, it.counselor_fax,
-                        it.is_current_school, it.start_date, it.end_date, it.grade_levels_attended,
+                        (it.is_current_school or False), it.start_date, it.end_date, it.grade_levels_attended,
                         it.grading_scale, it.max_grade_offered, it.schedule_type,
                         caf, it.courses_available_notes, it.graduating_class_size,
                         it.boarding_students, it.curriculum_notes, it.notes, user_id)
