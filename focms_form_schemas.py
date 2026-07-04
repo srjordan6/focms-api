@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.42 · Essay analysis (/essays/{id}/analyze) + exemplar corpus (/catalogs/essay-exemplars, /admin/essay-exemplars); shared _llm_complete adapter shim (provider-swappable). 
+v0.12.43 · fix: essays.topic_themes is jsonb not text[] - cast ::jsonb on write, json-decode on read (was blocking all essay creation).
+         v0.12.42 · Essay analysis (/essays/{id}/analyze) + exemplar corpus (/catalogs/essay-exemplars, /admin/essay-exemplars); shared _llm_complete adapter shim (provider-swappable). 
          v0.12.41 · Essay Studio: /catalogs/essay-guidance, /essays/sample (AI, env-swappable), /essays/{id}/autosave (versioned), /essays/{id}/versions.
          v0.12.40 · Higher-Ed: essays + recommenders + financial-aid + college-tests GET/POST.
          v0.12.39 · Career: job_description field + meta-skill inference rule R10 (job title/description/skills -> meta-skills).
@@ -4831,7 +4832,11 @@ async def get_essays(request: Request, student_id: str):
     for r in rows:
         d = dict(r)
         d["target_schools"] = list(d["target_schools"] or [])
-        d["topic_themes"] = list(d["topic_themes"] or [])
+        tt = d.get("topic_themes")
+        if isinstance(tt, str):
+            try: tt = json.loads(tt)
+            except Exception: tt = []
+        d["topic_themes"] = tt or []
         out.append(d)
     return {"student_id": student_id, "essays": out}
 
@@ -4863,11 +4868,11 @@ async def post_essays(request: Request, student_id: str, body: EssaysRequest):
                     r = await conn.execute(
                         "UPDATE essays SET essay_title=$3, prompt_text=$4, application_type=$5, "
                         "target_schools=$6, status=$7, word_count=$8, word_limit=$9, "
-                        "topic_themes=$10, body_content=$11, notes=$12, updated_at=now(), "
+                        "topic_themes=$10::jsonb, body_content=$11, notes=$12, updated_at=now(), "
                         "updated_by=$13::uuid WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, it.essay_title, it.prompt_text, it.application_type,
                         list(it.target_schools or []), it.status, wc, it.word_limit,
-                        list(it.topic_themes or []), it.body_content, it.notes, user_id)
+                        json.dumps(list(it.topic_themes or [])), it.body_content, it.notes, user_id)
                     if r and r.endswith(" 1"):
                         if it.show_on_showcase is True:
                             await conn.execute("UPDATE essays SET visibility='public' WHERE id=$1::uuid", it.id)
@@ -4880,10 +4885,10 @@ async def post_essays(request: Request, student_id: str, body: EssaysRequest):
                         "application_type, target_schools, status, word_count, word_limit, "
                         "topic_themes, body_content, notes, visibility, source_system, "
                         "created_by, updated_by) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,"
-                        "$10,$11,$12,'private','parent_portal',$13::uuid,$13::uuid) RETURNING id",
+                        "$10::jsonb,$11,$12,'private','parent_portal',$13::uuid,$13::uuid) RETURNING id",
                         tenant_id, student_id, it.essay_title, it.prompt_text, it.application_type,
                         list(it.target_schools or []), it.status, wc, it.word_limit,
-                        list(it.topic_themes or []), it.body_content, it.notes, user_id)
+                        json.dumps(list(it.topic_themes or [])), it.body_content, it.notes, user_id)
                     if it.show_on_showcase is True:
                         await conn.execute("UPDATE essays SET visibility='public' WHERE id=$1::uuid", rid)
                     saved += 1
