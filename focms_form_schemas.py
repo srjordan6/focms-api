@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.47 · debug: surface raw LLM text on parse failure (temporary).
+v0.12.48 · fix: sanitize deepseek `"key": word: N` pollution before JSON parse.
+         v0.12.47 · debug: surface raw LLM text on parse failure (temporary).
          v0.12.46 · fix: request response_format json_object for analyze/extract; strip injected <span> tags before JSON parse (deepseek pollution).
          v0.12.45 · fix: openai_compatible reads message.reasoning when content is empty (thinking models like qwen3.5:cloud return reasoning-only).
          v0.12.44 · fix: _extract_json tolerates thinking models (strip <think>, code fences, balanced-brace scan) so qwen3.5:cloud analysis parses.
@@ -5461,6 +5462,8 @@ def _extract_json(text: str):
     t = _re.sub(r"<think>.*?</think>", " ", t, flags=_re.S | _re.I)
     # strip stray HTML tags some models inject inside values
     t = _re.sub(r"</?span[^>]*>", "", t, flags=_re.I)
+    # deepseek pollution: `"key": word: 7` -> `"key": 7`
+    t = _re.sub(r'(:\s*)[A-Za-z][\w\- ]*:\s*(-?\d)', r'\1\2', t)
     # prefer a fenced ```json ... ``` block if present
     fence = _re.search(r"```(?:json)?\s*(\{.*?\})\s*```", t, _re.S)
     candidates = []
