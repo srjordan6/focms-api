@@ -1216,6 +1216,9 @@ class RecLetterItem(BaseModel):
     id: Optional[str] = None
     recommender_id: Optional[str] = None
     letter_text: Optional[str] = None
+    file_name: Optional[str] = None
+    file_mime: Optional[str] = None
+    file_data: Optional[str] = None
     artifact_id: Optional[str] = None
     source: Optional[str] = None            # email_paste | upload | direct_form
     submitter_name: Optional[str] = None
@@ -1237,7 +1240,7 @@ async def get_rec_letters(request: Request, student_id: str):
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT id::text AS id, recommender_id::text AS recommender_id, letter_text, "
-            "artifact_id::text AS artifact_id, source, submitter_name, submitter_email, "
+            "artifact_id::text AS artifact_id, source, submitter_name, submitter_email, file_name, file_mime, "
             "relationship, years_known, ratings, status, submitted_at "
             "FROM recommendation_letters WHERE student_id=$1::uuid AND deleted_at IS NULL "
             "ORDER BY submitted_at DESC", student_id)
@@ -1268,7 +1271,7 @@ async def post_rec_letters(request: Request, student_id: str, body: RecLettersRe
                                    "WHERE id=$1::uuid AND student_id=$2::uuid", did, student_id)
                 deleted += 1
             for it in body.items or []:
-                if not (it.letter_text or it.artifact_id): continue
+                if not (it.letter_text or it.artifact_id or it.file_data): continue
                 src = it.source if it.source in _SRC else "email_paste"
                 st = it.status if it.status in _ST else "received"
                 if it.id:
@@ -1286,13 +1289,30 @@ async def post_rec_letters(request: Request, student_id: str, body: RecLettersRe
                     await conn.execute(
                         "INSERT INTO recommendation_letters (tenant_id, student_id, recommender_id, "
                         "letter_text, artifact_id, source, submitter_name, submitter_email, "
-                        "relationship, years_known, status, created_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5::uuid,$6,$7,$8,$9,$10,$11,$12::uuid)",
+                        "relationship, years_known, status, created_by, file_name, file_mime, file_data) "
+                        "VALUES ($1::uuid,$2::uuid,$3::uuid,$4,$5::uuid,$6,$7,$8,$9,$10,$11,$12::uuid,$13,$14,$15)",
                         tenant_id, student_id, it.recommender_id, it.letter_text, it.artifact_id,
                         src, it.submitter_name, it.submitter_email, it.relationship,
-                        it.years_known, st, user_id)
+                        it.years_known, st, user_id, it.file_name, it.file_mime, it.file_data)
                 saved += 1
     return {"student_id": student_id, "saved": saved, "deleted": deleted}
+
+
+@router.get("/student/{student_id}/recommendation-letters/{letter_id}/file")
+async def get_rec_letter_file(request: Request, student_id: str, letter_id: str):
+    from fastapi.responses import Response
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT file_name, file_mime, file_data FROM recommendation_letters "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL", letter_id, student_id)
+    if not row or not row["file_data"]:
+        raise HTTPException(status_code=404, detail="no file")
+    import base64 as _b64
+    data = _b64.b64decode(row["file_data"])
+    return Response(content=data, media_type=row["file_mime"] or "application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "letter"}"'})
 
 
 class RecTokenRequest(BaseModel):
