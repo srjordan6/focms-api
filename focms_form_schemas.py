@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.43 · fix: essays.topic_themes is jsonb not text[] - cast ::jsonb on write, json-decode on read (was blocking all essay creation).
+v0.12.43b · fix: default application_type when unset (NOT NULL) so Studio autosave can create rows.
+         v0.12.43 · fix: essays.topic_themes is jsonb not text[] - cast ::jsonb on write, json-decode on read (was blocking all essay creation).
          v0.12.42 · Essay analysis (/essays/{id}/analyze) + exemplar corpus (/catalogs/essay-exemplars, /admin/essay-exemplars); shared _llm_complete adapter shim (provider-swappable). 
          v0.12.41 · Essay Studio: /catalogs/essay-guidance, /essays/sample (AI, env-swappable), /essays/{id}/autosave (versioned), /essays/{id}/versions.
          v0.12.40 · Higher-Ed: essays + recommenders + financial-aid + college-tests GET/POST.
@@ -4886,7 +4887,8 @@ async def post_essays(request: Request, student_id: str, body: EssaysRequest):
                         "topic_themes, body_content, notes, visibility, source_system, "
                         "created_by, updated_by) VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,"
                         "$10::jsonb,$11,$12,'private','parent_portal',$13::uuid,$13::uuid) RETURNING id",
-                        tenant_id, student_id, it.essay_title, it.prompt_text, it.application_type,
+                        tenant_id, student_id, it.essay_title, it.prompt_text,
+                        (it.application_type or "common_app_personal"),
                         list(it.target_schools or []), it.status, wc, it.word_limit,
                         json.dumps(list(it.topic_themes or [])), it.body_content, it.notes, user_id)
                     if it.show_on_showcase is True:
