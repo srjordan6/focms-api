@@ -3799,7 +3799,7 @@ async def post_student_applications(request: Request, student_id: str, body: App
                     v = getattr(it, k, None)
                     if v: details[k] = v
                 import json as _json
-                det_json = _json.dumps(details) if details else None
+                det_json = _json.dumps(details or {})
                 if it.id:
                     try: _uuid.UUID(it.id)
                     except Exception: continue
