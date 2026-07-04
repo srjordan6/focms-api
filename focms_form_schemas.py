@@ -3836,7 +3836,7 @@ async def post_student_applications(request: Request, student_id: str, body: App
                         "status, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,"
                         "NULLIF($7,'')::pathway_enum,$8::date,$9::date,$10::date,"
-                        "$11,$12,$13::jsonb,$14,$15,'planning','private','parent_portal',"
+                        "$11,$12,$13::jsonb,$14,$15,'planned','private','parent_portal',"
                         "$16::uuid,$16::uuid) RETURNING id",
                         tenant_id, student_id, leaid, it.application_year, plan, plat,
                         it.pathway_track, it.deadline, it.decision_release_date,
