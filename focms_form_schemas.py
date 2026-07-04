@@ -1,7 +1,8 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.51 · fix: courses subject must match check-constraint enum (invalid->other); add courses_taken.subject_other free-text; GRANT DELETE done via MCP.
+v0.12.52 · feat: SCED subject taxonomy — /catalogs/subjects endpoint; courses_taken.subject check now SCED codes 01-23 + other.
+         v0.12.51 · fix: courses subject must match check-constraint enum (invalid->other); add courses_taken.subject_other free-text; GRANT DELETE done via MCP.
          v0.12.50 · feat: job_experiences.supervisor_email (Ask-for-Recommendation mailto); remove temporary debug_raw passthrough.
          v0.12.49 · fix: coerce em-dash placeholder values to null before parse.
          v0.12.48 · fix: sanitize deepseek `"key": word: N` pollution before JSON parse.
@@ -1199,6 +1200,18 @@ async def get_student_courses(request: Request, student_id: str):
          "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]}
 
 
+@router.get("/catalogs/subjects")
+async def get_subject_catalog(request: Request):
+    """SCED (NCES) subject areas — canonical US K-12 subject taxonomy."""
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT code, title FROM sced_subject_areas WHERE is_active ORDER BY sort_order")
+    return {"subjects": [dict(r) for r in rows]}
+
+
 @router.post("/student/{student_id}/courses")
 async def post_student_courses(request: Request, student_id: str, body: CoursesRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
@@ -1216,8 +1229,8 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 if not name:
                     continue
                 school = (it.school_name or "").strip() or default_school or "Unspecified"
-                _ALLOWED_SUBJ = {"mathematics","english","science","social_studies","foreign_language","computer_science","arts","music","health_pe","career_tech","elective","religion","other"}
-                subj = (it.subject or "").strip().lower() or None
+                _ALLOWED_SUBJ = {"01","02","03","04","05","06","07","08","09","10","11","12","13","14","15","16","17","18","19","20","21","22","23","other"}
+                subj = (it.subject or "").strip() or None
                 if subj is not None and subj not in _ALLOWED_SUBJ:
                     subj = "other"
                 rigor = (it.rigor or "regular").lower()
