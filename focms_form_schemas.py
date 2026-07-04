@@ -3563,7 +3563,7 @@ async def get_universities_catalog(request: Request, q: Optional[str] = None, li
             rows = await conn.fetch(
                 "SELECT leaid, name, common_name, city, state, us_news_rank, "
                 "admit_rate, has_rotc, has_d1_swim, is_service_academy, common_app_member "
-                "FROM universities WHERE us_news_rank IS NOT NULL "
+                "FROM universities "
                 "ORDER BY us_news_rank NULLS LAST, name LIMIT $1", limit)
     out = []
     for r in rows:
