@@ -3813,7 +3813,7 @@ async def post_student_applications(request: Request, student_id: str, body: App
                         "notes=$14, public_description=$15, "
                         "updated_at=now(), updated_by=$16::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
-                        it.id, student_id, leaid, it.application_year, plan, plat,
+                        it.id, student_id, leaid, (it.application_year or __import__('datetime').date.today().year), plan, plat,
                         it.pathway_track, it.deadline, it.decision_release_date,
                         it.submitted_at, it.fee_paid_usd, it.fee_waiver_used,
                         det_json, it.notes, it.public_description, user_id)
@@ -3838,7 +3838,7 @@ async def post_student_applications(request: Request, student_id: str, body: App
                         "NULLIF($7,'')::pathway_enum,$8::date,$9::date,$10::date,"
                         "$11,$12,$13::jsonb,$14,$15,'planned','private','parent_portal',"
                         "$16::uuid,$16::uuid) RETURNING id",
-                        tenant_id, student_id, leaid, it.application_year, plan, plat,
+                        tenant_id, student_id, leaid, (it.application_year or __import__('datetime').date.today().year), plan, plat,
                         it.pathway_track, it.deadline, it.decision_release_date,
                         it.submitted_at, it.fee_paid_usd, it.fee_waiver_used,
                         det_json, it.notes, it.public_description, user_id)
