@@ -1,5 +1,12 @@
 ﻿from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.1
+"""focms_api.py - FOCMS Data Provider REST API v0.12.2
+
+v0.12.2 (2026-07-05):
+- authenticate() now falls back to api_tokens table rows (sha256 lookup,
+  5-min in-process cache) after the FOCMS_API_TOKENS_JSON registry miss.
+  Fixes 401 "Invalid bearer token" for every parent-portal token minted at
+  cohort signup - previously only env-registry tokens worked anywhere.
+  parent_portal scope maps to role tenant_owner; expiry/revocation honored.
 
 v0.12.1 (2026-07-05):
 - Pay first, storage second: POST /focms/v1/media quota source of truth is
@@ -204,6 +211,8 @@ from typing import Any, AsyncIterator, Optional
 from uuid import UUID
 
 import asyncpg
+import hashlib as _hashlib
+import time as _time
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -750,7 +759,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.12.1", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -801,17 +810,47 @@ def role_to_enum(role: Optional[str]) -> str:
     return _ROLE_TO_ENUM.get(role, "tenant_admin")
 
 
-def authenticate(authorization: str = Header(None)) -> dict[str, Any]:
+# v0.12.2: DB-backed token cache (api_tokens rows minted at cohort signup).
+_DB_TOKEN_CACHE: dict[str, tuple[float, dict]] = {}
+_DB_TOKEN_TTL = 300.0
+
+
+async def authenticate(request: Request, authorization: str = Header(None)) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Missing or malformed Authorization header")
     token = authorization.removeprefix("Bearer ").strip()
     principal = TOKENS.get(token)
-    if not principal:
+    if principal:
+        if "tenant_id" not in principal:
+            raise HTTPException(500, "Token misconfigured: tenant_id missing")
+        principal.setdefault("role", "tenant_admin")
+        return principal
+    # v0.12.2: fall back to api_tokens rows (parent-portal tokens minted at
+    # signup). sha256 lookup with a 5-minute in-process cache.
+    now = _time.monotonic()
+    cached = _DB_TOKEN_CACHE.get(token)
+    if cached and cached[0] > now:
+        return dict(cached[1])
+    token_hash = _hashlib.sha256(token.encode()).hexdigest()
+    pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT tenant_id, created_by, scope, student_ids FROM api_tokens "
+            "WHERE token_hash = $1 AND revoked_at IS NULL "
+            "AND (expires_at IS NULL OR expires_at > now())",
+            token_hash,
+        )
+    if not row:
         raise HTTPException(401, "Invalid bearer token")
-    if "tenant_id" not in principal:
-        raise HTTPException(500, "Token misconfigured: tenant_id missing")
-    principal.setdefault("role", "tenant_admin")
-    return principal
+    principal = {
+        "tenant_id": str(row["tenant_id"]),
+        "user_id": str(row["created_by"]) if row["created_by"] else None,
+        "role": "tenant_owner" if row["scope"] == "parent_portal" else "tenant_admin",
+        "scope": row["scope"],
+        "student_ids": [str(x) for x in (row["student_ids"] or [])],
+    }
+    _DB_TOKEN_CACHE[token] = (now + _DB_TOKEN_TTL, principal)
+    return dict(principal)
 
 
 def require_write(principal: dict = Depends(authenticate)) -> dict[str, Any]:
@@ -3074,7 +3113,6 @@ async def get_swim_race_log_feed(
 # ===========================================================================
 
 import base64 as _b64
-import hashlib as _hashlib
 from fastapi.responses import Response
 
 MAX_MEDIA_BYTES = 10 * 1024 * 1024  # 10 MB cap
