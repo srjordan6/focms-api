@@ -1483,9 +1483,9 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
-# --------------------- Resume tailoring (v0.12.73) ---------------------
+# --------------------- Resume tailoring (v0.12.75) ---------------------
 
 class ResumeTailorRequest(BaseModel):
     resume_kind: Optional[str] = None          # resume_academic | resume_career
@@ -1503,12 +1503,27 @@ async def resume_tailor(request: Request, student_id: str, body: ResumeTailorReq
     src = json.dumps({"sections": body.sections})[:12000]
     audience = "an academic program or scholarship committee" if kind == "resume_academic" else "a hiring manager"
     system = (
-        "You tailor student resumes. You are given the student's real record as JSON sections "
-        "and a target description. Reorder, select, and reword entries for maximum relevance to the target. "
-        "NEVER invent facts, employers, dates, scores, or accomplishments not present in the source. "
-        "Return ONLY JSON: {\"summary\": str (2-3 sentence objective/profile tailored to the target), "
-        "\"sections\": [{\"title\": str, \"rows\": [[label, detail], ...]}]}. "
-        "Keep section titles conventional for " + audience + ". Keep every detail truthful to the source."
+        "You tailor student resumes into ATS-optimized professional format. You are given the student's "
+        "real record as JSON sections and a target description. NEVER invent facts, employers, dates, "
+        "scores, or accomplishments not present in the source. "
+        "Return ONLY JSON: {\"summary\": str, \"sections\": [{\"title\": str, \"rows\": [[label, detail], ...]}]}. "
+        "Apply these resume rules strictly: "
+        "(1) summary = tailored 3-4 sentence professional pitch using keywords from the target description; "
+        "(2) weave exact keywords and phrases from the target description into summary, skills, and bullets "
+        "wherever the source record truthfully supports them (ATS keyword matching); "
+        "(3) CORE COMPETENCIES section: 6-12 rows [\"\", skill], curated hard skills first then soft skills, "
+        "all evidenced by the record and relevant to the target; "
+        "(4) experience section (PROFESSIONAL EXPERIENCE, or ACTIVITIES & LEADERSHIP for younger students): "
+        "reverse-chronological rows [\"Role \u2014 Organization\", \"Location | Mon YYYY \u2013 Mon YYYY\\n- bullet\\n- bullet\"]; "
+        "(5) every bullet starts with a strong action verb (Led, Developed, Achieved, Competed, Mentored) \u2014 never "
+        "\"Responsible for\"; use X-Y-Z structure (accomplished X, measured by Y, by doing Z) and include real numbers "
+        "from the source (race counts, times dropped, standards earned, hours/week, years) as quantified impact; "
+        "(6) bullets are 1-2 lines max, punchy; "
+        "(7) past tense for ended roles, present tense for current roles; "
+        "(8) relevance over recency: include only entries that matter to this target, omit the rest; "
+        "(9) EDUCATION after experience: institution, location, expected graduation if known; "
+        "(10) include a CERTIFICATIONS or HONORS section only if the source contains them. "
+        "Keep total content sized for a 1-page resume. " + ("Frame for " + audience + ".")
     )
     user = "TARGET DESCRIPTION:\n" + jd + "\n\nSTUDENT RECORD (JSON):\n" + src
     res = await _llm_complete(system, user, max_tokens=2200, want_json=True)
@@ -1530,7 +1545,7 @@ async def resume_tailor(request: Request, student_id: str, body: ResumeTailorReq
         raise HTTPException(status_code=502, detail="tailoring failed; use the standard resume")
     summary = str(obj.get("summary", ""))[:800]
     if summary:
-        clean.insert(0, {"title": "SUMMARY", "rows": [["Profile", summary]]})
+        clean.insert(0, {"title": "PROFESSIONAL SUMMARY", "rows": [["Profile", summary]]})
     return {"sections": clean}
 
 
