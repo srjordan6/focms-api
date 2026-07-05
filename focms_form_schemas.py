@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -1666,6 +1666,61 @@ async def post_website_config(request: Request, student_id: str, body: WebsiteCo
                 tenant_id, student_id, band, mode, sj, pj, body.domain, body.notes, theme, lp, ls)
     return {"ok": True, "age_band": band, "control_mode": mode, "privacy": privacy, "theme_key": theme,
             "language_primary": lp, "language_secondary": ls}
+
+
+# --------------------- Public site config (v0.12.82) ---------------------
+# Anonymous endpoint consumed by the outcomestar showcase renderer. Returns
+# only publish-safe fields: first name (universal first-name-only rule),
+# graduation year, age band, theme, enabled sections, languages. 404 when the
+# family has not configured a website (config row is the publish switch).
+
+@router.get("/public/site/{slug}")
+async def public_site_config(request: Request, slug: str):
+    pool: asyncpg.Pool = request.app.state.pool
+    slug = slug.strip().lower()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow(
+            "SELECT id FROM tenants WHERE slug = $1 AND status = 'active'", slug)
+        if not tenant:
+            raise HTTPException(404, {"error": "site_not_found"})
+        tenant_id = str(tenant["id"])
+        async with _tenant_conn(pool, tenant_id) as tconn:
+            student = await tconn.fetchrow(
+                "SELECT id, first_name, expected_hs_graduation_year, "
+                "extract(year from age(birth_date))::int AS age "
+                "FROM students WHERE tenant_id = $1::uuid ORDER BY created_at LIMIT 1",
+                tenant_id)
+            if not student:
+                raise HTTPException(404, {"error": "site_not_found"})
+            cfg = await tconn.fetchrow(
+                "SELECT age_band, control_mode, sections, privacy, theme_key, "
+                "language_primary, language_secondary "
+                "FROM website_configs WHERE tenant_id = $1::uuid AND student_id = $2",
+                tenant_id, student["id"])
+    if not cfg:
+        raise HTTPException(404, {"error": "site_not_published",
+                                  "message": "This family has not published a website yet."})
+    band = cfg["age_band"] or _website_band_for_age(student["age"])
+    cat = _WEBSITE_BANDS.get(band, _WEBSITE_BANDS["band_6_12"])
+    saved_sections = cfg["sections"] if isinstance(cfg["sections"], dict) else json.loads(cfg["sections"] or "{}")
+    enabled = [
+        {"code": sdef["code"], "title": sdef["title"]}
+        for sdef in cat["sections"]
+        if saved_sections.get(sdef["code"], sdef["default"])
+    ]
+    theme = next((t for t in cat["themes"] if t["key"] == cfg["theme_key"]), None)         or (cat["themes"][0] if cat["themes"] else None)
+    return {
+        "slug": slug,
+        "student_first_name": student["first_name"],
+        "graduation_year": student["expected_hs_graduation_year"],
+        "age_band": band,
+        "band_label": cat["label"],
+        "control_mode": cfg["control_mode"] or cat["control_mode"],
+        "theme": theme,
+        "sections": enabled,
+        "language_primary": cfg["language_primary"] or "en",
+        "language_secondary": cfg["language_secondary"],
+    }
 
 
 # --------------------- Custom report composer (v0.12.80) ---------------------
