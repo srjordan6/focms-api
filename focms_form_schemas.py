@@ -1483,7 +1483,56 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+
+# --------------------- Resume tailoring (v0.12.73) ---------------------
+
+class ResumeTailorRequest(BaseModel):
+    resume_kind: Optional[str] = None          # resume_academic | resume_career
+    job_description: str
+    sections: List[dict] = []                  # [{title, rows:[[label, detail],...]}]
+
+
+@router.post("/student/{student_id}/resume-tailor")
+async def resume_tailor(request: Request, student_id: str, body: ResumeTailorRequest):
+    await _pp_context(request, student_id)
+    kind = (body.resume_kind or "resume_career").strip()
+    jd = (body.job_description or "").strip()[:8000]
+    if not jd:
+        raise HTTPException(status_code=400, detail="job_description required")
+    src = json.dumps({"sections": body.sections})[:12000]
+    audience = "an academic program or scholarship committee" if kind == "resume_academic" else "a hiring manager"
+    system = (
+        "You tailor student resumes. You are given the student's real record as JSON sections "
+        "and a target description. Reorder, select, and reword entries for maximum relevance to the target. "
+        "NEVER invent facts, employers, dates, scores, or accomplishments not present in the source. "
+        "Return ONLY JSON: {\"summary\": str (2-3 sentence objective/profile tailored to the target), "
+        "\"sections\": [{\"title\": str, \"rows\": [[label, detail], ...]}]}. "
+        "Keep section titles conventional for " + audience + ". Keep every detail truthful to the source."
+    )
+    user = "TARGET DESCRIPTION:\n" + jd + "\n\nSTUDENT RECORD (JSON):\n" + src
+    res = await _llm_complete(system, user, max_tokens=2200, want_json=True)
+    if res.get("unavailable"):
+        raise HTTPException(status_code=503, detail=res.get("reason", "LLM unavailable"))
+    obj = _extract_json(res.get("text", "")) or {}
+    secs = obj.get("sections")
+    if not isinstance(secs, list) or not secs:
+        raise HTTPException(status_code=502, detail="tailoring failed; use the standard resume")
+    clean = []
+    for sec in secs[:12]:
+        if not isinstance(sec, dict):
+            continue
+        rows = [[str(r[0])[:200], str(r[1])[:600]] for r in (sec.get("rows") or [])
+                if isinstance(r, (list, tuple)) and len(r) >= 2][:25]
+        if rows:
+            clean.append({"title": str(sec.get("title", ""))[:80], "rows": rows})
+    if not clean:
+        raise HTTPException(status_code=502, detail="tailoring failed; use the standard resume")
+    summary = str(obj.get("summary", ""))[:800]
+    if summary:
+        clean.insert(0, {"title": "SUMMARY", "rows": [["Profile", summary]]})
+    return {"sections": clean}
+
 
 class UcaFormItem(BaseModel):
     id: Optional[str] = None
