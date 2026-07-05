@@ -5,6 +5,14 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.9 (2026-07-05):
+- Signup data now lands in the portal: provisioning (both 13+ and under-13
+  webhook paths) seeds student_personal_details (residence country, primary
+  student email if given) and a family_members row for the signing parent
+  (relationship Parent, legal guardian, email/name encrypted via
+  focms_encrypt_pii with FOCMS_KEK_MASTER; plaintext skipped if KEK unset).
+  source_system='cohort_signup'.
+
 v0.11.8 (2026-07-05):
 - GET /focms/v1/auth/token-context: bearer token -> {tenant_id, tenant_name,
   student_id, student_first_name, student_last_name, student_age_band}.
@@ -270,6 +278,36 @@ async def _send_verification_email(to_email: str, role: str, student_name: str, 
             log.warning("resend send failed %s: %s", r.status_code, r.text[:200])
 
 
+async def _seed_portal_rows(conn: asyncpg.Connection, tenant_id, student_id, parent_user_id, p: dict) -> None:
+    """v0.11.9: make signup data visible in the parent portal immediately."""
+    kek = os.environ.get("FOCMS_KEK_MASTER")
+    try:
+        await conn.execute(
+            """INSERT INTO student_personal_details (student_id, tenant_id, email_primary,
+                 residence_country, visibility, source_system, created_by, updated_by)
+               VALUES ($1, $2, $3, 'US', 'private', 'cohort_signup', $4, $4)
+               ON CONFLICT (student_id) DO NOTHING""",
+            student_id, tenant_id, p.get("student_email"), parent_user_id)
+    except Exception as exc:
+        log.warning("seed personal_details failed (non-fatal): %r", exc)
+    if not kek:
+        log.warning("FOCMS_KEK_MASTER unset; family member seed skipped")
+        return
+    try:
+        await conn.execute(
+            """INSERT INTO family_members (tenant_id, student_id, relationship, is_legal_guardian,
+                 guardian_order, first_name_ciphertext, last_name_ciphertext, email_ciphertext,
+                 is_living, resides_with_student, visibility, source_system, created_by, updated_by)
+               VALUES ($1, $2, 'Parent', true, 1,
+                 focms_encrypt_pii($1, $3, $6), focms_encrypt_pii($1, $4, $6),
+                 focms_encrypt_pii($1, $5, $6),
+                 true, true, 'private', 'cohort_signup', $7, $7)""",
+            tenant_id, student_id, p["parent_first_name"], p["parent_last_name"],
+            p["parent_email"], kek, parent_user_id)
+    except Exception as exc:
+        log.warning("seed family_members failed (non-fatal): %r", exc)
+
+
 @router.post("/cohort-signup", response_model=CohortSignupResponse, status_code=201)
 async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str, Any]:
     """Anonymous cohort-based signup. See design doc cohort_signup_backend_design_v0_1."""
@@ -524,6 +562,14 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 student_id,
                 parent_user_id,
             )
+
+            # Step 8b (v0.11.9): seed portal-visible rows from signup data
+            await _seed_portal_rows(conn, family_tenant_id, student_id, parent_user_id, {
+                "parent_first_name": body.parent_first_name,
+                "parent_last_name": body.parent_last_name,
+                "parent_email": str(body.parent_email),
+                "student_email": str(body.student_email) if body.student_email else None,
+            })
 
             # Step 9b (v0.11.2): email verification rows
             verify_targets: list[tuple[str, str, str, bool]] = []  # (role, email, raw_token, needs_review)
@@ -961,6 +1007,8 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 """INSERT INTO api_tokens (tenant_id, token_hash, student_ids, name, scope, created_by)
                    VALUES ($1,$2,ARRAY[$3::uuid],'parent-portal','parent_portal',$4)""",
                 family_tenant_id, token_hash, student_id, parent_user_id)
+
+            await _seed_portal_rows(conn, family_tenant_id, student_id, parent_user_id, p)
 
             await conn.execute(
                 "UPDATE cohorts SET redemption_count = redemption_count + 1, updated_at = now() WHERE id = $1",
