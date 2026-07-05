@@ -108,12 +108,21 @@ async def _tenant_conn(pool, tenant_id: str):
 
 async def _resolve_context(request: Request) -> dict:
     """
-    Delegate to focms_api.authenticate. Returns dict with tenant_id, user_id,
-    role from the FOCMS_API_TOKENS_JSON mapping.
+    v0.12.81: env-registry token via focms_api.authenticate (sync shim), then
+    api_tokens fallback via focms_api.db_token_principal - signup-minted
+    parent-portal tokens now work on every form-schemas endpoint.
     """
-    from focms_api import authenticate as _authenticate
+    from focms_api import authenticate as _authenticate, db_token_principal
     authorization = request.headers.get("authorization")
-    ctx = _authenticate(authorization=authorization)
+    try:
+        ctx = _authenticate(authorization=authorization)
+    except HTTPException as exc:
+        if exc.status_code != 401 or not (authorization or "").startswith("Bearer "):
+            raise
+        ctx = await db_token_principal(
+            request.app.state.pool, authorization.removeprefix("Bearer ").strip())
+        if not ctx:
+            raise
     # authenticate returns {"tenant_id", "user_id", "role"} plus maybe more.
     # Normalize to the shape the endpoints expect.
     return {
@@ -1483,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
