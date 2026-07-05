@@ -5,6 +5,12 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.7 (2026-07-05):
+- Under-13 free-plan path: storage_plan_key='free' triggers a one-time $1
+  Parental Consent Verification charge (pricing_tiers plan_key='vpc_consent',
+  mode=payment) instead of a subscription; family provisions on the free
+  1 GB plan after the charge. Paid plans remain available at signup.
+
 v0.11.6 (2026-07-05):
 - Payment-first under-13 signup (unblocks the VPC gate per
   coppa_vpc_method_selection_v0_1): when the student is under 13, signup
@@ -290,17 +296,25 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "message": "Students under 13 require verified parental consent; "
                            "enrollment for under-13 students is temporarily unavailable.",
             })
+        requested = (body.storage_plan_key or "").strip().lower()
+        one_time = requested == "free"
         async with pool.acquire() as conn:
-            tier = await conn.fetchrow(
-                "SELECT plan_key, stripe_price_id FROM pricing_tiers "
-                "WHERE plan_key = $1 AND active AND stripe_price_id IS NOT NULL AND NOT stackable",
-                (body.storage_plan_key or "").strip().lower())
+            if one_time:
+                tier = await conn.fetchrow(
+                    "SELECT 'free'::text AS plan_key, stripe_price_id FROM pricing_tiers "
+                    "WHERE plan_key = 'vpc_consent' AND stripe_price_id IS NOT NULL")
+            else:
+                tier = await conn.fetchrow(
+                    "SELECT plan_key, stripe_price_id FROM pricing_tiers "
+                    "WHERE plan_key = $1 AND active AND stripe_price_id IS NOT NULL AND NOT stackable",
+                    requested)
             if not tier:
                 raise HTTPException(400, {
                     "error": "vpc_plan_required",
                     "message": "For students under 13, federal law requires verified parental "
-                               "consent. Choose a storage plan - your card payment is the "
-                               "FTC-recognized consent method, and the plan unlocks file storage.",
+                               "consent. Choose the $1 one-time consent verification (free plan) "
+                               "or a storage plan - the card payment is the FTC-recognized "
+                               "consent method.",
                 })
             existing = await conn.fetchval(
                 "SELECT id FROM users WHERE email = $1 AND deactivated_at IS NULL",
@@ -312,7 +326,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "INSERT INTO pending_signups (payload, cohort_code) VALUES ($1::jsonb, $2) RETURNING id",
                 body.model_dump_json(), body.code)
         form = {
-            "mode": "subscription",
+            "mode": "payment" if one_time else "subscription",
             "line_items[0][price]": tier["stripe_price_id"],
             "line_items[0][quantity]": "1",
             "success_url": "https://outcomestar.app/signup.html?vpc=complete",
