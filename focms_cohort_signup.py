@@ -6,6 +6,7 @@ record, tenant_owner role, and API token in one atomic transaction.
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
 v0.11.10 (2026-07-05):
+- Also: relationship enum value lowercase 'parent' (check constraint).
 - HOTFIX: v0.11.9 seed inserts poisoned the signup transaction (RLS FORCE on
   student_personal_details/family_members blocks inserts without tenant
   context; try/except cannot unpoison - the v0.11.1 lesson). Each seed insert
@@ -313,7 +314,7 @@ async def _seed_portal_rows(conn: asyncpg.Connection, tenant_id, student_id, par
                 """INSERT INTO family_members (tenant_id, student_id, relationship, is_legal_guardian,
                      guardian_order, first_name_ciphertext, last_name_ciphertext, email_ciphertext,
                      is_living, resides_with_student, visibility, source_system, created_by, updated_by)
-                   VALUES ($1, $2, 'Parent', true, 1,
+                   VALUES ($1, $2, 'parent', true, 1,
                      focms_encrypt_pii($1, $3, $6), focms_encrypt_pii($1, $4, $6),
                      focms_encrypt_pii($1, $5, $6),
                      true, true, 'private', 'cohort_signup', $7, $7)""",
