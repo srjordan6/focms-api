@@ -1,5 +1,17 @@
 ﻿from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.10.0
+"""focms_api.py - FOCMS Data Provider REST API v0.12.1
+
+v0.12.1 (2026-07-05):
+- Pay first, storage second: POST /focms/v1/media quota source of truth is
+  the billing plan (tenants.storage_quota_gb set by the Stripe webhook);
+  legacy storage_quota_bytes remains an explicit override when non-NULL.
+- Over-quota uploads now 402 storage_quota_exceeded (was 413) with an
+  upgrade message; nothing is stored.
+- Free plan blocks video uploads (402 video_requires_plan) regardless of
+  remaining space, per pricing_storage_model_delta_v1_0.
+- GET /focms/v1/tenant/storage reports the effective plan quota.
+- Note: header previously said v0.10.0 while app version said 0.12.0; both
+  now read v0.12.1.
 
 Read + write API in front of FOCMS Postgres. Enforces per-request tenant
 context via RLS (SET LOCAL app.current_tenant_id). Runs as a Render Web
@@ -738,7 +750,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.12.0", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.1", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -963,7 +975,7 @@ async def get_tenant_storage(
             """
             SELECT id::text                AS tenant_id,
                    storage_used_bytes,
-                   storage_quota_bytes
+                   storage_quota_bytes, storage_plan, storage_quota_gb
               FROM tenants
              WHERE id = $1
             """,
@@ -974,6 +986,8 @@ async def get_tenant_storage(
 
     used = row["storage_used_bytes"] or 0
     quota = row["storage_quota_bytes"]
+    if quota is None and row["storage_quota_gb"] is not None:
+        quota = int(float(row["storage_quota_gb"]) * 1073741824)
     pct_used = round(100.0 * used / quota, 2) if (quota and quota > 0) else None
 
     return {
@@ -3139,23 +3153,42 @@ async def upload_media(
     # scale, the next over-quota upload gets blocked.
     async with tx(request, tenant_id) as conn:
         quota_row = await conn.fetchrow(
-            "SELECT storage_used_bytes, storage_quota_bytes "
+            "SELECT storage_used_bytes, storage_quota_bytes, storage_plan, storage_quota_gb "
             "  FROM tenants WHERE id = $1",
             UUID(tenant_id),
         )
         if quota_row is None:
             raise HTTPException(404, "tenant_not_found")
         used = quota_row["storage_used_bytes"] or 0
+        # v0.12.1 (pay first, storage second): billing plan quota is the source
+        # of truth (storage_quota_gb from pricing_tiers via webhook); legacy
+        # storage_quota_bytes acts as an explicit per-tenant override if set.
         quota = quota_row["storage_quota_bytes"]
+        if quota is None and quota_row["storage_quota_gb"] is not None:
+            quota = int(float(quota_row["storage_quota_gb"]) * 1073741824)
+        # Free plan: no video, regardless of remaining space.
+        if (quota_row["storage_plan"] or "free") == "free" and (
+            body.kind == "video" or (body.mime_type or "").lower().startswith("video/")
+        ):
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "video_requires_plan",
+                    "message": "Video uploads require a paid storage plan. "
+                               "Open Storage & Billing to choose one.",
+                },
+            )
         if quota is not None and (used + len(content)) > quota:
             log.info(
                 "media_upload_rejected_quota tenant=%s used=%d quota=%d incoming=%d",
                 tenant_id, used, quota, len(content),
             )
             raise HTTPException(
-                status_code=413,
+                status_code=402,
                 detail={
                     "error": "storage_quota_exceeded",
+                    "message": "Storage is full. Upgrade or expand your plan in "
+                               "Storage & Billing - nothing was uploaded.",
                     "used_bytes": used,
                     "quota_bytes": quota,
                     "incoming_bytes": len(content),
