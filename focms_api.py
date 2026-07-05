@@ -1,5 +1,15 @@
 ﻿from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.2
+"""focms_api.py - FOCMS Data Provider REST API v0.12.3
+
+v0.12.3 (2026-07-05):
+- HOTFIX for v0.12.2: focms_form_schemas calls authenticate() directly and
+  synchronously; the async signature returned a coroutine and 500ed every
+  form-schemas endpoint (website-config etc, no CORS headers -> browser
+  "failed to fetch"). authenticate() is sync/registry-only again;
+  the DB fallback moved to authenticate_any() (this module's dependency)
+  and db_token_principal() (exported for form_schemas' own patch).
+- KNOWN GAP until focms_form_schemas is patched: signup-minted tokens work
+  on focms_api endpoints but still 401 on form-schemas endpoints.
 
 v0.12.2 (2026-07-05):
 - authenticate() now falls back to api_tokens table rows (sha256 lookup,
@@ -759,7 +769,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.12.2", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.3", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -810,29 +820,43 @@ def role_to_enum(role: Optional[str]) -> str:
     return _ROLE_TO_ENUM.get(role, "tenant_admin")
 
 
-# v0.12.2: DB-backed token cache (api_tokens rows minted at cohort signup).
+# v0.12.2/3: DB-backed token support (api_tokens rows minted at cohort signup).
+# v0.12.3 keeps authenticate() SYNC and registry-only for backward
+# compatibility (focms_form_schemas calls it directly, unawaited); the DB
+# fallback lives in authenticate_any(), the dependency used by this module.
 _DB_TOKEN_CACHE: dict[str, tuple[float, dict]] = {}
 _DB_TOKEN_TTL = 300.0
 
 
-async def authenticate(request: Request, authorization: str = Header(None)) -> dict[str, Any]:
+def _registry_principal(token: str) -> Optional[dict]:
+    principal = TOKENS.get(token)
+    if not principal:
+        return None
+    if "tenant_id" not in principal:
+        raise HTTPException(500, "Token misconfigured: tenant_id missing")
+    principal.setdefault("role", "tenant_admin")
+    return principal
+
+
+def authenticate(authorization: str = Header(None), request: Request = None) -> dict[str, Any]:
+    """v0.12.3: original sync, env-registry-only behavior (compat shim for
+    focms_form_schemas which calls this directly)."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Missing or malformed Authorization header")
-    token = authorization.removeprefix("Bearer ").strip()
-    principal = TOKENS.get(token)
-    if principal:
-        if "tenant_id" not in principal:
-            raise HTTPException(500, "Token misconfigured: tenant_id missing")
-        principal.setdefault("role", "tenant_admin")
-        return principal
-    # v0.12.2: fall back to api_tokens rows (parent-portal tokens minted at
-    # signup). sha256 lookup with a 5-minute in-process cache.
+    principal = _registry_principal(authorization.removeprefix("Bearer ").strip())
+    if not principal:
+        raise HTTPException(401, "Invalid bearer token")
+    return principal
+
+
+async def db_token_principal(pool, token: str) -> Optional[dict]:
+    """Shared api_tokens lookup (used by authenticate_any and, after its own
+    patch, focms_form_schemas)."""
     now = _time.monotonic()
     cached = _DB_TOKEN_CACHE.get(token)
     if cached and cached[0] > now:
         return dict(cached[1])
     token_hash = _hashlib.sha256(token.encode()).hexdigest()
-    pool = request.app.state.pool
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT tenant_id, created_by, scope, student_ids FROM api_tokens "
@@ -841,7 +865,7 @@ async def authenticate(request: Request, authorization: str = Header(None)) -> d
             token_hash,
         )
     if not row:
-        raise HTTPException(401, "Invalid bearer token")
+        return None
     principal = {
         "tenant_id": str(row["tenant_id"]),
         "user_id": str(row["created_by"]) if row["created_by"] else None,
@@ -853,7 +877,21 @@ async def authenticate(request: Request, authorization: str = Header(None)) -> d
     return dict(principal)
 
 
-def require_write(principal: dict = Depends(authenticate)) -> dict[str, Any]:
+async def authenticate_any(request: Request, authorization: str = Header(None)) -> dict[str, Any]:
+    """Registry first, api_tokens fallback. FastAPI dependency for this module."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or malformed Authorization header")
+    token = authorization.removeprefix("Bearer ").strip()
+    principal = _registry_principal(token)
+    if principal:
+        return principal
+    principal = await db_token_principal(request.app.state.pool, token)
+    if not principal:
+        raise HTTPException(401, "Invalid bearer token")
+    return principal
+
+
+def require_write(principal: dict = Depends(authenticate_any)) -> dict[str, Any]:
     role = principal.get("role", "")
     if role not in WRITE_ROLES:
         raise HTTPException(403, f"Role '{role}' is not permitted to write")
@@ -979,7 +1017,7 @@ async def health(request: Request) -> dict[str, Any]:
 
 @app.get("/focms/v1/types")
 async def list_types(
-    request: Request, principal: dict = Depends(authenticate),
+    request: Request, principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch("""
@@ -1005,7 +1043,7 @@ async def list_types(
 @app.get("/focms/v1/tenant/storage")
 async def get_tenant_storage(
     request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     """Return the calling tenant's storage usage and quota."""
     tenant_id = principal["tenant_id"]
@@ -1048,7 +1086,7 @@ async def get_tenant_storage(
 @app.get("/focms/v1/student/{student_id}")
 async def get_student(
     student_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         row = await conn.fetchrow("""
@@ -1083,7 +1121,7 @@ RECORD_TABLES = {
 @app.get("/focms/v1/student/{student_id}/records")
 async def get_records(
     student_id: UUID, request: Request, type: str, limit: int = 100,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     if type not in RECORD_TABLES:
         raise HTTPException(400, f"Unknown record type: {type}")
@@ -1109,7 +1147,7 @@ async def get_records(
 @app.get("/focms/v1/student/{student_id}/target-universities")
 async def get_target_universities(
     student_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         targets = await conn.fetch("""
@@ -1191,7 +1229,7 @@ def _split_event_course(label: str):
 @app.get("/focms/v1/student/{student_id}/computed/power-index")
 async def get_power_index(
     student_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         base_row = await conn.fetchrow("""
@@ -1429,7 +1467,7 @@ async def create_archive_entry(
 @app.get("/focms/v1/archive_entries/{entry_id}")
 async def get_archive_entry(
     entry_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         row = await conn.fetchrow(
@@ -2405,7 +2443,7 @@ class PublicShowcasePatch(BaseModel):
 @app.get("/focms/v1/public_showcases")
 async def list_public_showcases(
     request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch(
@@ -2444,7 +2482,7 @@ async def list_public_showcases(
 @app.get("/focms/v1/students")
 async def list_students(
     request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         rows = await conn.fetch(
@@ -2481,7 +2519,7 @@ async def list_students(
 @app.get("/focms/v1/showcase/{slug}")
 async def get_showcase_by_slug(
     slug: str, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with request.app.state.pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -2883,7 +2921,7 @@ def _next_standard(seconds: float, standards: dict[str, float]) -> tuple[Optiona
 @app.get("/focms/v1/student/{student_id}/computed/swim-bests")
 async def get_swim_bests_feed(
     student_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     async with tx(request, principal["tenant_id"]) as conn:
         records = await conn.fetch("""
@@ -3024,7 +3062,7 @@ def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optiona
 @app.get("/focms/v1/student/{student_id}/computed/swim-race-log")
 async def get_swim_race_log_feed(
     student_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
     limit: int = 1000,
     course: Optional[str] = None,
     stroke: Optional[str] = None,
@@ -3465,7 +3503,7 @@ async def delete_media(
 @app.get("/focms/v1/student/{student_id}/media")
 async def list_student_media(
     student_id: UUID, request: Request,
-    principal: dict = Depends(authenticate),
+    principal: dict = Depends(authenticate_any),
 ) -> dict[str, Any]:
     """List media for a student."""
     async with tx(request, principal["tenant_id"]) as conn:
