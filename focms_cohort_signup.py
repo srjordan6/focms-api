@@ -5,6 +5,14 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.8 (2026-07-05):
+- GET /focms/v1/auth/token-context: bearer token -> {tenant_id, tenant_name,
+  student_id, student_first_name, student_last_name, student_age_band}.
+  Resolves api_tokens rows (first student_ids entry) or FOCMS_API_TOKENS_JSON
+  registry entries (tenant's first student). Lets the parent portal resolve
+  its tenant/student at runtime instead of hardcoded constants - required
+  for any tenant other than JRJ to use the portal.
+
 v0.11.7 (2026-07-05):
 - Under-13 free-plan path: storage_plan_key='free' triggers a one-time $1
   Parental Consent Verification charge (pricing_tiers plan_key='vpc_consent',
@@ -609,6 +617,55 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
 # ---------------------------------------------------------------------------
 # Storage billing (v0.11.3)
 # ---------------------------------------------------------------------------
+
+@router.get("/token-context")
+async def token_context(request: Request) -> dict[str, Any]:
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        auth = request.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(401, {"error": "auth_required", "message": "Bearer token required."})
+        raw = auth[7:].strip()
+        tenant_id = None
+        student_id = None
+        try:
+            registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+        except Exception:
+            registry = {}
+        entry = registry.get(raw)
+        if entry:
+            tenant_id = str(entry.get("tenant_id", "")) or None
+        else:
+            row = await conn.fetchrow(
+                "SELECT tenant_id, student_ids FROM api_tokens "
+                "WHERE token_hash = $1 AND revoked_at IS NULL",
+                hashlib.sha256(raw.encode()).hexdigest())
+            if row:
+                tenant_id = str(row["tenant_id"])
+                if row["student_ids"]:
+                    student_id = str(row["student_ids"][0])
+        if not tenant_id:
+            raise HTTPException(401, {"error": "invalid_token", "message": "Token not recognized."})
+        if not student_id:
+            student_id = await conn.fetchval(
+                "SELECT id FROM students WHERE tenant_id = $1::uuid ORDER BY created_at LIMIT 1",
+                tenant_id)
+        st = None
+        if student_id:
+            st = await conn.fetchrow(
+                "SELECT first_name, last_name, extract(year from age(birth_date))::int AS age "
+                "FROM students WHERE id = $1::uuid", student_id)
+        tn = await conn.fetchval("SELECT display_name FROM tenants WHERE id = $1::uuid", tenant_id)
+    age = st["age"] if st and st["age"] is not None else None
+    band = None
+    if age is not None:
+        band = "band_1_5" if age <= 5 else ("band_6_12" if age <= 12 else "band_13_18")
+    return {"tenant_id": tenant_id, "tenant_name": tn,
+            "student_id": str(student_id) if student_id else None,
+            "student_first_name": st["first_name"] if st else None,
+            "student_last_name": st["last_name"] if st else None,
+            "student_age_band": band}
+
 
 DELETION_NOTICE = (
     "Your child's life record is yours forever. Files cost us money to store; "
