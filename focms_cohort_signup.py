@@ -5,6 +5,12 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.4 (2026-07-05):
+- GET /focms/v1/auth/pricing: anonymous read of active pricing_tiers rows
+  (plan_key, display_name, storage_gb, price_usd_cents, video_allowed,
+  stackable) + the locked verbatim deletion notice string, so no surface
+  ever hardcodes prices or policy text.
+
 v0.11.3 (2026-07-05):
 - Storage billing (pricing decision of record 2026-07-05: signup free with code
   + verified emails; artifact storage is the only charge).
@@ -520,6 +526,27 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
 # ---------------------------------------------------------------------------
 # Storage billing (v0.11.3)
 # ---------------------------------------------------------------------------
+
+DELETION_NOTICE = (
+    "Your child's life record is yours forever. Files cost us money to store; "
+    "if you stop, we delete the files. We never delete the record. "
+    "Artifacts (photos, videos, documents) are deleted 90 days after a storage "
+    "plan lapses; all structured records remain yours permanently and are "
+    "exportable free at any time."
+)
+
+
+@router.get("/pricing")
+async def get_pricing(request: Request) -> dict[str, Any]:
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT plan_key, display_name, storage_gb, price_usd_cents, "
+            "billing_interval, video_allowed, stackable, sort_order "
+            "FROM pricing_tiers WHERE active ORDER BY sort_order")
+    return {"deletion_notice": DELETION_NOTICE,
+            "plans": [dict(r) for r in rows]}
+
 
 class BillingSessionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
