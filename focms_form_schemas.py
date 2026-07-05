@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2439,11 +2439,12 @@ async def post_student_religion(request: Request, student_id: str, body: Religio
             fn = (body.first_name or "").strip()
             ln = (body.last_name or "").strip()
             if fn and ln:
+                mn = (body.middle_name or "").strip() or None
                 await conn.execute(
-                    "UPDATE students SET first_name=$2, last_name=$3, "
+                    "UPDATE students SET first_name=$2, middle_name=$5, last_name=$3, "
                     "display_name=$2||' '||$3, updated_by=$4::uuid, updated_at=now() "
                     "WHERE id=$1::uuid AND deleted_at IS NULL",
-                    student_id, fn, ln, user_id)
+                    student_id, fn, ln, user_id, mn)
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
@@ -2478,7 +2479,8 @@ _PERSONAL_LOCKED = {
 
 
 class PersonalDetailsRequest(BaseModel):
-    first_name: Optional[str] = None   # v0.12.83: legal name lives on students
+    first_name: Optional[str] = None   # v0.12.83/84: legal name lives on students
+    middle_name: Optional[str] = None
     last_name: Optional[str] = None
     chosen_name: Optional[str] = None
     pronouns: list[str] = Field(default_factory=list)
@@ -2501,7 +2503,7 @@ async def get_student_personal_details(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         names = await conn.fetchrow(
-            "SELECT first_name, last_name FROM students WHERE id=$1::uuid AND deleted_at IS NULL",
+            "SELECT first_name, middle_name, last_name FROM students WHERE id=$1::uuid AND deleted_at IS NULL",
             student_id)
         row = await conn.fetchrow(
             "SELECT chosen_name, pronouns, gender_identity, legal_sex_at_birth, email_primary, "
@@ -2511,6 +2513,7 @@ async def get_student_personal_details(request: Request, student_id: str):
             "FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
     locked = sorted(_PERSONAL_LOCKED)
     base = {"first_name": names["first_name"] if names else None,
+            "middle_name": names["middle_name"] if names else None,
             "last_name": names["last_name"] if names else None}
     if not row:
         return {"student_id": student_id, "personal": base, "locked": locked}
@@ -2555,11 +2558,12 @@ async def post_student_personal_details(request: Request, student_id: str, body:
             fn = (body.first_name or "").strip()
             ln = (body.last_name or "").strip()
             if fn and ln:
+                mn = (body.middle_name or "").strip() or None
                 await conn.execute(
-                    "UPDATE students SET first_name=$2, last_name=$3, "
+                    "UPDATE students SET first_name=$2, middle_name=$5, last_name=$3, "
                     "display_name=$2||' '||$3, updated_by=$4::uuid, updated_at=now() "
                     "WHERE id=$1::uuid AND deleted_at IS NULL",
-                    student_id, fn, ln, user_id)
+                    student_id, fn, ln, user_id, mn)
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
