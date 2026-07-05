@@ -1483,9 +1483,9 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
-# --------------------- Website pillar config (v0.12.78) ---------------------
+# --------------------- Website pillar config (v0.12.80) ---------------------
 
 _WEBSITE_BANDS = {
     "band_1_5": {
@@ -1583,6 +1583,8 @@ class WebsiteConfigRequest(BaseModel):
     domain: Optional[str] = None
     notes: Optional[str] = None
     theme_key: Optional[str] = None
+    language_primary: Optional[str] = None    # BCP-47, e.g. en, es, zh
+    language_secondary: Optional[str] = None  # enables a second site in the native language
 
 
 @router.get("/student/{student_id}/website-config")
@@ -1596,7 +1598,8 @@ async def get_website_config(request: Request, student_id: str):
         except Exception:
             age = None
         row = await conn.fetchrow(
-            "SELECT age_band, control_mode, sections, privacy, domain, notes, theme_key, updated_at "
+            "SELECT age_band, control_mode, sections, privacy, domain, notes, theme_key, "
+            "language_primary, language_secondary, updated_at "
             "FROM website_configs WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
     band = (row and row["age_band"]) or _website_band_for_age(age)
     if band not in _WEBSITE_BANDS:
@@ -1606,7 +1609,8 @@ async def get_website_config(request: Request, student_id: str):
         cfg = {"age_band": band, "control_mode": row["control_mode"],
                "sections": json.loads(row["sections"]) if isinstance(row["sections"], str) else (row["sections"] or {}),
                "privacy": json.loads(row["privacy"]) if isinstance(row["privacy"], str) else (row["privacy"] or {}),
-               "domain": row["domain"], "notes": row["notes"], "theme_key": row["theme_key"]}
+               "domain": row["domain"], "notes": row["notes"], "theme_key": row["theme_key"],
+               "language_primary": row["language_primary"], "language_secondary": row["language_secondary"]}
     return {"student_id": student_id, "student_age": age, "computed_band": _website_band_for_age(age),
             "band_catalog": _WEBSITE_BANDS, "config": cfg}
 
@@ -1622,7 +1626,11 @@ async def post_website_config(request: Request, student_id: str, body: WebsiteCo
                 band = _website_band_for_age(await _pp_student_age(conn, student_id))
             except Exception:
                 band = "band_6_12"
-        forced = _WEBSITE_BANDS[band]["privacy_forced"]
+        forced = dict(_WEBSITE_BANDS[band]["privacy_forced"])
+        # Platform-wide rules (decision 2026-07-05): law > parent > child authority;
+        # public front page shows first name ONLY; nondescript slug for minors.
+        forced.update({"first_name_only_public": True, "no_address_or_phone_public": True,
+                       "nondescript_slug_required": True})
         privacy = dict(body.privacy or {})
         privacy.update(forced)  # server-side lock: forced guardrails always win
         mode = body.control_mode or _WEBSITE_BANDS[band]["control_mode"]
@@ -1631,20 +1639,27 @@ async def post_website_config(request: Request, student_id: str, body: WebsiteCo
             "SELECT id FROM website_configs WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
         valid_themes = {t["key"] for t in _WEBSITE_BANDS[band].get("themes", [])}
         theme = body.theme_key if body.theme_key in valid_themes else None
+        lp = (body.language_primary or "en").strip().lower()[:12]
+        ls = (body.language_secondary or "").strip().lower()[:12] or None
+        if ls == lp:
+            ls = None
         if row:
             await conn.execute(
                 "UPDATE website_configs SET age_band=$2, control_mode=$3, sections=$4::jsonb, "
-                "privacy=$5::jsonb, domain=$6, notes=$7, theme_key=COALESCE($8, theme_key), updated_at=now() WHERE id=$1",
-                row["id"], band, mode, sj, pj, body.domain, body.notes, theme)
+                "privacy=$5::jsonb, domain=$6, notes=$7, theme_key=COALESCE($8, theme_key), "
+                "language_primary=$9, language_secondary=$10, updated_at=now() WHERE id=$1",
+                row["id"], band, mode, sj, pj, body.domain, body.notes, theme, lp, ls)
         else:
             await conn.execute(
-                "INSERT INTO website_configs (tenant_id, student_id, age_band, control_mode, sections, privacy, domain, notes, theme_key) "
-                "VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)",
-                tenant_id, student_id, band, mode, sj, pj, body.domain, body.notes, theme)
-    return {"ok": True, "age_band": band, "control_mode": mode, "privacy": privacy, "theme_key": theme}
+                "INSERT INTO website_configs (tenant_id, student_id, age_band, control_mode, sections, privacy, "
+                "domain, notes, theme_key, language_primary, language_secondary) "
+                "VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11)",
+                tenant_id, student_id, band, mode, sj, pj, body.domain, body.notes, theme, lp, ls)
+    return {"ok": True, "age_band": band, "control_mode": mode, "privacy": privacy, "theme_key": theme,
+            "language_primary": lp, "language_secondary": ls}
 
 
-# --------------------- Custom report composer (v0.12.78) ---------------------
+# --------------------- Custom report composer (v0.12.80) ---------------------
 
 class ReportComposeRequest(BaseModel):
     title: Optional[str] = None
@@ -1690,7 +1705,7 @@ async def report_compose(request: Request, student_id: str, body: ReportComposeR
     return {"sections": clean}
 
 
-# --------------------- Resume tailoring (v0.12.78) ---------------------
+# --------------------- Resume tailoring (v0.12.80) ---------------------
 
 class ResumeTailorRequest(BaseModel):
     resume_kind: Optional[str] = None          # resume_academic | resume_career
