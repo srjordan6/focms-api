@@ -5,6 +5,20 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.3 (2026-07-05):
+- Storage billing (pricing decision of record 2026-07-05: signup free with code
+  + verified emails; artifact storage is the only charge).
+- POST /focms/v1/auth/billing-session: bearer parent-portal token -> Stripe
+  Checkout Session (subscription) for a pricing_tiers plan; expansion blocks
+  stackable via quantity. Needs STRIPE_SECRET_KEY env.
+- POST /focms/v1/auth/stripe-webhook: signature-verified
+  (STRIPE_WEBHOOK_SECRET); on checkout.session.completed updates tenants
+  storage_plan/storage_quota_gb/stripe_customer_id/billing_verified_at and
+  logs coppa_vpc_captured (payment_transaction) with youngest-student age -
+  the durable VPC evidence per coppa_vpc_method_selection_v0_1.
+- Under-13 signup gate unchanged (payment-first signup flow is the future
+  unblocking path).
+
 v0.11.2 (2026-07-05):
 - Optional student_email on signup (free-tier eligibility requires BOTH
   parent and student email verified).
@@ -24,6 +38,8 @@ v0.11.0 (2026-07-01):
 """
 import asyncio
 import hashlib
+import hmac
+import json
 import logging
 import re
 import secrets
@@ -499,6 +515,142 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
         "verification_sent_to": sent_to,
         "free_tier_pending_verification": bool(body.student_email),
     }
+
+
+# ---------------------------------------------------------------------------
+# Storage billing (v0.11.3)
+# ---------------------------------------------------------------------------
+
+class BillingSessionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plan_key: str = Field(..., min_length=1, max_length=40)
+    quantity: int = Field(1, ge=1, le=50)          # >1 only for stackable plans
+    success_url: str = Field("https://outcomestar.app/billing-success")
+    cancel_url: str = Field("https://outcomestar.app/portal")
+
+
+async def _tenant_from_bearer(request: Request, conn: asyncpg.Connection) -> dict:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, {"error": "auth_required", "message": "Bearer token required."})
+    token_hash = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+    row = await conn.fetchrow(
+        """
+        SELECT at.tenant_id, t.primary_email, t.stripe_customer_id
+        FROM api_tokens at JOIN tenants t ON t.id = at.tenant_id
+        WHERE at.token_hash = $1 AND at.revoked_at IS NULL
+        """,
+        token_hash,
+    )
+    if not row:
+        raise HTTPException(401, {"error": "invalid_token", "message": "Token not recognized."})
+    return dict(row)
+
+
+@router.post("/billing-session")
+async def billing_session(body: BillingSessionRequest, request: Request) -> dict[str, Any]:
+    api_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not api_key:
+        raise HTTPException(503, {"error": "billing_unavailable", "message": "Billing is not configured."})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        principal = await _tenant_from_bearer(request, conn)
+        tier = await conn.fetchrow(
+            "SELECT plan_key, display_name, stripe_price_id, stackable FROM pricing_tiers "
+            "WHERE plan_key = $1 AND active AND stripe_price_id IS NOT NULL",
+            body.plan_key,
+        )
+    if not tier:
+        raise HTTPException(404, {"error": "plan_not_found", "message": "Unknown or non-purchasable plan."})
+    qty = body.quantity if tier["stackable"] else 1
+    form = {
+        "mode": "subscription",
+        "line_items[0][price]": tier["stripe_price_id"],
+        "line_items[0][quantity]": str(qty),
+        "success_url": body.success_url,
+        "cancel_url": body.cancel_url,
+        "customer_email": principal["primary_email"],
+        "metadata[tenant_id]": str(principal["tenant_id"]),
+        "metadata[plan_key]": tier["plan_key"],
+        "metadata[quantity]": str(qty),
+        "subscription_data[metadata][tenant_id]": str(principal["tenant_id"]),
+    }
+    if principal.get("stripe_customer_id"):
+        form["customer"] = principal["stripe_customer_id"]
+        form.pop("customer_email", None)
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post("https://api.stripe.com/v1/checkout/sessions",
+                              headers={"Authorization": f"Bearer {api_key}"}, data=form)
+    if r.status_code >= 300:
+        log.warning("stripe checkout create failed %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(502, {"error": "stripe_error", "message": "Could not start checkout."})
+    sess = r.json()
+    return {"checkout_url": sess["url"], "session_id": sess["id"]}
+
+
+def _stripe_sig_ok(payload: bytes, header: str, secret: str) -> bool:
+    try:
+        parts = dict(p.split("=", 1) for p in header.split(","))
+        signed = f"{parts['t']}.".encode() + payload
+        expected = hmac.new(secret.encode(), signed, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, parts.get("v1", ""))
+    except Exception:
+        return False
+
+
+@router.post("/stripe-webhook")
+async def stripe_webhook(request: Request) -> dict[str, Any]:
+    secret = os.environ.get("STRIPE_WEBHOOK_SECRET")
+    payload = await request.body()
+    if not secret or not _stripe_sig_ok(payload, request.headers.get("stripe-signature", ""), secret):
+        raise HTTPException(400, {"error": "bad_signature"})
+    event = json.loads(payload)
+    if event.get("type") != "checkout.session.completed":
+        return {"received": True, "ignored": event.get("type")}
+    sess = event["data"]["object"]
+    meta = sess.get("metadata") or {}
+    tenant_id, plan_key = meta.get("tenant_id"), meta.get("plan_key")
+    qty = int(meta.get("quantity", "1") or 1)
+    if not tenant_id or not plan_key:
+        return {"received": True, "ignored": "no_metadata"}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        tier = await conn.fetchrow(
+            "SELECT storage_gb, stackable FROM pricing_tiers WHERE plan_key = $1", plan_key)
+        if not tier:
+            return {"received": True, "ignored": "unknown_plan"}
+        if tier["stackable"]:
+            await conn.execute(
+                "UPDATE tenants SET storage_quota_gb = storage_quota_gb + $2, "
+                "stripe_customer_id = COALESCE($3, stripe_customer_id), "
+                "billing_verified_at = COALESCE(billing_verified_at, now()) WHERE id = $1::uuid",
+                tenant_id, tier["storage_gb"] * qty, sess.get("customer"))
+        else:
+            await conn.execute(
+                "UPDATE tenants SET storage_plan = $2, storage_quota_gb = $3, "
+                "stripe_customer_id = COALESCE($4, stripe_customer_id), "
+                "billing_verified_at = COALESCE(billing_verified_at, now()) WHERE id = $1::uuid",
+                tenant_id, plan_key, tier["storage_gb"], sess.get("customer"))
+        youngest = await conn.fetchval(
+            "SELECT min(extract(year from age(birth_date)))::int FROM students "
+            "WHERE tenant_id = $1::uuid AND birth_date IS NOT NULL", tenant_id)
+        try:
+            await conn.execute(
+                """
+                INSERT INTO audit_log (tenant_id, actor_role, action, target_table,
+                                       target_id, target_label, new_value)
+                VALUES ($1::uuid, 'tenant_owner', 'coppa_vpc_captured', 'tenants', $2, $3, $4::jsonb)
+                """,
+                tenant_id, str(tenant_id), f"storage purchase {plan_key} x{qty}",
+                json.dumps({"method": "payment_transaction", "processor": "stripe",
+                            "checkout_session": sess.get("id"),
+                            "subscription": sess.get("subscription"),
+                            "youngest_student_age": youngest, "plan_key": plan_key,
+                            "quantity": qty}))
+        except Exception as exc:
+            log.warning("coppa_vpc_captured audit insert failed (non-fatal): %r", exc)
+    log.info("storage_purchase tenant=%s plan=%s x%s", tenant_id, plan_key, qty)
+    return {"received": True}
 
 
 _VERIFY_PAGE = """<!DOCTYPE html><html><head><meta charset='utf-8'>
