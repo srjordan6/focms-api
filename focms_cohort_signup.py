@@ -5,6 +5,14 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.10 (2026-07-05):
+- HOTFIX: v0.11.9 seed inserts poisoned the signup transaction (RLS FORCE on
+  student_personal_details/family_members blocks inserts without tenant
+  context; try/except cannot unpoison - the v0.11.1 lesson). Each seed insert
+  now runs in its own SAVEPOINT (nested conn.transaction()) with
+  SET LOCAL app.current_tenant_id (validated-UUID f-string literal per
+  playbook PgBouncer rule) so a failure rolls back only the savepoint.
+
 v0.11.9 (2026-07-05):
 - Signup data now lands in the portal: provisioning (both 13+ and under-13
   webhook paths) seeds student_personal_details (residence country, primary
@@ -279,31 +287,38 @@ async def _send_verification_email(to_email: str, role: str, student_name: str, 
 
 
 async def _seed_portal_rows(conn: asyncpg.Connection, tenant_id, student_id, parent_user_id, p: dict) -> None:
-    """v0.11.9: make signup data visible in the parent portal immediately."""
+    """v0.11.9/10: portal-visible seed rows. Each insert in its own SAVEPOINT
+    with tenant RLS context, so a failure never poisons the outer signup
+    transaction."""
     kek = os.environ.get("FOCMS_KEK_MASTER")
+    tid = str(UUID(str(tenant_id)))  # validate before f-string literal (PgBouncer rule)
     try:
-        await conn.execute(
-            """INSERT INTO student_personal_details (student_id, tenant_id, email_primary,
-                 residence_country, visibility, source_system, created_by, updated_by)
-               VALUES ($1, $2, $3, 'US', 'private', 'cohort_signup', $4, $4)
-               ON CONFLICT (student_id) DO NOTHING""",
-            student_id, tenant_id, p.get("student_email"), parent_user_id)
+        async with conn.transaction():  # SAVEPOINT
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tid}'")
+            await conn.execute(
+                """INSERT INTO student_personal_details (student_id, tenant_id, email_primary,
+                     residence_country, visibility, source_system, created_by, updated_by)
+                   VALUES ($1, $2, $3, 'US', 'private', 'cohort_signup', $4, $4)
+                   ON CONFLICT (student_id) DO NOTHING""",
+                student_id, tenant_id, p.get("student_email"), parent_user_id)
     except Exception as exc:
         log.warning("seed personal_details failed (non-fatal): %r", exc)
     if not kek:
         log.warning("FOCMS_KEK_MASTER unset; family member seed skipped")
         return
     try:
-        await conn.execute(
-            """INSERT INTO family_members (tenant_id, student_id, relationship, is_legal_guardian,
-                 guardian_order, first_name_ciphertext, last_name_ciphertext, email_ciphertext,
-                 is_living, resides_with_student, visibility, source_system, created_by, updated_by)
-               VALUES ($1, $2, 'Parent', true, 1,
-                 focms_encrypt_pii($1, $3, $6), focms_encrypt_pii($1, $4, $6),
-                 focms_encrypt_pii($1, $5, $6),
-                 true, true, 'private', 'cohort_signup', $7, $7)""",
-            tenant_id, student_id, p["parent_first_name"], p["parent_last_name"],
-            p["parent_email"], kek, parent_user_id)
+        async with conn.transaction():  # SAVEPOINT
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tid}'")
+            await conn.execute(
+                """INSERT INTO family_members (tenant_id, student_id, relationship, is_legal_guardian,
+                     guardian_order, first_name_ciphertext, last_name_ciphertext, email_ciphertext,
+                     is_living, resides_with_student, visibility, source_system, created_by, updated_by)
+                   VALUES ($1, $2, 'Parent', true, 1,
+                     focms_encrypt_pii($1, $3, $6), focms_encrypt_pii($1, $4, $6),
+                     focms_encrypt_pii($1, $5, $6),
+                     true, true, 'private', 'cohort_signup', $7, $7)""",
+                tenant_id, student_id, p["parent_first_name"], p["parent_last_name"],
+                p["parent_email"], kek, parent_user_id)
     except Exception as exc:
         log.warning("seed family_members failed (non-fatal): %r", exc)
 
