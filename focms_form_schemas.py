@@ -1483,6 +1483,77 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
+# --------------------- UCA form instances ---------------------
+
+class UcaFormItem(BaseModel):
+    id: Optional[str] = None
+    form_code: Optional[str] = None
+    application_id: Optional[str] = None
+    title: Optional[str] = None
+    data: Optional[dict] = None
+
+
+class UcaFormsRequest(BaseModel):
+    items: List[UcaFormItem] = []
+    delete_ids: List[str] = []
+
+
+@router.get("/student/{student_id}/uca-forms")
+async def get_uca_forms(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, form_code, application_id::text AS application_id, title, data, "
+            "created_at, updated_at FROM uca_form_instances "
+            "WHERE student_id=$1::uuid AND deleted_at IS NULL ORDER BY updated_at DESC", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["data"] = json.loads(d["data"]) if isinstance(d["data"], str) else (d["data"] or {})
+        d["created_at"] = d["created_at"].isoformat() if d["created_at"] else None
+        d["updated_at"] = d["updated_at"].isoformat() if d["updated_at"] else None
+        out.append(d)
+    return {"student_id": student_id, "forms": out}
+
+
+@router.post("/student/{student_id}/uca-forms")
+async def post_uca_forms(request: Request, student_id: str, body: UcaFormsRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = deleted = 0
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                await conn.execute("UPDATE uca_form_instances SET deleted_at=now() "
+                                   "WHERE id=$1::uuid AND student_id=$2::uuid", did, student_id)
+                deleted += 1
+            for it in body.items or []:
+                if not it.form_code: continue
+                dj = json.dumps(it.data or {})
+                app_id = it.application_id if it.application_id else None
+                if app_id:
+                    try: _uuid.UUID(app_id)
+                    except Exception: app_id = None
+                if it.id:
+                    try: _uuid.UUID(it.id)
+                    except Exception: continue
+                    await conn.execute(
+                        "UPDATE uca_form_instances SET title=$3, data=$4::jsonb, application_id=$5::uuid, "
+                        "updated_at=now() WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        it.id, student_id, it.title, dj, app_id)
+                else:
+                    await conn.execute(
+                        "INSERT INTO uca_form_instances (tenant_id, student_id, form_code, application_id, "
+                        "title, data, created_by) VALUES ($1::uuid,$2::uuid,$3,$4::uuid,$5,$6::jsonb,$7::uuid)",
+                        tenant_id, student_id, it.form_code, app_id, it.title, dj, user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved, "deleted": deleted}
+
+
 class RecTokenRequest(BaseModel):
     recommender_id: Optional[str] = None
     recommender_name: Optional[str] = None
