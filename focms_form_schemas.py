@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2435,6 +2435,15 @@ async def post_student_religion(request: Request, student_id: str, body: Religio
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            # v0.12.83: legal name on students row (display_name kept in sync)
+            fn = (body.first_name or "").strip()
+            ln = (body.last_name or "").strip()
+            if fn and ln:
+                await conn.execute(
+                    "UPDATE students SET first_name=$2, last_name=$3, "
+                    "display_name=$2||' '||$3, updated_by=$4::uuid, updated_at=now() "
+                    "WHERE id=$1::uuid AND deleted_at IS NULL",
+                    student_id, fn, ln, user_id)
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
@@ -2469,6 +2478,8 @@ _PERSONAL_LOCKED = {
 
 
 class PersonalDetailsRequest(BaseModel):
+    first_name: Optional[str] = None   # v0.12.83: legal name lives on students
+    last_name: Optional[str] = None
     chosen_name: Optional[str] = None
     pronouns: list[str] = Field(default_factory=list)
     gender_identity: list[str] = Field(default_factory=list)
@@ -2489,6 +2500,9 @@ async def get_student_personal_details(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
+        names = await conn.fetchrow(
+            "SELECT first_name, last_name FROM students WHERE id=$1::uuid AND deleted_at IS NULL",
+            student_id)
         row = await conn.fetchrow(
             "SELECT chosen_name, pronouns, gender_identity, legal_sex_at_birth, email_primary, "
             "phone_primary, citizenship_status, place_of_birth_country, is_hispanic_or_latino, "
@@ -2496,8 +2510,10 @@ async def get_student_personal_details(request: Request, student_id: str):
             "details->'public_fields' AS public_fields "
             "FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
     locked = sorted(_PERSONAL_LOCKED)
+    base = {"first_name": names["first_name"] if names else None,
+            "last_name": names["last_name"] if names else None}
     if not row:
-        return {"student_id": student_id, "personal": {}, "locked": locked}
+        return {"student_id": student_id, "personal": base, "locked": locked}
     pf = row["public_fields"]
     if isinstance(pf, str):
         try:
@@ -2505,6 +2521,7 @@ async def get_student_personal_details(request: Request, student_id: str):
         except Exception:
             pf = {}
     return {"student_id": student_id, "locked": locked, "personal": {
+        **base,
         "chosen_name": row["chosen_name"],
         "pronouns": list(row["pronouns"] or []),
         "gender_identity": list(row["gender_identity"] or []),
@@ -2534,6 +2551,15 @@ async def post_student_personal_details(request: Request, student_id: str, body:
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            # v0.12.83: legal name on students row (display_name kept in sync)
+            fn = (body.first_name or "").strip()
+            ln = (body.last_name or "").strip()
+            if fn and ln:
+                await conn.execute(
+                    "UPDATE students SET first_name=$2, last_name=$3, "
+                    "display_name=$2||' '||$3, updated_by=$4::uuid, updated_at=now() "
+                    "WHERE id=$1::uuid AND deleted_at IS NULL",
+                    student_id, fn, ln, user_id)
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
