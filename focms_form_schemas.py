@@ -1483,9 +1483,129 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
-# --------------------- Custom report composer (v0.12.76) ---------------------
+# --------------------- Website pillar config (v0.12.77) ---------------------
+
+_WEBSITE_BANDS = {
+    "band_1_5": {
+        "label": "Ages 1-5 \u00b7 Family Memory Book", "control_mode": "parent_managed",
+        "sections": [
+            {"code": "growth_timeline",  "title": "Growth & Milestone Timeline",  "source": "milestones + student_skills", "default": True},
+            {"code": "art_gallery",      "title": "Digital Art & Project Gallery", "source": "media_files",                "default": True},
+            {"code": "memory_scrapbook", "title": "Memory Scrapbook",              "source": "events + media_files",       "default": True},
+            {"code": "birthday_interviews", "title": "Birthday Interview Log",     "source": "events (annual interview)",  "default": True},
+            {"code": "family_excursions",  "title": "Family Excursions & Vacations", "source": "events + media_files",     "default": False},
+        ],
+        "privacy_forced": {"password_protected": True, "hide_from_search": True, "pii_locked": True, "comments_disabled": True},
+        "privacy_optional": [],
+    },
+    "band_6_12": {
+        "label": "Ages 6-12 \u00b7 Developmental Portfolio", "control_mode": "shared",
+        "sections": [
+            {"code": "athlete_tracker",   "title": "Student-Athlete Tracker (PRs, times)", "source": "personal_records + events + power index", "default": True},
+            {"code": "leadership_milestones", "title": "Leadership & Group Milestones",    "source": "affiliations + milestones", "default": True},
+            {"code": "fine_arts",         "title": "Fine Arts Showcase",                   "source": "affiliations (music) + media", "default": True},
+            {"code": "stem_portfolio",    "title": "Academic & STEM Portfolio",            "source": "events + courses_taken", "default": True},
+            {"code": "writing_book_log",  "title": "Writing & Book Log",                   "source": "events (reading log)", "default": False},
+        ],
+        "privacy_forced": {"hide_from_search": True, "pii_locked": True, "comment_moderation": True},
+        "privacy_optional": ["two_gate_private_portal", "password_protected"],
+    },
+    "band_13_18": {
+        "label": "Ages 13-18 \u00b7 Professional Launchpad", "control_mode": "student_led",
+        "sections": [
+            {"code": "resume_cv",         "title": "Resume / CV Tab",                    "source": "resume engine (uca_form_instances)", "default": True},
+            {"code": "academic_capstone", "title": "Academic Capstone & Research",       "source": "events + essays + verified_documents", "default": True},
+            {"code": "essay_vault",       "title": "Essay & Writing Vault",              "source": "essays", "default": False},
+            {"code": "recruitment_portal", "title": "Athletics Recruitment Portal",      "source": "swim bests + power index + coach contacts + grad year", "default": True},
+            {"code": "highlight_reel",    "title": "Highlight Reel (video)",             "source": "media_files (video)", "default": False},
+            {"code": "leadership_impact", "title": "Leadership & Extracurricular Impact", "source": "affiliations + service logs", "default": True},
+            {"code": "branding",          "title": "Professional Branding (domain, LinkedIn)", "source": "digital_presence", "default": True},
+        ],
+        "privacy_forced": {},
+        "privacy_optional": ["two_gate_private_portal", "hide_from_search", "password_protected"],
+    },
+}
+
+
+def _website_band_for_age(age: Optional[float]) -> str:
+    if age is None:
+        return "band_6_12"
+    if age <= 5:
+        return "band_1_5"
+    if age <= 12:
+        return "band_6_12"
+    return "band_13_18"
+
+
+class WebsiteConfigRequest(BaseModel):
+    age_band: Optional[str] = None
+    control_mode: Optional[str] = None
+    sections: dict = {}
+    privacy: dict = {}
+    domain: Optional[str] = None
+    notes: Optional[str] = None
+
+
+@router.get("/student/{student_id}/website-config")
+async def get_website_config(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    age = None
+    async with _tenant_conn(pool, tenant_id) as conn:
+        try:
+            age = await _pp_student_age(conn, student_id)
+        except Exception:
+            age = None
+        row = await conn.fetchrow(
+            "SELECT age_band, control_mode, sections, privacy, domain, notes, updated_at "
+            "FROM website_configs WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+    band = (row and row["age_band"]) or _website_band_for_age(age)
+    if band not in _WEBSITE_BANDS:
+        band = _website_band_for_age(age)
+    cfg = None
+    if row:
+        cfg = {"age_band": band, "control_mode": row["control_mode"],
+               "sections": json.loads(row["sections"]) if isinstance(row["sections"], str) else (row["sections"] or {}),
+               "privacy": json.loads(row["privacy"]) if isinstance(row["privacy"], str) else (row["privacy"] or {}),
+               "domain": row["domain"], "notes": row["notes"]}
+    return {"student_id": student_id, "student_age": age, "computed_band": _website_band_for_age(age),
+            "band_catalog": _WEBSITE_BANDS, "config": cfg}
+
+
+@router.post("/student/{student_id}/website-config")
+async def post_website_config(request: Request, student_id: str, body: WebsiteConfigRequest):
+    tenant_id, _ = await _pp_context(request, student_id)
+    band = body.age_band if body.age_band in _WEBSITE_BANDS else None
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        if band is None:
+            try:
+                band = _website_band_for_age(await _pp_student_age(conn, student_id))
+            except Exception:
+                band = "band_6_12"
+        forced = _WEBSITE_BANDS[band]["privacy_forced"]
+        privacy = dict(body.privacy or {})
+        privacy.update(forced)  # server-side lock: forced guardrails always win
+        mode = body.control_mode or _WEBSITE_BANDS[band]["control_mode"]
+        sj, pj = json.dumps(body.sections or {}), json.dumps(privacy)
+        row = await conn.fetchrow(
+            "SELECT id FROM website_configs WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+        if row:
+            await conn.execute(
+                "UPDATE website_configs SET age_band=$2, control_mode=$3, sections=$4::jsonb, "
+                "privacy=$5::jsonb, domain=$6, notes=$7, updated_at=now() WHERE id=$1",
+                row["id"], band, mode, sj, pj, body.domain, body.notes)
+        else:
+            await conn.execute(
+                "INSERT INTO website_configs (tenant_id, student_id, age_band, control_mode, sections, privacy, domain, notes) "
+                "VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::jsonb, $7, $8)",
+                tenant_id, student_id, band, mode, sj, pj, body.domain, body.notes)
+    return {"ok": True, "age_band": band, "control_mode": mode, "privacy": privacy}
+
+
+# --------------------- Custom report composer (v0.12.77) ---------------------
 
 class ReportComposeRequest(BaseModel):
     title: Optional[str] = None
@@ -1531,7 +1651,7 @@ async def report_compose(request: Request, student_id: str, body: ReportComposeR
     return {"sections": clean}
 
 
-# --------------------- Resume tailoring (v0.12.76) ---------------------
+# --------------------- Resume tailoring (v0.12.77) ---------------------
 
 class ResumeTailorRequest(BaseModel):
     resume_kind: Optional[str] = None          # resume_academic | resume_career
