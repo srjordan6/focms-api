@@ -1415,6 +1415,57 @@ async def post_verified_docs(request: Request, student_id: str, body: VerifiedDo
     return {"student_id": student_id, "saved": saved, "deleted": deleted}
 
 
+@router.post("/student/{student_id}/verified-documents/{doc_id}/extract")
+async def extract_verified_doc(request: Request, student_id: str, doc_id: str):
+    """Extract courses/GPA from a stored transcript PDF via LLM. Returns a proposal; nothing is written."""
+    import base64 as _b64
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT file_name, file_data FROM verified_documents "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL", doc_id, student_id)
+    if not row or not row["file_data"]:
+        raise HTTPException(status_code=404, detail="no file")
+    raw = _b64.b64decode(row["file_data"])
+    try:
+        from pypdf import PdfReader
+        import io as _io
+        reader = PdfReader(_io.BytesIO(raw))
+        text = "\n".join((pg.extract_text() or "") for pg in reader.pages)[:20000]
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"pdf text extraction failed: {e}")
+    if len(text.strip()) < 50:
+        raise HTTPException(status_code=400, detail="no extractable text (scanned image PDF); OCR not yet supported")
+    sys_p = ("You extract structured data from US school transcripts. "
+             "Respond ONLY with JSON, no prose, no code fences. Schema: "
+             '{"gpa_unweighted": number|null, "gpa_weighted": number|null, '
+             '"courses": [{"course_name": str, "grade_level": int|null, "school_year": str|null, '
+             '"term": str|null, "grade_received": str|null, "credit_hours": number|null, '
+             '"is_honors": bool, "is_ap": bool, "is_ib": bool, "is_dual_credit": bool}]}. '
+             "grade_level is 0-12 (K=0). Omit nothing; use null when unknown.")
+    res = await _llm_complete(sys_p, "TRANSCRIPT TEXT:\n" + text, max_tokens=3000, want_json=True)
+    data = res.get("json") or {}
+    courses = data.get("courses") or []
+    clean = []
+    for c in courses[:80]:
+        if not isinstance(c, dict) or not (c.get("course_name") or "").strip(): continue
+        gl = c.get("grade_level")
+        clean.append({
+            "course_name": str(c["course_name"]).strip()[:200],
+            "grade_level": gl if isinstance(gl, int) and 0 <= gl <= 12 else None,
+            "school_year": (str(c["school_year"]).strip()[:20] if c.get("school_year") else None),
+            "term": (str(c["term"]).strip()[:40] if c.get("term") else None),
+            "grade_received": (str(c["grade_received"]).strip()[:20] if c.get("grade_received") else None),
+            "credit_hours": c.get("credit_hours") if isinstance(c.get("credit_hours"), (int, float)) else None,
+            "is_honors": bool(c.get("is_honors")), "is_ap": bool(c.get("is_ap")),
+            "is_ib": bool(c.get("is_ib")), "is_dual_credit": bool(c.get("is_dual_credit")),
+        })
+    return {"document": row["file_name"], "gpa_unweighted": data.get("gpa_unweighted"),
+            "gpa_weighted": data.get("gpa_weighted"), "courses": clean,
+            "raw_available": bool(res.get("json"))}
+
+
 @router.get("/student/{student_id}/verified-documents/{doc_id}/file")
 async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
     from fastapi.responses import Response
