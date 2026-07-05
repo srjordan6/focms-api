@@ -5,6 +5,11 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.5 (2026-07-05):
+- /billing-session accepts the tenant-scoped env admin token (FOCMS_API_TOKEN)
+  with X-Tenant-Id header, in addition to api_tokens rows - matches how the
+  parent portal authenticates everywhere else.
+
 v0.11.4 (2026-07-05):
 - GET /focms/v1/auth/pricing: anonymous read of active pricing_tiers rows
   (plan_key, display_name, storage_gb, price_usd_cents, video_allowed,
@@ -560,7 +565,19 @@ async def _tenant_from_bearer(request: Request, conn: asyncpg.Connection) -> dic
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         raise HTTPException(401, {"error": "auth_required", "message": "Bearer token required."})
-    token_hash = hashlib.sha256(auth[7:].strip().encode()).hexdigest()
+    raw = auth[7:].strip()
+    admin = os.environ.get("FOCMS_API_TOKEN")
+    if admin and hmac.compare_digest(raw, admin):
+        tenant_id = request.headers.get("x-tenant-id", "").strip()
+        if not tenant_id:
+            raise HTTPException(401, {"error": "tenant_required", "message": "X-Tenant-Id required with admin token."})
+        row = await conn.fetchrow(
+            "SELECT id AS tenant_id, primary_email, stripe_customer_id FROM tenants WHERE id = $1::uuid",
+            tenant_id)
+        if not row:
+            raise HTTPException(401, {"error": "invalid_tenant", "message": "Tenant not found."})
+        return dict(row)
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
     row = await conn.fetchrow(
         """
         SELECT at.tenant_id, t.primary_email, t.stripe_customer_id
