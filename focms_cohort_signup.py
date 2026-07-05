@@ -5,10 +5,10 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
-v0.11.5 (2026-07-05):
-- /billing-session accepts the tenant-scoped env admin token (FOCMS_API_TOKEN)
-  with X-Tenant-Id header, in addition to api_tokens rows - matches how the
-  parent portal authenticates everywhere else.
+v0.11.5a (2026-07-05):
+- /billing-session accepts tokens from the FOCMS_API_TOKENS_JSON env registry
+  (the same registry focms_api uses), tenant from X-Tenant-Id header or the
+  registry entry, in addition to api_tokens rows.
 
 v0.11.4 (2026-07-05):
 - GET /focms/v1/auth/pricing: anonymous read of active pricing_tiers rows
@@ -566,9 +566,16 @@ async def _tenant_from_bearer(request: Request, conn: asyncpg.Connection) -> dic
     if not auth.lower().startswith("bearer "):
         raise HTTPException(401, {"error": "auth_required", "message": "Bearer token required."})
     raw = auth[7:].strip()
-    admin = os.environ.get("FOCMS_API_TOKEN")
-    if admin and hmac.compare_digest(raw, admin):
-        tenant_id = request.headers.get("x-tenant-id", "").strip()
+    # Env token registry (FOCMS_API_TOKENS_JSON: {token: {tenant_id, ...}}) -
+    # same registry focms_api uses for bearer auth.
+    try:
+        registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+    except Exception:
+        registry = {}
+    entry = registry.get(raw)
+    if entry:
+        tenant_id = (request.headers.get("x-tenant-id", "").strip()
+                     or str(entry.get("tenant_id", "")))
         if not tenant_id:
             raise HTTPException(401, {"error": "tenant_required", "message": "X-Tenant-Id required with admin token."})
         row = await conn.fetchrow(
