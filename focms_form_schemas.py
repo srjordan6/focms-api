@@ -1315,6 +1315,123 @@ async def get_rec_letter_file(request: Request, student_id: str, letter_id: str)
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "letter"}"'})
 
 
+# --------------------- Verified documents (Parchment-shared records) ---------------------
+
+class VerifiedDocItem(BaseModel):
+    id: Optional[str] = None
+    doc_type: Optional[str] = None      # transcript|diploma|certificate|badge|other
+    source: Optional[str] = None        # parchment_link|upload
+    source_url: Optional[str] = None
+    file_name: Optional[str] = None
+    file_mime: Optional[str] = None
+    file_data: Optional[str] = None     # base64
+    notes: Optional[str] = None
+
+
+class VerifiedDocsRequest(BaseModel):
+    items: List[VerifiedDocItem] = []
+    delete_ids: List[str] = []
+
+
+def _pdf_signature_scan(data: bytes) -> bool:
+    """Heuristic: PDF contains an embedded digital signature dictionary."""
+    return (b"/ByteRange" in data) and (b"/Sig" in data or b"adbe.pkcs7" in data or b"ETSI.CAdES" in data)
+
+
+@router.get("/student/{student_id}/verified-documents")
+async def get_verified_docs(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id::text AS id, doc_type, source, source_url, file_name, file_mime, "
+            "sha256, signature_present, verification_status, notes, created_at "
+            "FROM verified_documents WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "ORDER BY created_at DESC", student_id)
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["created_at"] = d["created_at"].isoformat() if d["created_at"] else None
+        out.append(d)
+    return {"student_id": student_id, "documents": out}
+
+
+@router.post("/student/{student_id}/verified-documents")
+async def post_verified_docs(request: Request, student_id: str, body: VerifiedDocsRequest):
+    import base64 as _b64, hashlib as _hash, urllib.request as _url
+    tenant_id, user_id = await _pp_context(request, student_id)
+    saved = deleted = 0
+    _DT = {"transcript","diploma","certificate","badge","other"}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for did in body.delete_ids or []:
+                try: _uuid.UUID(did)
+                except Exception: continue
+                await conn.execute("UPDATE verified_documents SET deleted_at=now() "
+                                   "WHERE id=$1::uuid AND student_id=$2::uuid", did, student_id)
+                deleted += 1
+            for it in body.items or []:
+                raw = None
+                src = "upload"
+                fname = it.file_name
+                fmime = it.file_mime or "application/pdf"
+                if it.file_data:
+                    try: raw = _b64.b64decode(it.file_data)
+                    except Exception: raise HTTPException(status_code=400, detail="bad base64")
+                elif it.source_url and it.source_url.lower().startswith("https://"):
+                    src = "parchment_link"
+                    try:
+                        req = _url.Request(it.source_url, headers={"User-Agent": "FOCMS/1.0"})
+                        with _url.urlopen(req, timeout=30) as resp:
+                            ct = resp.headers.get("Content-Type","")
+                            raw = resp.read(6*1024*1024)
+                        if "pdf" not in ct.lower() and not raw.startswith(b"%PDF"):
+                            raise HTTPException(status_code=400,
+                                detail="link did not return a PDF; download the PDF from Parchment and upload it instead")
+                        fmime = "application/pdf"
+                        fname = fname or "parchment_document.pdf"
+                    except HTTPException: raise
+                    except Exception as e:
+                        raise HTTPException(status_code=400, detail=f"could not fetch link: {e}")
+                else:
+                    continue
+                if raw is None or len(raw) == 0: continue
+                if len(raw) > 5*1024*1024:
+                    raise HTTPException(status_code=400, detail="file too large (max 5 MB)")
+                sig = _pdf_signature_scan(raw) if raw.startswith(b"%PDF") else False
+                status = "signature_present" if sig else "unverified"
+                dt = it.doc_type if it.doc_type in _DT else "transcript"
+                await conn.execute(
+                    "INSERT INTO verified_documents (tenant_id, student_id, doc_type, source, "
+                    "source_url, file_name, file_mime, file_data, sha256, signature_present, "
+                    "verification_status, notes, created_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::uuid)",
+                    tenant_id, student_id, dt, src, it.source_url, fname, fmime,
+                    _b64.b64encode(raw).decode(), _hash.sha256(raw).hexdigest(), sig,
+                    status, it.notes, user_id)
+                saved += 1
+    return {"student_id": student_id, "saved": saved, "deleted": deleted}
+
+
+@router.get("/student/{student_id}/verified-documents/{doc_id}/file")
+async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
+    from fastapi.responses import Response
+    import base64 as _b64
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT file_name, file_mime, file_data FROM verified_documents "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL", doc_id, student_id)
+    if not row or not row["file_data"]:
+        raise HTTPException(status_code=404, detail="no file")
+    data = _b64.b64decode(row["file_data"])
+    return Response(content=data, media_type=row["file_mime"] or "application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
+
+
 class RecTokenRequest(BaseModel):
     recommender_id: Optional[str] = None
     recommender_name: Optional[str] = None
