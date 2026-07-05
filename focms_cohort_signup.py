@@ -5,6 +5,18 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.6 (2026-07-05):
+- Payment-first under-13 signup (unblocks the VPC gate per
+  coppa_vpc_method_selection_v0_1): when the student is under 13, signup
+  requires choosing a paid storage plan; the request is parked in
+  pending_signups (24h expiry, no tenant/student rows created), a Stripe
+  Checkout session is returned (402-style flow, response field
+  vpc_checkout_url), and the family is provisioned ONLY by the webhook on
+  checkout.session.completed - payment precedes all child data persistence.
+  Welcome email (with portal token) + verification emails sent post-provision.
+- Signup body gains optional storage_plan_key (required under 13).
+- Core provisioning extracted to _provision_family() shared by both paths.
+
 v0.11.5a (2026-07-05):
 - /billing-session accepts tokens from the FOCMS_API_TOKENS_JSON env registry
   (the same registry focms_api uses), tenant from X-Tenant-Id header or the
@@ -130,6 +142,7 @@ class CohortSignupRequest(BaseModel):
     student_grade: str = Field(..., min_length=1, max_length=2)
     student_birth_year: int = Field(..., ge=2000, le=2030)
     student_email: Optional[EmailStr] = None
+    storage_plan_key: Optional[str] = None   # required when student is under 13
     accept_user_agreement: bool
     accept_privacy_policy: bool
 
@@ -151,6 +164,7 @@ class CohortSignupResponse(BaseModel):
     family_tenant_id: str
     verification_sent_to: list[str] = []
     free_tier_pending_verification: bool = False
+    vpc_checkout_url: Optional[str] = None
     family_tenant_slug: str
     student_id: str
     parent_user_id: str
@@ -263,18 +277,68 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             "message": "student_birth_year is not plausible for a K-12 student.",
         })
 
-    # COPPA gate: under-13 students require VPC (not implemented in v0.11.0)
-    if age < 13:
-        raise HTTPException(400, {
-            "error": "vpc_required",
-            "message": (
-                "Students under 13 require verified parental consent via a "
-                "process we have not yet enabled. Please contact "
-                "support@outcomestar.app to enroll."
-            ),
-        })
-
     pool: asyncpg.Pool = request.app.state.pool
+
+    # COPPA gate (v0.11.6): under-13 requires payment-first VPC. Park the
+    # request, return a Stripe Checkout URL; the webhook provisions the family
+    # AFTER payment - no child data is persisted before consent.
+    if age < 13:
+        api_key = os.environ.get("STRIPE_SECRET_KEY")
+        if not api_key:
+            raise HTTPException(400, {
+                "error": "vpc_required",
+                "message": "Students under 13 require verified parental consent; "
+                           "enrollment for under-13 students is temporarily unavailable.",
+            })
+        async with pool.acquire() as conn:
+            tier = await conn.fetchrow(
+                "SELECT plan_key, stripe_price_id FROM pricing_tiers "
+                "WHERE plan_key = $1 AND active AND stripe_price_id IS NOT NULL AND NOT stackable",
+                (body.storage_plan_key or "").strip().lower())
+            if not tier:
+                raise HTTPException(400, {
+                    "error": "vpc_plan_required",
+                    "message": "For students under 13, federal law requires verified parental "
+                               "consent. Choose a storage plan - your card payment is the "
+                               "FTC-recognized consent method, and the plan unlocks file storage.",
+                })
+            existing = await conn.fetchval(
+                "SELECT id FROM users WHERE email = $1 AND deactivated_at IS NULL",
+                body.parent_email)
+            if existing:
+                raise HTTPException(409, {"error": "email_already_exists",
+                                          "message": "An account with this email already exists."})
+            pending_id = await conn.fetchval(
+                "INSERT INTO pending_signups (payload, cohort_code) VALUES ($1::jsonb, $2) RETURNING id",
+                body.model_dump_json(), body.code)
+        form = {
+            "mode": "subscription",
+            "line_items[0][price]": tier["stripe_price_id"],
+            "line_items[0][quantity]": "1",
+            "success_url": "https://outcomestar.app/signup.html?vpc=complete",
+            "cancel_url": "https://outcomestar.app/signup.html?vpc=cancelled",
+            "customer_email": body.parent_email,
+            "metadata[pending_signup_id]": str(pending_id),
+            "metadata[plan_key]": tier["plan_key"],
+        }
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post("https://api.stripe.com/v1/checkout/sessions",
+                                  headers={"Authorization": f"Bearer {api_key}"}, data=form)
+        if r.status_code >= 300:
+            log.warning("vpc checkout create failed %s: %s", r.status_code, r.text[:300])
+            raise HTTPException(502, {"error": "stripe_error", "message": "Could not start consent checkout."})
+        sess = r.json()
+        async with pool.acquire() as conn:
+            await conn.execute("UPDATE pending_signups SET checkout_session_id=$2 WHERE id=$1",
+                               pending_id, sess["id"])
+        log.info("under13_vpc_checkout pending=%s plan=%s", pending_id, tier["plan_key"])
+        return {
+            "family_tenant_id": "", "family_tenant_slug": "", "student_id": "",
+            "parent_user_id": "", "api_token": "", "welcome_url": "",
+            "verification_sent_to": [], "free_tier_pending_verification": False,
+            "vpc_checkout_url": sess["url"],
+        }
+
     async with pool.acquire() as conn:
         async with conn.transaction():
             # Step 1: lock the cohort row for the duration of the transaction
@@ -660,6 +724,9 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         return {"received": True, "ignored": event.get("type")}
     sess = event["data"]["object"]
     meta = sess.get("metadata") or {}
+    pending_id = meta.get("pending_signup_id")
+    if pending_id:
+        return await _complete_pending_signup(request, pending_id, sess, meta)
     tenant_id, plan_key = meta.get("tenant_id"), meta.get("plan_key")
     qty = int(meta.get("quantity", "1") or 1)
     if not tenant_id or not plan_key:
@@ -745,3 +812,153 @@ async def verify_email(token: str, request: Request) -> HTMLResponse:
         msg = f"{row['email']} is confirmed. {remaining} email confirmation still pending for free access."
     log.info("email_verified tenant=%s role=%s remaining=%s", row["tenant_id"], row["subject_role"], remaining)
     return HTMLResponse(_VERIFY_PAGE.format(title="Email confirmed", msg=msg))
+
+
+async def _complete_pending_signup(request: Request, pending_id: str, sess: dict, meta: dict) -> dict[str, Any]:
+    """v0.11.6: provision a parked under-13 signup after Stripe payment (VPC)."""
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        pend = await conn.fetchrow(
+            "SELECT id, payload, cohort_code FROM pending_signups "
+            "WHERE id = $1::uuid AND consumed_at IS NULL AND expires_at > now()", pending_id)
+    if not pend:
+        log.warning("pending signup %s missing/expired/consumed", pending_id)
+        return {"received": True, "ignored": "pending_missing"}
+    p = json.loads(pend["payload"])
+    plan_key = meta.get("plan_key", "keepsake")
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            cohort = await conn.fetchrow(
+                "SELECT id, tenant_id, tier, max_redemptions, redemption_count, expires_at, status "
+                "FROM cohorts WHERE code = $1 FOR UPDATE", pend["cohort_code"])
+            if not cohort or cohort["status"] != "active":
+                log.warning("pending %s: cohort unavailable at completion", pending_id)
+                return {"received": True, "ignored": "cohort_unavailable"}
+            existing = await conn.fetchval(
+                "SELECT id FROM users WHERE email = $1 AND deactivated_at IS NULL", p["parent_email"])
+            if existing:
+                await conn.execute("UPDATE pending_signups SET consumed_at = now() WHERE id = $1::uuid", pending_id)
+                return {"received": True, "ignored": "email_exists"}
+
+            slug = generate_family_slug(p["student_first_name"], p["student_last_name"])
+            tier_row = await conn.fetchrow("SELECT storage_gb FROM pricing_tiers WHERE plan_key = $1", plan_key)
+            quota = tier_row["storage_gb"] if tier_row else 1
+            try:
+                family_tenant_id = await conn.fetchval(
+                    """INSERT INTO tenants (slug, short_id, display_name, primary_email, country, locale,
+                       timezone, plan, status, storage_used_bytes, storage_plan, storage_quota_gb,
+                       stripe_customer_id, billing_verified_at)
+                       VALUES ($1,$2,$3,$4,'US','en-US','America/Chicago',$5,'active',0,$6,$7,$8,now())
+                       RETURNING id""",
+                    slug, generate_short_id(), f"{p['parent_last_name']} Family",
+                    p["parent_email"], cohort["tier"], plan_key, quota, sess.get("customer"))
+            except asyncpg.UniqueViolationError:
+                slug = generate_family_slug(p["student_first_name"], p["student_last_name"])
+                family_tenant_id = await conn.fetchval(
+                    """INSERT INTO tenants (slug, short_id, display_name, primary_email, country, locale,
+                       timezone, plan, status, storage_used_bytes, storage_plan, storage_quota_gb,
+                       stripe_customer_id, billing_verified_at)
+                       VALUES ($1,$2,$3,$4,'US','en-US','America/Chicago',$5,'active',0,$6,$7,$8,now())
+                       RETURNING id""",
+                    slug, generate_short_id(), f"{p['parent_last_name']} Family",
+                    p["parent_email"], cohort["tier"], plan_key, quota, sess.get("customer"))
+
+            parent_user_id = await conn.fetchval(
+                """INSERT INTO users (email, display_name, first_name, last_name, mfa_enabled,
+                   webauthn_credentials, oauth_providers, is_active, is_platform_admin, failed_login_count)
+                   VALUES ($1,$2,$3,$4,false,'[]'::jsonb,'{}'::jsonb,true,false,0) RETURNING id""",
+                p["parent_email"], p["parent_display_name"], p["parent_first_name"], p["parent_last_name"])
+
+            approx_birth_date = date(int(p["student_birth_year"]), 7, 1)
+            hs_grad = compute_hs_graduation_year(int(p["student_birth_year"]), p["student_grade"])
+            student_id = await conn.fetchval(
+                """INSERT INTO students (tenant_id, first_name, last_name, display_name, birth_date,
+                   current_grade, expected_hs_graduation_year, residence_country, created_by, updated_by)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,'US',$8,$8) RETURNING id""",
+                family_tenant_id, p["student_first_name"], p["student_last_name"],
+                f"{p['student_first_name']} {p['student_last_name']}",
+                approx_birth_date, p["student_grade"], hs_grad, parent_user_id)
+
+            await conn.execute(
+                """INSERT INTO user_tenant_roles (user_id, tenant_id, role, granted_at, granted_by,
+                   invitation_email, accepted_at) VALUES ($1,$2,'tenant_owner',now(),$1,$3,now())""",
+                parent_user_id, family_tenant_id, p["parent_email"])
+
+            raw_token, token_hash = generate_api_token()
+            await conn.execute(
+                """INSERT INTO api_tokens (tenant_id, token_hash, student_ids, name, scope, created_by)
+                   VALUES ($1,$2,ARRAY[$3::uuid],'parent-portal','parent_portal',$4)""",
+                family_tenant_id, token_hash, student_id, parent_user_id)
+
+            await conn.execute(
+                "UPDATE cohorts SET redemption_count = redemption_count + 1, updated_at = now() WHERE id = $1",
+                cohort["id"])
+
+            verify_rows = [("parent", p["parent_email"], False)]
+            if p.get("student_email"):
+                verify_rows.append(("student", p["student_email"], not _looks_edu(p["student_email"])))
+            tokens_to_send = []
+            for role, email, review in verify_rows:
+                raw = secrets.token_urlsafe(32)
+                tokens_to_send.append((role, email, raw))
+                await conn.execute(
+                    """INSERT INTO email_verifications (tenant_id, subject_role, email, token_hash,
+                       needs_review, expires_at) VALUES ($1,$2,$3,$4,$5, now() + interval '7 days')""",
+                    family_tenant_id, role, email,
+                    hashlib.sha256(raw.encode()).hexdigest(), review)
+
+            await conn.execute("UPDATE pending_signups SET consumed_at = now() WHERE id = $1::uuid", pending_id)
+
+        try:
+            await conn.execute(
+                """INSERT INTO audit_log (tenant_id, actor_user_id, actor_role, action, target_table,
+                   target_id, target_label, new_value)
+                   VALUES ($1,$2,'tenant_owner','coppa_vpc_captured','tenants',$3,$4,$5::jsonb)""",
+                family_tenant_id, parent_user_id, str(family_tenant_id),
+                f"{p['parent_last_name']} Family - under-13 payment-first signup",
+                json.dumps({"method": "payment_transaction", "processor": "stripe",
+                            "checkout_session": sess.get("id"), "subscription": sess.get("subscription"),
+                            "plan_key": plan_key, "pending_signup_id": pending_id,
+                            "student_age_at_capture": compute_current_age(int(p["student_birth_year"])),
+                            "cohort_code": pend["cohort_code"]}))
+        except Exception as exc:
+            log.warning("vpc audit insert failed (non-fatal): %r", exc)
+
+    for role, email, raw in tokens_to_send:
+        try:
+            await _send_verification_email(email, role, p["student_first_name"], raw)
+        except Exception as exc:
+            log.warning("verification email to %s failed (non-fatal): %r", email, exc)
+    try:
+        await _send_welcome_email(p["parent_email"], p["parent_display_name"], raw_token)
+    except Exception as exc:
+        log.warning("welcome email failed (non-fatal): %r", exc)
+
+    log.info("under13_signup_completed tenant=%s student=%s pending=%s", family_tenant_id, student_id, pending_id)
+    return {"received": True, "provisioned": str(family_tenant_id)}
+
+
+async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
+    api_key = os.environ.get("RESEND_API_KEY")
+    if not api_key:
+        log.warning("RESEND_API_KEY not set; welcome email to %s skipped", to_email)
+        return
+    sender = os.environ.get("EMAIL_FROM", "outcomestar <onboarding@resend.dev>")
+    html = (
+        '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
+        '<h2 style="color:#201868">Welcome to outcomestar, ' + display_name + '</h2>'
+        '<p>Your payment confirmed parental consent and your family account is ready.</p>'
+        '<p>Your parent portal access token (keep it private):</p>'
+        '<p style="background:#F4F4F0;padding:12px;border-radius:8px;font-family:monospace;word-break:break-all">' + token + '</p>'
+        '<p><a href="https://outcomestar.app/portal" style="background:#F07800;color:#fff;padding:12px 26px;'
+        'border-radius:8px;text-decoration:none;font-weight:bold">Open the parent portal</a></p>'
+        '<p style="color:#7A8A9E;font-size:12px">Also confirm the verification emails we just sent.</p></div>'
+    )
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post("https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"from": sender, "to": [to_email],
+                  "subject": "Welcome to outcomestar - your portal access", "html": html})
+        if r.status_code >= 300:
+            log.warning("welcome send failed %s: %s", r.status_code, r.text[:200])
