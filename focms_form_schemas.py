@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2234,7 +2234,9 @@ async def post_student_tests(request: Request, student_id: str, body: TestsReque
 
 import os as _pp_os
 _PP_KEK = _pp_os.environ.get("FOCMS_KEK_MASTER")
-_FAMILY_LOCKED = {"email", "phone", "date_of_birth", "legal_sex", "marital_relationship"}
+_FAMILY_LOCKED = {"email", "phone", "date_of_birth", "legal_sex", "marital_relationship",
+                  "street_address", "street_address_line_2", "city_town", "state_province",
+                  "zip_postal_code", "country", "mailing_address"}
 
 
 class FamilyMember(BaseModel):
@@ -2261,6 +2263,16 @@ class FamilyMember(BaseModel):
     resides_with_student: Optional[bool] = None
     is_legal_guardian: Optional[bool] = True
     notes: Optional[str] = None
+    # v0.12.85: physical address (family_members columns, free-text
+    # international) + mailing address (details jsonb). Never public.
+    street_address: Optional[str] = None
+    street_address_line_2: Optional[str] = None
+    city_town: Optional[str] = None
+    state_province: Optional[str] = None
+    zip_postal_code: Optional[str] = None
+    country: Optional[str] = None
+    mailing_same_as_physical: Optional[bool] = True
+    mailing_address: Optional[dict] = None   # {street_address, street_address_line_2, city_town, state_province, zip_postal_code, country}
     public: dict = Field(default_factory=dict)
 
 
@@ -2286,6 +2298,8 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              undergrad_institution, undergrad_degree, undergrad_year,
              grad_institution, grad_degree, grad_year,
              marital_relationship, resides_with_student, notes, details,
+             street_address, street_address_line_2, city_town, state_province,
+             zip_postal_code, country,
              source_system, created_by, updated_by)
         VALUES
             ($1::uuid,$2::uuid,$3,$4,$5,
@@ -2295,7 +2309,11 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              $16,$17,$18,
              $19,$20,$21,
              $22,$23,$24,
-             $25,$26,$27, jsonb_build_object('public_fields', $30::jsonb),
+             $25,$26,$27,
+             jsonb_build_object('public_fields', $30::jsonb,
+                                'mailing_same_as_physical', $31::boolean,
+                                'mailing_address', $32::jsonb),
+             $33,$34,$35,$36,$37,$38,
              'parent_portal',$28::uuid,$28::uuid)
         """,
         tenant_id, student_id, relationship, order,
@@ -2310,6 +2328,10 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
         (m.grad_institution or None), (m.grad_degree or None), _pp_int(m.grad_year),
         (m.marital_relationship or None), m.resides_with_student, (m.notes or None),
         user_id, _PP_KEK, pub_json,
+        (m.mailing_same_as_physical if m.mailing_same_as_physical is not None else True),
+        json.dumps(m.mailing_address or {}),
+        (m.street_address or None), (m.street_address_line_2 or None), (m.city_town or None),
+        (m.state_province or None), (m.zip_postal_code or None), (m.country or None),
     )
 
 
@@ -2330,7 +2352,11 @@ async def get_student_family(request: Request, student_id: str):
                    undergrad_institution, undergrad_degree, undergrad_year,
                    grad_institution, grad_degree, grad_year,
                    marital_relationship, resides_with_student, notes,
-                   details->'public_fields' AS public_fields
+                   street_address, street_address_line_2, city_town, state_province,
+                   zip_postal_code, country,
+                   details->'public_fields' AS public_fields,
+                   COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS mailing_same_as_physical,
+                   details->'mailing_address' AS mailing_address
               FROM family_members
              WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal'
              ORDER BY guardian_order NULLS LAST
@@ -2355,7 +2381,13 @@ async def get_student_family(request: Request, student_id: str):
             "undergrad_year": r["undergrad_year"], "grad_institution": r["grad_institution"],
             "grad_degree": r["grad_degree"], "grad_year": r["grad_year"],
             "marital_relationship": r["marital_relationship"], "resides_with_student": r["resides_with_student"],
-            "is_legal_guardian": r["is_legal_guardian"], "notes": r["notes"], "public": pf or {},
+            "is_legal_guardian": r["is_legal_guardian"], "notes": r["notes"],
+            "street_address": r["street_address"], "street_address_line_2": r["street_address_line_2"],
+            "city_town": r["city_town"], "state_province": r["state_province"],
+            "zip_postal_code": r["zip_postal_code"], "country": r["country"],
+            "mailing_same_as_physical": r["mailing_same_as_physical"],
+            "mailing_address": (json.loads(r["mailing_address"]) if isinstance(r["mailing_address"], str) else (r["mailing_address"] or {})),
+            "public": pf or {},
         }
         rel = (r["relationship"] or "").lower()
         if rel in ("father", "mother"):
@@ -2601,6 +2633,89 @@ async def post_student_personal_details(request: Request, student_id: str, body:
                     "COALESCE($15::uuid,'019ed384-56d8-77fb-bfe6-00b1d064da18'::uuid))",
                     *args, tenant_id)
     return {"student_id": student_id, "saved": True}
+
+
+# ---------------------- Student addresses (v0.12.85) -----------------------
+# Physical ('permanent') + 'mailing' rows in student_addresses. Free-text
+# fields accommodate every country; iso/e164 normalization is the i18n
+# validate endpoint's job. Addresses are NEVER site-eligible (no public map).
+
+_ADDR_FIELDS = ("street_address", "street_address_line_2", "city_town",
+                "state_province", "zip_postal_code", "country", "phone_at_address")
+
+
+class StudentAddressIn(BaseModel):
+    street_address: Optional[str] = None
+    street_address_line_2: Optional[str] = None
+    city_town: Optional[str] = None
+    state_province: Optional[str] = None
+    zip_postal_code: Optional[str] = None
+    country: Optional[str] = None
+    phone_at_address: Optional[str] = None
+
+
+class StudentAddressesRequest(BaseModel):
+    physical: StudentAddressIn = Field(default_factory=StudentAddressIn)
+    mailing_same_as_physical: bool = True
+    mailing: StudentAddressIn = Field(default_factory=StudentAddressIn)
+
+
+@router.get("/student/{student_id}/addresses")
+async def get_student_addresses(request: Request, student_id: str):
+    tenant_id, _ = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT address_kind, street_address, street_address_line_2, city_town, "
+            "state_province, zip_postal_code, country, phone_at_address, "
+            "COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS same_flag "
+            "FROM student_addresses WHERE student_id=$1::uuid AND deleted_at IS NULL "
+            "AND address_kind IN ('permanent','mailing')", student_id)
+    out = {"physical": {}, "mailing": {}, "mailing_same_as_physical": True}
+    for r in rows:
+        d = {k: r[k] for k in _ADDR_FIELDS}
+        if r["address_kind"] == "permanent":
+            out["physical"] = d
+            out["mailing_same_as_physical"] = r["same_flag"]
+        else:
+            out["mailing"] = d
+    return {"student_id": student_id, **out}
+
+
+@router.post("/student/{student_id}/addresses")
+async def post_student_addresses(request: Request, student_id: str, body: StudentAddressesRequest):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    mailing = body.physical if body.mailing_same_as_physical else body.mailing
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            for kind, a, extra in (("permanent", body.physical,
+                                    {"mailing_same_as_physical": body.mailing_same_as_physical}),
+                                   ("mailing", mailing, {})):
+                await conn.execute(
+                    """INSERT INTO student_addresses
+                         (student_id, tenant_id, address_kind, is_current,
+                          street_address, street_address_line_2, city_town, state_province,
+                          zip_postal_code, country, phone_at_address, details,
+                          visibility, source_system, created_by, updated_by)
+                       VALUES ($1::uuid,$2::uuid,$3,true,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,
+                               'private','parent_portal',$12::uuid,$12::uuid)
+                       ON CONFLICT (student_id, address_kind) DO UPDATE SET
+                         street_address=EXCLUDED.street_address,
+                         street_address_line_2=EXCLUDED.street_address_line_2,
+                         city_town=EXCLUDED.city_town, state_province=EXCLUDED.state_province,
+                         zip_postal_code=EXCLUDED.zip_postal_code, country=EXCLUDED.country,
+                         phone_at_address=EXCLUDED.phone_at_address,
+                         details = COALESCE(student_addresses.details,'{}'::jsonb) || EXCLUDED.details,
+                         updated_by=$12::uuid, updated_at=now(), deleted_at=NULL""",
+                    student_id, tenant_id, kind,
+                    (a.street_address or None), (a.street_address_line_2 or None),
+                    (a.city_town or None), (a.state_province or None),
+                    (a.zip_postal_code or None), (a.country or None),
+                    (a.phone_at_address or None), json.dumps(extra), user_id)
+    return {"student_id": student_id, "saved": True,
+            "mailing_same_as_physical": body.mailing_same_as_physical}
 
 
 # --------------------------------- Skills ----------------------------------
