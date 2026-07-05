@@ -1483,9 +1483,55 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
-# --------------------- Resume tailoring (v0.12.75) ---------------------
+# --------------------- Custom report composer (v0.12.76) ---------------------
+
+class ReportComposeRequest(BaseModel):
+    title: Optional[str] = None
+    instructions: str
+    sections: List[dict] = []
+
+
+@router.post("/student/{student_id}/report-compose")
+async def report_compose(request: Request, student_id: str, body: ReportComposeRequest):
+    await _pp_context(request, student_id)
+    ins = (body.instructions or "").strip()[:4000]
+    if not ins:
+        raise HTTPException(status_code=400, detail="instructions required")
+    src = json.dumps({"sections": body.sections})[:16000]
+    system = (
+        "You compose family-facing student reports from a complete student record given as JSON sections. "
+        "Follow the report request: select ONLY the relevant data, organize it into clear sections, and add "
+        "a short factual OVERVIEW section (2-4 sentences) summarizing what the report shows. "
+        "NEVER invent facts, numbers, dates, or achievements not present in the source; never speculate, "
+        "predict outcomes, or evaluate the student negatively \u2014 this is an informational report, not a verdict. "
+        "Return ONLY JSON: {\"sections\": [{\"title\": str, \"rows\": [[label, detail], ...]}]}. "
+        "First section must be titled OVERVIEW with rows [[\"Summary\", text]]. "
+        "Keep section titles short and reader-friendly. Detail values may contain newlines for lists."
+    )
+    user = "REPORT REQUEST:\n" + ((body.title or "") + "\n" + ins).strip() + "\n\nSTUDENT RECORD (JSON):\n" + src
+    res = await _llm_complete(system, user, max_tokens=2600, want_json=True)
+    if res.get("unavailable"):
+        raise HTTPException(status_code=503, detail=res.get("reason", "LLM unavailable"))
+    obj = _extract_json(res.get("text", "")) or {}
+    secs = obj.get("sections")
+    if not isinstance(secs, list) or not secs:
+        raise HTTPException(status_code=502, detail="composition failed")
+    clean = []
+    for sec in secs[:15]:
+        if not isinstance(sec, dict):
+            continue
+        rows = [[str(r[0])[:200], str(r[1])[:1200]] for r in (sec.get("rows") or [])
+                if isinstance(r, (list, tuple)) and len(r) >= 2][:40]
+        if rows:
+            clean.append({"title": str(sec.get("title", ""))[:80], "rows": rows})
+    if not clean:
+        raise HTTPException(status_code=502, detail="composition failed")
+    return {"sections": clean}
+
+
+# --------------------- Resume tailoring (v0.12.76) ---------------------
 
 class ResumeTailorRequest(BaseModel):
     resume_kind: Optional[str] = None          # resume_academic | resume_career
