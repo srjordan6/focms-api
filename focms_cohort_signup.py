@@ -5,6 +5,10 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.16a (2026-07-06):
+- POST /auth/admin/test-email {to} (registry token): sends a test and returns
+  the active transport + exact error string for diagnosis.
+
 v0.11.16 (2026-07-06):
 - Google Workspace email transport: unified _send_email helper. When
   GMAIL_SMTP_USER + GMAIL_SMTP_PASS are set, all product email (welcome,
@@ -1251,6 +1255,28 @@ async def request_email_verification(body: EmailVerifyRequest, request: Request)
         log.warning("request-email-verification send failed for %s: %s", email, exc)
         sent = False
     return {"sent": sent, "already_verified": False, "email": email, "needs_review": review}
+
+
+@router.post("/admin/test-email")
+async def admin_test_email(request: Request) -> dict[str, Any]:
+    """v0.11.16a: send a test email and RETURN the transport + any error."""
+    auth = request.headers.get("authorization", "")
+    try:
+        registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+    except Exception:
+        registry = {}
+    if not auth.lower().startswith("bearer ") or auth[7:].strip() not in registry:
+        raise HTTPException(401, {"error": "admin_token_required"})
+    body = await request.json()
+    to = body.get("to")
+    transport = "gmail" if (os.environ.get("GMAIL_SMTP_USER") and os.environ.get("GMAIL_SMTP_PASS")) else (
+        "resend" if os.environ.get("RESEND_API_KEY") else "none")
+    try:
+        await _send_email(to, "outcomestar transport test",
+                          "<p>Transport test from focms-api.</p>")
+        return {"transport": transport, "ok": True}
+    except Exception as exc:
+        return {"transport": transport, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
 @router.post("/admin/complete-pending/{pending_id}")
