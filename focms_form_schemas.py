@@ -1610,6 +1610,7 @@ async def get_website_config(request: Request, student_id: str):
             "SELECT age_band, control_mode, sections, privacy, domain, notes, theme_key, "
             "language_primary, language_secondary, updated_at "
             "FROM website_configs WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+        slug = await conn.fetchval("SELECT slug FROM tenants WHERE id=$1::uuid", tenant_id)
     band = (row and row["age_band"]) or _website_band_for_age(age)
     if band not in _WEBSITE_BANDS:
         band = _website_band_for_age(age)
@@ -1620,8 +1621,12 @@ async def get_website_config(request: Request, student_id: str):
                "privacy": json.loads(row["privacy"]) if isinstance(row["privacy"], str) else (row["privacy"] or {}),
                "domain": row["domain"], "notes": row["notes"], "theme_key": row["theme_key"],
                "language_primary": row["language_primary"], "language_secondary": row["language_secondary"]}
+    lang2 = cfg and cfg.get("language_secondary")
     return {"student_id": student_id, "student_age": age, "computed_band": _website_band_for_age(age),
-            "band_catalog": _WEBSITE_BANDS, "config": cfg}
+            "band_catalog": _WEBSITE_BANDS, "config": cfg,
+            "site_slug": slug,
+            "site_url": f"https://app.outcomestar.app/{slug}" if slug else None,
+            "site_url_secondary": (f"https://app.outcomestar.app/{slug}/{lang2}" if (slug and lang2) else None)}
 
 
 @router.post("/student/{student_id}/website-config")
