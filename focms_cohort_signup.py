@@ -5,6 +5,18 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.13 (2026-07-05):
+- Password auth (phase 1 of auth build; passkeys are phase 2):
+  * CohortSignupRequest.password (optional, min 12 chars) - hashed with
+    stdlib scrypt (n=16384,r=8,p=1, per-user salt) into user_credentials
+    at signup (13+ path) and at webhook provisioning (under-13 path).
+  * POST /auth/set-password (bearer: registry or DB token) sets/changes
+    the caller's password.
+  * POST /auth/login {email,password} (anonymous, rate-limited by lockout:
+    5 fails -> 15 min) verifies scrypt hash, mints a parent-portal
+    api_token, returns {api_token, tenant_id, portal_url}. Email is the
+    username.
+
 v0.11.12 (2026-07-05):
 - POST /auth/request-email-verification: authenticated (registry or DB
   parent-portal token) endpoint the portal calls whenever an email is entered
@@ -189,6 +201,7 @@ class CohortSignupRequest(BaseModel):
     student_birth_year: int = Field(..., ge=2000, le=2030)
     student_email: Optional[EmailStr] = None
     storage_plan_key: Optional[str] = None   # required when student is under 13
+    password: Optional[str] = Field(None, min_length=12, max_length=200)
     accept_user_agreement: bool
     accept_privacy_policy: bool
 
@@ -234,6 +247,22 @@ def compute_current_age(birth_year: int) -> int:
 
 
 SLUG_STRIP = re.compile(r"[^a-z0-9-]+")
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    return f"scrypt$16384$8$1${salt.hex()}${h.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        _, n, r, p, salt_hex, hash_hex = stored.split("$")
+        h = hashlib.scrypt(password.encode(), salt=bytes.fromhex(salt_hex),
+                           n=int(n), r=int(r), p=int(p), dklen=32)
+        return hmac.compare_digest(h.hex(), hash_hex)
+    except Exception:
+        return False
 
 
 def generate_family_slug(first: str, last: str) -> str:
@@ -399,9 +428,15 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             if existing:
                 raise HTTPException(409, {"error": "email_already_exists",
                                           "message": "An account with this email already exists."})
+            # v0.11.13: never park a plaintext password - hash before storing
+            _pend = json.loads(body.model_dump_json())
+            if _pend.get("password"):
+                _pend["password_hash"] = _hash_password(_pend.pop("password"))
+            else:
+                _pend.pop("password", None)
             pending_id = await conn.fetchval(
                 "INSERT INTO pending_signups (payload, cohort_code) VALUES ($1::jsonb, $2) RETURNING id",
-                body.model_dump_json(), body.code)
+                json.dumps(_pend), body.code)
         form = {
             "mode": "payment" if one_time else "subscription",
             "line_items[0][price]": tier["stripe_price_id"],
@@ -593,6 +628,13 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 student_id,
                 parent_user_id,
             )
+
+            # Step 8a (v0.11.13): password credential when supplied at signup
+            if body.password:
+                await conn.execute(
+                    """INSERT INTO user_credentials (user_id, password_hash) VALUES ($1,$2)
+                       ON CONFLICT (user_id) DO UPDATE SET password_hash=EXCLUDED.password_hash, updated_at=now()""",
+                    parent_user_id, _hash_password(body.password))
 
             # Step 8b (v0.11.9): seed portal-visible rows from signup data
             await _seed_portal_rows(conn, family_tenant_id, student_id, parent_user_id, {
@@ -968,6 +1010,97 @@ class EmailVerifyRequest(BaseModel):
     subject_role: str = "parent"   # parent | father | mother | student
 
 
+class SetPasswordRequest(BaseModel):
+    password: str = Field(..., min_length=12, max_length=200)
+
+
+@router.post("/set-password")
+async def set_password(body: SetPasswordRequest, request: Request) -> dict[str, Any]:
+    """v0.11.13: set/change the caller's password (email is the username)."""
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, {"error": "auth_required"})
+    token = auth[7:].strip()
+    user_id = None
+    try:
+        registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+    except Exception:
+        registry = {}
+    if token in registry:
+        user_id = registry[token].get("user_id")
+    else:
+        from focms_api import db_token_principal
+        ctx = await db_token_principal(request.app.state.pool, token)
+        if ctx:
+            user_id = ctx.get("user_id")
+    if not user_id:
+        raise HTTPException(401, {"error": "invalid_token"})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO user_credentials (user_id, password_hash) VALUES ($1,$2)
+               ON CONFLICT (user_id) DO UPDATE SET password_hash=EXCLUDED.password_hash,
+               failed_attempts=0, locked_until=NULL, updated_at=now()""",
+            user_id, _hash_password(body.password))
+    return {"ok": True}
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/login")
+async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
+    """v0.11.13: email + password -> parent-portal api token.
+    Lockout: 5 consecutive failures -> 15 minutes."""
+    email = str(body.email).strip().lower()
+    pool: asyncpg.Pool = request.app.state.pool
+    generic = HTTPException(401, {"error": "invalid_credentials",
+                                  "message": "Email or password is incorrect."})
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id, display_name FROM users WHERE lower(email)=$1 AND deleted_at IS NULL", email)
+        if not user:
+            raise generic
+        cred = await conn.fetchrow(
+            "SELECT password_hash, failed_attempts, locked_until FROM user_credentials WHERE user_id=$1",
+            user["id"])
+        if not cred:
+            raise HTTPException(401, {"error": "no_password_set",
+                                      "message": "No password set for this account - use your portal link, then Set password."})
+        if cred["locked_until"] and cred["locked_until"] > datetime.now(timezone.utc):
+            raise HTTPException(429, {"error": "locked",
+                                      "message": "Too many attempts. Try again in a few minutes."})
+        if not _verify_password(body.password, cred["password_hash"]):
+            await conn.execute(
+                """UPDATE user_credentials SET failed_attempts = failed_attempts + 1,
+                   locked_until = CASE WHEN failed_attempts + 1 >= 5
+                                       THEN now() + interval '15 minutes' ELSE NULL END,
+                   updated_at = now() WHERE user_id=$1""", user["id"])
+            raise generic
+        await conn.execute(
+            "UPDATE user_credentials SET failed_attempts=0, locked_until=NULL, updated_at=now() WHERE user_id=$1",
+            user["id"])
+        role = await conn.fetchrow(
+            "SELECT tenant_id FROM user_tenant_roles WHERE user_id=$1 ORDER BY granted_at LIMIT 1",
+            user["id"])
+        if not role:
+            raise generic
+        tenant_id = role["tenant_id"]
+        students = await conn.fetch(
+            "SELECT id FROM students WHERE tenant_id=$1 AND deleted_at IS NULL ORDER BY created_at",
+            tenant_id)
+        raw_token, token_hash = generate_api_token()
+        await conn.execute(
+            """INSERT INTO api_tokens (tenant_id, token_hash, student_ids, name, scope, created_by)
+               VALUES ($1,$2,$3::uuid[],'login','parent_portal',$4)""",
+            tenant_id, token_hash, [r["id"] for r in students], user["id"])
+    return {"api_token": raw_token, "tenant_id": str(tenant_id),
+            "display_name": user["display_name"],
+            "portal_url": f"https://outcomestar.app/portal#t={raw_token}"}
+
+
 @router.post("/request-email-verification")
 async def request_email_verification(body: EmailVerifyRequest, request: Request) -> dict[str, Any]:
     """v0.11.12: (re)issue a verification email for an entered address."""
@@ -1126,6 +1259,12 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 """INSERT INTO api_tokens (tenant_id, token_hash, student_ids, name, scope, created_by)
                    VALUES ($1,$2,ARRAY[$3::uuid],'parent-portal','parent_portal',$4)""",
                 family_tenant_id, token_hash, student_id, parent_user_id)
+
+            if p.get("password_hash"):
+                await conn.execute(
+                    """INSERT INTO user_credentials (user_id, password_hash) VALUES ($1,$2)
+                       ON CONFLICT (user_id) DO UPDATE SET password_hash=EXCLUDED.password_hash, updated_at=now()""",
+                    parent_user_id, p["password_hash"])
 
             await _seed_portal_rows(conn, family_tenant_id, student_id, parent_user_id, p)
 
