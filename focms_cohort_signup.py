@@ -309,10 +309,13 @@ def generate_family_slug(first: str, last: str) -> str:
     E.g. "smith-alex-a3b9c7". Never guaranteed unique; caller retries
     on collision.
     """
-    base = f"{last}-{first}".lower()
-    base = SLUG_STRIP.sub("-", base).strip("-")[:40]
+    # v0.11.18: nondescript by design - never the child's name (COPPA/child-safety).
+    words = ["amber","aspen","cedar","comet","coral","delta","ember","fern","flint","harbor",
+             "hazel","indigo","juniper","lumen","maple","meadow","nova","onyx","orbit","pine",
+             "quartz","raven","ridge","river","sierra","summit","terra","tidal","vega","willow"]
+    w1 = secrets.choice(words); w2 = secrets.choice([w for w in words if w != w1])
     suffix = secrets.token_hex(3)  # 6 hex chars
-    return f"{base}-{suffix}" if base else f"family-{suffix}"
+    return f"{w1}-{w2}-{suffix}"
 
 
 def generate_short_id() -> str:
