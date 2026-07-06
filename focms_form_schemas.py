@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2288,6 +2288,10 @@ def _fm_has_data(m: FamilyMember) -> bool:
 
 
 async def _insert_family_member(conn, tenant_id, student_id, user_id, relationship, order, m: FamilyMember):
+    # v0.12.89: family_members_relationship_check has no father/mother values.
+    # Store relationship='parent' and keep the side in details->>'parent_role'.
+    parent_role = relationship
+    relationship = "parent"
     public = {k: (False if k in _FAMILY_LOCKED else bool(v)) for k, v in (m.public or {}).items()}
     pub_json = json.dumps(public)
     await conn.execute(
@@ -2336,7 +2340,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
         json.dumps(m.mailing_address or {}),
         (m.street_address or None), (m.street_address_line_2 or None), (m.city_town or None),
         (m.state_province or None), (m.zip_postal_code or None), (m.country or None),
-        (m.education_level or None), (m.county or None),
+        (m.education_level or None), (m.county or None), parent_role,
     )
 
 
@@ -2363,7 +2367,8 @@ async def get_student_family(request: Request, student_id: str):
                    COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS mailing_same_as_physical,
                    details->'mailing_address' AS mailing_address,
                    details->>'education_level' AS education_level,
-                   details->>'county' AS county
+                   details->>'county' AS county,
+                   details->>'parent_role' AS parent_role
               FROM family_members
              WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal'
              ORDER BY guardian_order NULLS LAST
@@ -2397,7 +2402,7 @@ async def get_student_family(request: Request, student_id: str):
             "mailing_address": (json.loads(r["mailing_address"]) if isinstance(r["mailing_address"], str) else (r["mailing_address"] or {})),
             "public": pf or {},
         }
-        rel = (r["relationship"] or "").lower()
+        rel = (r["parent_role"] or r["relationship"] or "").lower()
         if rel in ("father", "mother"):
             out[rel] = d
     return {"student_id": student_id, "father": out["father"], "mother": out["mother"], "locked": sorted(_FAMILY_LOCKED)}
@@ -2415,7 +2420,7 @@ async def post_student_family(request: Request, student_id: str, body: FamilyReq
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             await conn.execute(
                 "DELETE FROM family_members WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
-                "AND source_system='parent_portal' AND relationship IN ('father','mother')",
+                "AND source_system='parent_portal' AND COALESCE(details->>'parent_role','') IN ('father','mother')",
                 tenant_id, student_id)
             if _fm_has_data(body.father):
                 await _insert_family_member(conn, tenant_id, student_id, user_id, "father", 1, body.father)
