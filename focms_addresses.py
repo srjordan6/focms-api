@@ -6,6 +6,14 @@ Drops in alongside focms_api.py. Wired up by adding 3 lines to focms_api.py:
     # ...inside app creation:
     app.include_router(addresses_router)
 
+v0.5.1 (2026-07-05):
+- _require_auth falls back to focms_api.db_token_principal - signup-minted
+  parent-portal tokens (api_tokens table) now work on autocomplete/validate.
+  Root cause of "no autofill" + "verification unavailable" for new tenants.
+- validate SELECT referenced non-existent student_addresses.place_id column
+  (500 "column place_id does not exist" for everyone); now read from
+  details->>'place_id'.
+
 v0.5.0b (2026-06-24):
 - Hotfix #2: cast jsonb returns to text in SQL (fn_validate_phone()::text,
   suggestions::text) so asyncpg can decode them. PgBouncer transaction mode
@@ -90,6 +98,7 @@ def _tokens() -> dict[str, dict[str, str]]:
 
 
 async def _require_auth(
+    request: Request,
     authorization: Optional[str] = Header(None),
 ) -> AuthContext:
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -97,10 +106,14 @@ async def _require_auth(
     token = authorization.split(" ", 1)[1].strip()
     info = _tokens().get(token)
     if not info:
-        raise HTTPException(401, "invalid token")
+        # v0.5.1: signup-minted parent-portal tokens (api_tokens table)
+        from focms_api import db_token_principal
+        info = await db_token_principal(request.app.state.pool, token)
+        if not info:
+            raise HTTPException(401, "invalid token")
     return AuthContext(
-        tenant_id=UUID(info["tenant_id"]),
-        user_id=UUID(info["user_id"]),
+        tenant_id=UUID(str(info["tenant_id"])),
+        user_id=UUID(str(info["user_id"])),
         role=info.get("role", "tenant_viewer"),
     )
 
@@ -440,7 +453,8 @@ async def addresses_validate(
 
             addr = await conn.fetchrow(
                 """
-                SELECT id, student_id, tenant_id, country_iso2, country, place_id,
+                SELECT id, student_id, tenant_id, country_iso2, country,
+                       details->>'place_id' AS place_id,
                        street_address, street_address_line_2, street_address_line_3,
                        building_or_district, city_town, state_province,
                        subdivision_iso, zip_postal_code, validation_status
