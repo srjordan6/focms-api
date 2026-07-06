@@ -5,6 +5,9 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.13a (2026-07-05):
+- login: users table uses deactivated_at (not deleted_at) - 500 fix.
+
 v0.11.13 (2026-07-05):
 - Password auth (phase 1 of auth build; passkeys are phase 2):
   * CohortSignupRequest.password (optional, min 12 chars) - hashed with
@@ -1060,7 +1063,7 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
                                   "message": "Email or password is incorrect."})
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
-            "SELECT id, display_name FROM users WHERE lower(email)=$1 AND deleted_at IS NULL", email)
+            "SELECT id, display_name FROM users WHERE lower(email)=$1 AND deactivated_at IS NULL", email)
         if not user:
             raise generic
         cred = await conn.fetchrow(
