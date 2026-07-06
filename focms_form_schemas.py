@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2273,6 +2273,7 @@ class FamilyMember(BaseModel):
     country: Optional[str] = None
     mailing_same_as_physical: Optional[bool] = True
     mailing_address: Optional[dict] = None   # {street_address, street_address_line_2, city_town, state_province, zip_postal_code, country}
+    education_level: Optional[str] = None    # v0.12.87: high_school_diploma | ged | other
     public: dict = Field(default_factory=dict)
 
 
@@ -2312,7 +2313,8 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              $25,$26,$27,
              jsonb_build_object('public_fields', $30::jsonb,
                                 'mailing_same_as_physical', $31::boolean,
-                                'mailing_address', $32::jsonb),
+                                'mailing_address', $32::jsonb,
+                                'education_level', $39::text),
              $33,$34,$35,$36,$37,$38,
              'parent_portal',$28::uuid,$28::uuid)
         """,
@@ -2332,6 +2334,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
         json.dumps(m.mailing_address or {}),
         (m.street_address or None), (m.street_address_line_2 or None), (m.city_town or None),
         (m.state_province or None), (m.zip_postal_code or None), (m.country or None),
+        (m.education_level or None),
     )
 
 
@@ -2356,7 +2359,8 @@ async def get_student_family(request: Request, student_id: str):
                    zip_postal_code, country,
                    details->'public_fields' AS public_fields,
                    COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS mailing_same_as_physical,
-                   details->'mailing_address' AS mailing_address
+                   details->'mailing_address' AS mailing_address,
+                   details->>'education_level' AS education_level
               FROM family_members
              WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal'
              ORDER BY guardian_order NULLS LAST
@@ -2386,6 +2390,7 @@ async def get_student_family(request: Request, student_id: str):
             "city_town": r["city_town"], "state_province": r["state_province"],
             "zip_postal_code": r["zip_postal_code"], "country": r["country"],
             "mailing_same_as_physical": r["mailing_same_as_physical"],
+            "education_level": r["education_level"],
             "mailing_address": (json.loads(r["mailing_address"]) if isinstance(r["mailing_address"], str) else (r["mailing_address"] or {})),
             "public": pf or {},
         }

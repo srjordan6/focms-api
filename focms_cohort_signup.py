@@ -5,6 +5,21 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.12 (2026-07-05):
+- POST /auth/request-email-verification: authenticated (registry or DB
+  parent-portal token) endpoint the portal calls whenever an email is entered
+  or changed for the student, father, or mother. Upserts an
+  email_verifications row for (tenant, subject_role, email) and sends the
+  confirmation email. subject_role father/mother map to role 'parent' with
+  the relationship kept in the email copy.
+
+v0.11.11 (2026-07-05):
+- Admin recovery endpoint POST /auth/admin/complete-pending/{pending_id}
+  (FOCMS_API_TOKENS_JSON token required): runs _complete_pending_signup for a
+  paid-but-unprovisioned under-13 signup (missed/failed webhook). Synthetic
+  session metadata; plan_key from the parked payload (free -> free plan).
+- Webhook handler logs event id + metadata keys on entry (diagnosis).
+
 v0.11.10 (2026-07-05):
 - Also: relationship enum value lowercase 'parent' (check constraint).
 - HOTFIX: v0.11.9 seed inserts poisoned the signup transaction (RLS FORCE on
@@ -853,6 +868,7 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
     if not secret or not _stripe_sig_ok(payload, request.headers.get("stripe-signature", ""), secret):
         raise HTTPException(400, {"error": "bad_signature"})
     event = json.loads(payload)
+    log.info("stripe_webhook event=%s type=%s", event.get("id"), event.get("type"))
     if event.get("type") != "checkout.session.completed":
         return {"received": True, "ignored": event.get("type")}
     sess = event["data"]["object"]
@@ -945,6 +961,93 @@ async def verify_email(token: str, request: Request) -> HTMLResponse:
         msg = f"{row['email']} is confirmed. {remaining} email confirmation still pending for free access."
     log.info("email_verified tenant=%s role=%s remaining=%s", row["tenant_id"], row["subject_role"], remaining)
     return HTMLResponse(_VERIFY_PAGE.format(title="Email confirmed", msg=msg))
+
+
+class EmailVerifyRequest(BaseModel):
+    email: EmailStr
+    subject_role: str = "parent"   # parent | father | mother | student
+
+
+@router.post("/request-email-verification")
+async def request_email_verification(body: EmailVerifyRequest, request: Request) -> dict[str, Any]:
+    """v0.11.12: (re)issue a verification email for an entered address."""
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, {"error": "auth_required"})
+    token = auth[7:].strip()
+    tenant_id = None
+    try:
+        registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+    except Exception:
+        registry = {}
+    if token in registry:
+        tenant_id = registry[token].get("tenant_id")
+    else:
+        from focms_api import db_token_principal
+        ctx = await db_token_principal(request.app.state.pool, token)
+        if ctx:
+            tenant_id = ctx.get("tenant_id")
+    if not tenant_id:
+        raise HTTPException(401, {"error": "invalid_token"})
+
+    role_in = body.subject_role.strip().lower()
+    if role_in not in ("parent", "father", "mother", "student"):
+        raise HTTPException(422, {"error": "bad_subject_role"})
+    db_role = "student" if role_in == "student" else "parent"
+    email = str(body.email).strip().lower()
+    review = (db_role == "student") and not _looks_edu(email)
+
+    raw = secrets.token_urlsafe(32)
+    th = hashlib.sha256(raw.encode()).hexdigest()
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        already = await conn.fetchrow(
+            "SELECT 1 FROM email_verifications WHERE tenant_id=$1::uuid AND subject_role=$2 "
+            "AND email=$3 AND verified_at IS NOT NULL", tenant_id, db_role, email)
+        if already:
+            return {"sent": False, "already_verified": True, "email": email}
+        await conn.execute(
+            "DELETE FROM email_verifications WHERE tenant_id=$1::uuid AND subject_role=$2 "
+            "AND email=$3 AND verified_at IS NULL", tenant_id, db_role, email)
+        await conn.execute(
+            "INSERT INTO email_verifications (tenant_id, subject_role, email, token_hash, needs_review, expires_at) "
+            "VALUES ($1::uuid, $2, $3, $4, $5, now() + interval '7 days')",
+            tenant_id, db_role, email, th, review)
+        student_name = await conn.fetchval(
+            "SELECT first_name FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1",
+            tenant_id) or "your student"
+    try:
+        await _send_verification_email(email, role_in, student_name, raw)
+        sent = True
+    except Exception as exc:
+        log.warning("request-email-verification send failed for %s: %s", email, exc)
+        sent = False
+    return {"sent": sent, "already_verified": False, "email": email, "needs_review": review}
+
+
+@router.post("/admin/complete-pending/{pending_id}")
+async def admin_complete_pending(pending_id: str, request: Request) -> dict[str, Any]:
+    """v0.11.11: manual recovery for paid-but-unprovisioned under-13 signups."""
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(401, {"error": "auth_required"})
+    try:
+        registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+    except Exception:
+        registry = {}
+    if auth[7:].strip() not in registry:
+        raise HTTPException(401, {"error": "admin_token_required"})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        pend = await conn.fetchrow(
+            "SELECT payload FROM pending_signups WHERE id = $1::uuid AND consumed_at IS NULL",
+            pending_id)
+    if not pend:
+        raise HTTPException(404, {"error": "pending_not_found_or_consumed"})
+    p = json.loads(pend["payload"])
+    plan_key = (p.get("storage_plan_key") or "free").strip().lower()
+    sess = {"id": f"manual-recovery-{pending_id}", "customer": None, "subscription": None}
+    return await _complete_pending_signup(request, pending_id, sess, {"plan_key": plan_key})
 
 
 async def _complete_pending_signup(request: Request, pending_id: str, sess: dict, meta: dict) -> dict[str, Any]:
