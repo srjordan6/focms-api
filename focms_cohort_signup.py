@@ -1,9 +1,12 @@
-﻿"""
+"""
 focms_cohort_signup.py - Anonymous cohort-based parent signup for
 outcomestar.app. Provisions a family tenant, parent user, student
 record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
+
+v0.11.17 (2026-07-06):
+- Cloudflare Turnstile on cohort-signup, /auth/login, /auth/forgot-password.
 
 v0.11.16a (2026-07-06):
 - POST /auth/admin/test-email {to} (registry token): sends a test and returns
@@ -236,6 +239,7 @@ class CohortSignupRequest(BaseModel):
     student_email: Optional[EmailStr] = None
     storage_plan_key: Optional[str] = None   # required when student is under 13
     password: Optional[str] = Field(None, min_length=12, max_length=200)
+    turnstile_token: Optional[str] = None
     accept_user_agreement: bool
     accept_privacy_policy: bool
 
@@ -336,6 +340,36 @@ def _looks_edu(email: str) -> bool:
     return bool(EDU_DOMAIN_RE.search("." + domain))
 
 
+async def _verify_turnstile(token, request: Request) -> None:
+    """v0.11.17: enforce Turnstile when TURNSTILE_SECRET is configured."""
+    secret = os.environ.get("TURNSTILE_SECRET")
+    if not secret:
+        return
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        try:
+            registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+            if auth[7:].strip() in registry:
+                return
+        except Exception:
+            pass
+    if not token:
+        raise HTTPException(400, {"error": "turnstile_required",
+                                  "message": "Please complete the security check."})
+    ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else None)
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                              data={"secret": secret, "response": token, "remoteip": ip or ""})
+        ok = False
+        try:
+            ok = bool(r.json().get("success"))
+        except Exception:
+            ok = False
+    if not ok:
+        raise HTTPException(400, {"error": "turnstile_failed",
+                                  "message": "Security check failed - reload the page and try again."})
+
+
 async def _send_email(to_email: str, subject: str, html: str) -> None:
     """v0.11.16: Gmail SMTP (Workspace) preferred, Resend fallback."""
     g_user = os.environ.get("GMAIL_SMTP_USER")
@@ -425,6 +459,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
         })
 
     # Sanity: computed age plausible for K-12 (4-19)
+    await _verify_turnstile(body.turnstile_token, request)
     age = compute_current_age(body.student_birth_year)
     if age < 4 or age > 19:
         raise HTTPException(400, {
@@ -1060,12 +1095,14 @@ async def _send_reset_email(to_email: str, token: str) -> None:
 
 
 class ForgotPasswordRequest(BaseModel):
+    turnstile_token: Optional[str] = None
     email: EmailStr
 
 
 @router.post("/forgot-password")
 async def forgot_password(body: ForgotPasswordRequest, request: Request) -> dict[str, Any]:
     """v0.11.15: always 200 (no account enumeration)."""
+    await _verify_turnstile(body.turnstile_token, request)
     email = str(body.email).strip().lower()
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -1147,12 +1184,14 @@ async def set_password(body: SetPasswordRequest, request: Request) -> dict[str, 
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1, max_length=200)
+    turnstile_token: Optional[str] = None
 
 
 @router.post("/login")
 async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
     """v0.11.13: email + password -> parent-portal api token.
     Lockout: 5 consecutive failures -> 15 minutes."""
+    await _verify_turnstile(body.turnstile_token, request)
     email = str(body.email).strip().lower()
     pool: asyncpg.Pool = request.app.state.pool
     generic = HTTPException(401, {"error": "invalid_credentials",
