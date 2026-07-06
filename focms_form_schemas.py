@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2666,19 +2666,22 @@ async def get_student_addresses(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
-            "SELECT address_kind, street_address, street_address_line_2, city_town, "
+            "SELECT id, address_kind, street_address, street_address_line_2, city_town, "
             "state_province, zip_postal_code, country, phone_at_address, "
             "COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS same_flag "
             "FROM student_addresses WHERE student_id=$1::uuid AND deleted_at IS NULL "
-            "AND address_kind IN ('permanent','mailing')", student_id)
-    out = {"physical": {}, "mailing": {}, "mailing_same_as_physical": True}
+            "AND address_kind IN ('permanent','current_mailing')", student_id)
+    out = {"physical": {}, "mailing": {}, "mailing_same_as_physical": True,
+           "physical_id": None, "mailing_id": None}
     for r in rows:
         d = {k: r[k] for k in _ADDR_FIELDS}
         if r["address_kind"] == "permanent":
             out["physical"] = d
+            out["physical_id"] = str(r["id"])
             out["mailing_same_as_physical"] = r["same_flag"]
         else:
             out["mailing"] = d
+            out["mailing_id"] = str(r["id"])
     return {"student_id": student_id, **out}
 
 
@@ -2690,10 +2693,11 @@ async def post_student_addresses(request: Request, student_id: str, body: Studen
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            ids = {}
             for kind, a, extra in (("permanent", body.physical,
                                     {"mailing_same_as_physical": body.mailing_same_as_physical}),
-                                   ("mailing", mailing, {})):
-                await conn.execute(
+                                   ("current_mailing", mailing, {})):
+                row = await conn.fetchrow(
                     """INSERT INTO student_addresses
                          (student_id, tenant_id, address_kind, is_current,
                           street_address, street_address_line_2, city_town, state_province,
@@ -2708,14 +2712,16 @@ async def post_student_addresses(request: Request, student_id: str, body: Studen
                          zip_postal_code=EXCLUDED.zip_postal_code, country=EXCLUDED.country,
                          phone_at_address=EXCLUDED.phone_at_address,
                          details = COALESCE(student_addresses.details,'{}'::jsonb) || EXCLUDED.details,
-                         updated_by=$12::uuid, updated_at=now(), deleted_at=NULL""",
+                         updated_by=$12::uuid, updated_at=now(), deleted_at=NULL
+                       RETURNING id""",
                     student_id, tenant_id, kind,
                     (a.street_address or None), (a.street_address_line_2 or None),
                     (a.city_town or None), (a.state_province or None),
                     (a.zip_postal_code or None), (a.country or None),
                     (a.phone_at_address or None), json.dumps(extra), user_id)
+                ids["physical_id" if kind == "permanent" else "mailing_id"] = str(row["id"])
     return {"student_id": student_id, "saved": True,
-            "mailing_same_as_physical": body.mailing_same_as_physical}
+            "mailing_same_as_physical": body.mailing_same_as_physical, **ids}
 
 
 # --------------------------------- Skills ----------------------------------
