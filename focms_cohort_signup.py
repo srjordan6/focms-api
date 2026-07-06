@@ -5,6 +5,25 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.15 (2026-07-05):
+- Password reset flow: POST /auth/forgot-password {email} (anonymous, always
+  200 to avoid account enumeration; emails a 1-hour single-use link to
+  outcomestar.app/reset-password) + POST /auth/reset-password
+  {token, password} (consumes the token, sets the scrypt hash, clears
+  lockout). New table password_resets (MCP-created).
+- Change password: use POST /auth/set-password from the signed-in portal
+  (portal v157 adds the Change password UI).
+
+v0.11.14 (2026-07-05):
+- Payment-first for ALL ages (Stephen decision 2026-07-05): every signup
+  requires a storage plan choice ($1 one-time consent verification on the
+  free plan, or a paid plan). The card payment verifies the parent and the
+  card is saved on file for future billing:
+  * payment mode: customer_creation=always + 
+    payment_intent_data[setup_future_usage]=off_session
+  * subscription mode: customer + default payment method saved by Stripe.
+  The 13+ instant-provision path is removed; provisioning is webhook-only.
+
 v0.11.13a (2026-07-05):
 - login: users table uses deactivated_at (not deleted_at) - 500 fix.
 
@@ -394,16 +413,17 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
 
     pool: asyncpg.Pool = request.app.state.pool
 
-    # COPPA gate (v0.11.6): under-13 requires payment-first VPC. Park the
-    # request, return a Stripe Checkout URL; the webhook provisions the family
-    # AFTER payment - no child data is persisted before consent.
-    if age < 13:
+    # v0.11.14: payment-first for ALL ages. The card payment verifies the
+    # parent (FTC-recognized for under-13 COPPA consent; identity + billing
+    # readiness for 13+) and the card is kept on file. Provisioning happens
+    # only in the webhook after payment.
+    if True:
         api_key = os.environ.get("STRIPE_SECRET_KEY")
         if not api_key:
             raise HTTPException(400, {
                 "error": "vpc_required",
-                "message": "Students under 13 require verified parental consent; "
-                           "enrollment for under-13 students is temporarily unavailable.",
+                "message": "Signup requires parent verification by card; "
+                           "enrollment is temporarily unavailable.",
             })
         requested = (body.storage_plan_key or "").strip().lower()
         one_time = requested == "free"
@@ -420,10 +440,9 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             if not tier:
                 raise HTTPException(400, {
                     "error": "vpc_plan_required",
-                    "message": "For students under 13, federal law requires verified parental "
-                               "consent. Choose the $1 one-time consent verification (free plan) "
-                               "or a storage plan - the card payment is the FTC-recognized "
-                               "consent method.",
+                    "message": "Choose the $1 one-time parent verification (free plan) "
+                               "or a storage plan - the card payment verifies the parent "
+                               "and stays on file for billing.",
                 })
             existing = await conn.fetchval(
                 "SELECT id FROM users WHERE email = $1 AND deactivated_at IS NULL",
@@ -444,6 +463,8 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             "mode": "payment" if one_time else "subscription",
             "line_items[0][price]": tier["stripe_price_id"],
             "line_items[0][quantity]": "1",
+            **({"customer_creation": "always",
+                "payment_intent_data[setup_future_usage]": "off_session"} if one_time else {}),
             "success_url": "https://outcomestar.app/signup.html?vpc=complete",
             "cancel_url": "https://outcomestar.app/signup.html?vpc=cancelled",
             "customer_email": body.parent_email,
@@ -1011,6 +1032,81 @@ async def verify_email(token: str, request: Request) -> HTMLResponse:
 class EmailVerifyRequest(BaseModel):
     email: EmailStr
     subject_role: str = "parent"   # parent | father | mother | student
+
+
+async def _send_reset_email(to_email: str, token: str) -> None:
+    api_key = os.environ.get("RESEND_API_KEY")
+    if not api_key:
+        log.warning("RESEND_API_KEY not set; reset email to %s skipped", to_email)
+        return
+    sender = os.environ.get("EMAIL_FROM", "outcomestar <onboarding@resend.dev>")
+    link = f"https://outcomestar.app/reset-password?token={token}"
+    html = (
+        '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
+        '<h2 style="color:#201868">Reset your password</h2>'
+        '<p>Someone (hopefully you) asked to reset the outcomestar password for this email.</p>'
+        '<p><a href="' + link + '" style="background:#F07800;color:#fff;padding:12px 26px;'
+        'border-radius:8px;text-decoration:none;font-weight:bold">Choose a new password</a></p>'
+        '<p style="color:#7A8A9E;font-size:12px">This link expires in 1 hour and works once. '
+        'If you did not request this, ignore this email - your password is unchanged.</p></div>'
+    )
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post("https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"from": sender, "to": [to_email],
+                  "subject": "Reset your password - outcomestar", "html": html})
+        if r.status_code >= 300:
+            log.warning("reset email failed %s: %s", r.status_code, r.text[:200])
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
+@router.post("/forgot-password")
+async def forgot_password(body: ForgotPasswordRequest, request: Request) -> dict[str, Any]:
+    """v0.11.15: always 200 (no account enumeration)."""
+    email = str(body.email).strip().lower()
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow(
+            "SELECT id FROM users WHERE lower(email)=$1 AND deactivated_at IS NULL", email)
+        if user:
+            raw = secrets.token_urlsafe(32)
+            await conn.execute(
+                "INSERT INTO password_resets (user_id, token_hash, expires_at) "
+                "VALUES ($1, $2, now() + interval '1 hour')",
+                user["id"], hashlib.sha256(raw.encode()).hexdigest())
+            try:
+                await _send_reset_email(email, raw)
+            except Exception as exc:
+                log.warning("forgot-password send failed: %s", exc)
+    return {"ok": True, "message": "If that email has an account, a reset link is on its way."}
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(..., min_length=10, max_length=128)
+    password: str = Field(..., min_length=12, max_length=200)
+
+
+@router.post("/reset-password")
+async def reset_password(body: ResetPasswordRequest, request: Request) -> dict[str, Any]:
+    th = hashlib.sha256(body.token.encode()).hexdigest()
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT id, user_id FROM password_resets WHERE token_hash=$1 "
+            "AND used_at IS NULL AND expires_at > now()", th)
+        if not row:
+            raise HTTPException(400, {"error": "invalid_or_expired",
+                                      "message": "This reset link is invalid or has expired. Request a new one."})
+        await conn.execute("UPDATE password_resets SET used_at=now() WHERE id=$1", row["id"])
+        await conn.execute(
+            """INSERT INTO user_credentials (user_id, password_hash) VALUES ($1,$2)
+               ON CONFLICT (user_id) DO UPDATE SET password_hash=EXCLUDED.password_hash,
+               failed_attempts=0, locked_until=NULL, updated_at=now()""",
+            row["user_id"], _hash_password(body.password))
+    return {"ok": True}
 
 
 class SetPasswordRequest(BaseModel):
