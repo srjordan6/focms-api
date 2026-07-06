@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -1732,7 +1732,8 @@ async def public_site_hero(request: Request, slug: str):
                     headers={"Cache-Control": "public, max-age=300"})
 
 
-@router.get("/public/site/{slug}")async def public_site_config(request: Request, slug: str):
+@router.get("/public/site/{slug}")
+async def public_site_config(request: Request, slug: str):
     pool: asyncpg.Pool = request.app.state.pool
     slug = slug.strip().lower()
     async with pool.acquire() as conn:
@@ -1754,8 +1755,6 @@ async def public_site_hero(request: Request, slug: str):
                 "language_primary, language_secondary "
                 "FROM website_configs WHERE tenant_id = $1::uuid AND student_id = $2",
                 tenant_id, student["id"])
-            has_hero = bool(await tconn.fetchval(
-                "SELECT 1 FROM site_assets WHERE student_id=$1 AND kind='hero'", student["id"]))
             has_hero = bool(await tconn.fetchval(
                 "SELECT 1 FROM site_assets WHERE student_id=$1 AND kind='hero'", student["id"]))
     if not cfg:
