@@ -5,6 +5,14 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.16 (2026-07-06):
+- Google Workspace email transport: unified _send_email helper. When
+  GMAIL_SMTP_USER + GMAIL_SMTP_PASS are set, all product email (welcome,
+  verification, password reset) sends via smtp.gmail.com:587 STARTTLS as
+  support@outcomestar.app (app password; ~2,000/day/user limit). Falls back
+  to Resend (RESEND_API_KEY) when Gmail env is absent, then logs-and-skips.
+  SMTP runs in a thread (asyncio.to_thread) - no new dependencies.
+
 v0.11.15 (2026-07-05):
 - Password reset flow: POST /auth/forgot-password {email} (anonymous, always
   200 to avoid account enumeration; emails a 1-hour single-use link to
@@ -324,33 +332,42 @@ def _looks_edu(email: str) -> bool:
     return bool(EDU_DOMAIN_RE.search("." + domain))
 
 
-async def _send_verification_email(to_email: str, role: str, student_name: str, token: str) -> None:
+async def _send_email(to_email: str, subject: str, html: str) -> None:
+    """v0.11.16: Gmail SMTP (Workspace) preferred, Resend fallback."""
+    g_user = os.environ.get("GMAIL_SMTP_USER")
+    g_pass = os.environ.get("GMAIL_SMTP_PASS")
+    if g_user and g_pass:
+        import smtplib
+        from email.mime.text import MIMEText
+
+        def _smtp_send():
+            msg = MIMEText(html, "html", "utf-8")
+            msg["Subject"] = subject
+            msg["From"] = os.environ.get("EMAIL_FROM", f"outcomestar <{g_user}>")
+            msg["To"] = to_email
+            with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as srv:
+                srv.starttls()
+                srv.login(g_user, g_pass)
+                srv.sendmail(g_user, [to_email], msg.as_string())
+
+        import asyncio
+        await asyncio.to_thread(_smtp_send)
+        return
     api_key = os.environ.get("RESEND_API_KEY")
     if not api_key:
-        log.warning("RESEND_API_KEY not set; verification email to %s skipped", to_email)
+        log.warning("no email transport configured; mail to %s skipped", to_email)
         return
     sender = os.environ.get("EMAIL_FROM", "outcomestar <onboarding@resend.dev>")
-    link = f"https://focms-api.onrender.com/focms/v1/auth/verify-email?token={token}"
-    who = "your parent account" if role == "parent" else f"{student_name}'s student email"
-    html = (
-        '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
-        '<h2 style="color:#201868">Confirm ' + who + '</h2>'
-        '<p>To activate free access to outcomestar, both the parent and student '
-        'email addresses must be confirmed.</p>'
-        '<p><a href="' + link + '" style="background:#F07800;color:#fff;padding:12px 26px;'
-        'border-radius:8px;text-decoration:none;font-weight:bold">Confirm this email</a></p>'
-        '<p style="color:#7A8A9E;font-size:12px">This link expires in 7 days. '
-        'If you did not sign up for outcomestar, ignore this email.</p></div>'
-    )
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(
-            "https://api.resend.com/emails",
+        r = await client.post("https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={"from": sender, "to": [to_email],
-                  "subject": "Confirm your email — outcomestar", "html": html},
-        )
+            json={"from": sender, "to": [to_email], "subject": subject, "html": html})
         if r.status_code >= 300:
             log.warning("resend send failed %s: %s", r.status_code, r.text[:200])
+
+
+async def _send_verification_email(to_email: str, role: str, student_name: str, token: str) -> None:
+    await _send_email(to_email, "Confirm your email — outcomestar", html)
 
 
 async def _seed_portal_rows(conn: asyncpg.Connection, tenant_id, student_id, parent_user_id, p: dict) -> None:
@@ -1035,28 +1052,7 @@ class EmailVerifyRequest(BaseModel):
 
 
 async def _send_reset_email(to_email: str, token: str) -> None:
-    api_key = os.environ.get("RESEND_API_KEY")
-    if not api_key:
-        log.warning("RESEND_API_KEY not set; reset email to %s skipped", to_email)
-        return
-    sender = os.environ.get("EMAIL_FROM", "outcomestar <onboarding@resend.dev>")
-    link = f"https://outcomestar.app/reset-password?token={token}"
-    html = (
-        '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
-        '<h2 style="color:#201868">Reset your password</h2>'
-        '<p>Someone (hopefully you) asked to reset the outcomestar password for this email.</p>'
-        '<p><a href="' + link + '" style="background:#F07800;color:#fff;padding:12px 26px;'
-        'border-radius:8px;text-decoration:none;font-weight:bold">Choose a new password</a></p>'
-        '<p style="color:#7A8A9E;font-size:12px">This link expires in 1 hour and works once. '
-        'If you did not request this, ignore this email - your password is unchanged.</p></div>'
-    )
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post("https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"from": sender, "to": [to_email],
-                  "subject": "Reset your password - outcomestar", "html": html})
-        if r.status_code >= 300:
-            log.warning("reset email failed %s: %s", r.status_code, r.text[:200])
+    await _send_email(to_email, "Reset your password - outcomestar", html)
 
 
 class ForgotPasswordRequest(BaseModel):
@@ -1415,6 +1411,8 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
     return {"received": True, "provisioned": str(family_tenant_id)}
 
 
+async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
+    await _send_email(to_email, "Welcome to outcomestar - your portal access", html)
 async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
     api_key = os.environ.get("RESEND_API_KEY")
     if not api_key:
