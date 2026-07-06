@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -2274,6 +2274,7 @@ class FamilyMember(BaseModel):
     mailing_same_as_physical: Optional[bool] = True
     mailing_address: Optional[dict] = None   # {street_address, street_address_line_2, city_town, state_province, zip_postal_code, country}
     education_level: Optional[str] = None    # v0.12.87: high_school_diploma | ged | other
+    county: Optional[str] = None             # v0.12.88: county/district of residence
     public: dict = Field(default_factory=dict)
 
 
@@ -2314,7 +2315,8 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              jsonb_build_object('public_fields', $30::jsonb,
                                 'mailing_same_as_physical', $31::boolean,
                                 'mailing_address', $32::jsonb,
-                                'education_level', $39::text),
+                                'education_level', $39::text,
+                                'county', $40::text),
              $33,$34,$35,$36,$37,$38,
              'parent_portal',$28::uuid,$28::uuid)
         """,
@@ -2334,7 +2336,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
         json.dumps(m.mailing_address or {}),
         (m.street_address or None), (m.street_address_line_2 or None), (m.city_town or None),
         (m.state_province or None), (m.zip_postal_code or None), (m.country or None),
-        (m.education_level or None),
+        (m.education_level or None), (m.county or None),
     )
 
 
@@ -2360,7 +2362,8 @@ async def get_student_family(request: Request, student_id: str):
                    details->'public_fields' AS public_fields,
                    COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS mailing_same_as_physical,
                    details->'mailing_address' AS mailing_address,
-                   details->>'education_level' AS education_level
+                   details->>'education_level' AS education_level,
+                   details->>'county' AS county
               FROM family_members
              WHERE student_id=$1::uuid AND deleted_at IS NULL AND source_system='parent_portal'
              ORDER BY guardian_order NULLS LAST
@@ -2390,7 +2393,7 @@ async def get_student_family(request: Request, student_id: str):
             "city_town": r["city_town"], "state_province": r["state_province"],
             "zip_postal_code": r["zip_postal_code"], "country": r["country"],
             "mailing_same_as_physical": r["mailing_same_as_physical"],
-            "education_level": r["education_level"],
+            "education_level": r["education_level"], "county": r["county"],
             "mailing_address": (json.loads(r["mailing_address"]) if isinstance(r["mailing_address"], str) else (r["mailing_address"] or {})),
             "public": pf or {},
         }
@@ -2640,6 +2643,27 @@ async def post_student_personal_details(request: Request, student_id: str, body:
     return {"student_id": student_id, "saved": True}
 
 
+# ------------------ Subdivisions catalog (v0.12.88, ISO 3166-2) ------------
+# Canonical geographic divisions from pycountry (ISO 3166-2). The portal
+# renders these as the State/Province dropdown after a country is chosen and
+# stores the ISO code (e.g. US-TX), never the localized display name.
+# Countries without formal subdivisions return an empty list; the portal
+# falls back to a free-text Region / City input.
+
+@router.get("/catalogs/subdivisions")
+async def get_subdivisions(request: Request, country: str):
+    await _resolve_context(request)
+    iso2 = (country or "").strip().upper()[:2]
+    try:
+        import pycountry
+        subs = pycountry.subdivisions.get(country_code=iso2) or []
+        out = sorted(({"code": x.code, "name": x.name} for x in subs),
+                     key=lambda d: d["name"])
+    except Exception:
+        out = []
+    return {"country": iso2, "subdivision_count": len(out), "subdivisions": out}
+
+
 # ---------------------- Student addresses (v0.12.85) -----------------------
 # Physical ('permanent') + 'mailing' rows in student_addresses. Free-text
 # fields accommodate every country; iso/e164 normalization is the i18n
@@ -2647,9 +2671,11 @@ async def post_student_personal_details(request: Request, student_id: str, body:
 
 _ADDR_FIELDS = ("street_address", "street_address_line_2", "city_town",
                 "state_province", "zip_postal_code", "country", "phone_at_address")
+_ADDR_DETAIL_FIELDS = ("county",)
 
 
 class StudentAddressIn(BaseModel):
+    county: Optional[str] = None
     street_address: Optional[str] = None
     street_address_line_2: Optional[str] = None
     city_town: Optional[str] = None
@@ -2673,6 +2699,7 @@ async def get_student_addresses(request: Request, student_id: str):
         rows = await conn.fetch(
             "SELECT id, address_kind, street_address, street_address_line_2, city_town, "
             "state_province, zip_postal_code, country, phone_at_address, "
+            "details->>'county' AS county, "
             "COALESCE((details->>'mailing_same_as_physical')::boolean, true) AS same_flag "
             "FROM student_addresses WHERE student_id=$1::uuid AND deleted_at IS NULL "
             "AND address_kind IN ('permanent','current_mailing')", student_id)
@@ -2680,6 +2707,7 @@ async def get_student_addresses(request: Request, student_id: str):
            "physical_id": None, "mailing_id": None}
     for r in rows:
         d = {k: r[k] for k in _ADDR_FIELDS}
+        d["county"] = r["county"]
         if r["address_kind"] == "permanent":
             out["physical"] = d
             out["physical_id"] = str(r["id"])
@@ -2700,8 +2728,9 @@ async def post_student_addresses(request: Request, student_id: str, body: Studen
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             ids = {}
             for kind, a, extra in (("permanent", body.physical,
-                                    {"mailing_same_as_physical": body.mailing_same_as_physical}),
-                                   ("current_mailing", mailing, {})):
+                                    {"mailing_same_as_physical": body.mailing_same_as_physical,
+                                     "county": body.physical.county}),
+                                   ("current_mailing", mailing, {"county": mailing.county})):
                 row = await conn.fetchrow(
                     """INSERT INTO student_addresses
                          (student_id, tenant_id, address_kind, is_current,
