@@ -1756,6 +1756,8 @@ async def public_site_hero(request: Request, slug: str):
                 tenant_id, student["id"])
             has_hero = bool(await tconn.fetchval(
                 "SELECT 1 FROM site_assets WHERE student_id=$1 AND kind='hero'", student["id"]))
+            has_hero = bool(await tconn.fetchval(
+                "SELECT 1 FROM site_assets WHERE student_id=$1 AND kind='hero'", student["id"]))
     if not cfg:
         raise HTTPException(404, {"error": "site_not_published",
                                   "message": "This family has not published a website yet."})
