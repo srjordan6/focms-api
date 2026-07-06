@@ -1679,8 +1679,60 @@ async def post_website_config(request: Request, student_id: str, body: WebsiteCo
 # graduation year, age band, theme, enabled sections, languages. 404 when the
 # family has not configured a website (config row is the publish switch).
 
-@router.get("/public/site/{slug}")
-async def public_site_config(request: Request, slug: str):
+class SiteHeroRequest(BaseModel):
+    content_type: str
+    data_base64: str
+
+
+@router.post("/student/{student_id}/site-hero")
+async def post_site_hero(request: Request, student_id: str, body: SiteHeroRequest):
+    """v0.12.93: student photo / graphic for the public site hero (JPG/PNG/WebP, 2 MB max)."""
+    ctx = await _resolve_context(request)
+    tenant_id = ctx["tenant_id"]
+    if body.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(400, {"error": "bad_type", "message": "Use a JPG, PNG, or WebP image."})
+    import base64 as _b64
+    try:
+        blob = _b64.b64decode(body.data_base64, validate=True)
+    except Exception:
+        raise HTTPException(400, {"error": "bad_data"})
+    if len(blob) > 2_000_000:
+        raise HTTPException(400, {"error": "too_large", "message": "Max photo size is 2 MB."})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
+            await conn.execute(
+                """INSERT INTO site_assets (tenant_id, student_id, kind, content_type, content)
+                   VALUES ($1::uuid, $2::uuid, 'hero', $3, $4)
+                   ON CONFLICT (student_id, kind)
+                   DO UPDATE SET content_type=EXCLUDED.content_type, content=EXCLUDED.content, updated_at=now()""",
+                tenant_id, student_id, body.content_type, blob)
+    return {"saved": True, "bytes": len(blob)}
+
+
+@router.get("/public/site/{slug}/hero")
+async def public_site_hero(request: Request, slug: str):
+    from fastapi.responses import Response
+    pool: asyncpg.Pool = request.app.state.pool
+    slug = slug.strip().lower()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE slug=$1 AND status='active'", slug)
+        if not tenant:
+            raise HTTPException(404, {"error": "not_found"})
+        async with _tenant_conn(pool, str(tenant["id"])) as tconn:
+            row = await tconn.fetchrow(
+                "SELECT sa.content_type, sa.content FROM site_assets sa "
+                "JOIN students st ON st.id = sa.student_id "
+                "WHERE st.tenant_id=$1::uuid AND sa.kind='hero' "
+                "ORDER BY st.created_at LIMIT 1", str(tenant["id"]))
+    if not row:
+        raise HTTPException(404, {"error": "not_found"})
+    return Response(content=bytes(row["content"]), media_type=row["content_type"],
+                    headers={"Cache-Control": "public, max-age=300"})
+
+
+@router.get("/public/site/{slug}")async def public_site_config(request: Request, slug: str):
     pool: asyncpg.Pool = request.app.state.pool
     slug = slug.strip().lower()
     async with pool.acquire() as conn:
@@ -1702,6 +1754,8 @@ async def public_site_config(request: Request, slug: str):
                 "language_primary, language_secondary "
                 "FROM website_configs WHERE tenant_id = $1::uuid AND student_id = $2",
                 tenant_id, student["id"])
+            has_hero = bool(await tconn.fetchval(
+                "SELECT 1 FROM site_assets WHERE student_id=$1 AND kind='hero'", student["id"]))
     if not cfg:
         raise HTTPException(404, {"error": "site_not_published",
                                   "message": "This family has not published a website yet."})
@@ -1716,6 +1770,7 @@ async def public_site_config(request: Request, slug: str):
     theme = next((t for t in cat["themes"] if t["key"] == cfg["theme_key"]), None)         or (cat["themes"][0] if cat["themes"] else None)
     return {
         "slug": slug,
+        "hero_url": (f"https://focms-api.onrender.com/focms/v1/public/site/{slug}/hero" if has_hero else None),
         "student_first_name": student["first_name"],
         "graduation_year": student["expected_hs_graduation_year"],
         "age_band": band,
