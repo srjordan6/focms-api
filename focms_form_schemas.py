@@ -1492,19 +1492,33 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.95 real section content mapping (athlete_tracker/leadership/portfolio/essays); v0.12.94 latest/section endpoints; v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.96 pillar-level publish gates + is_public master + Skills/Applications/Reports blacklisted; v0.12.95 real section content mapping (athlete_tracker/leadership/portfolio/essays); v0.12.94 latest/section endpoints; v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
+
+_SITE_PILLARS = [
+    {"code": "personal", "label": "Personal"},
+    {"code": "academics", "label": "Academics"},
+    {"code": "extracurricular", "label": "Extra Curricular"},
+    {"code": "career", "label": "Career"},
+    {"code": "higher_education", "label": "Higher Education"},
+]
+_BLOCKED_PILLARS = {"skills", "applications_resumes_reports", "reports"}
+
+
+def _default_pillars() -> dict:
+    return {p["code"]: True for p in _SITE_PILLARS}
+
 
 _WEBSITE_BANDS = {
     "band_1_5": {
         "label": "Ages 1-5 \u00b7 Family Memory Book", "control_mode": "parent_managed",
         "sections": [
-            {"code": "growth_timeline",  "title": "Growth & Milestone Timeline",  "source": "milestones + student_skills", "default": True},
-            {"code": "art_gallery",      "title": "Digital Art & Project Gallery", "source": "media_files",                "default": True},
-            {"code": "memory_scrapbook", "title": "Memory Scrapbook",              "source": "events + media_files",       "default": True},
-            {"code": "birthday_interviews", "title": "Birthday Interview Log",     "source": "events (annual interview)",  "default": True},
-            {"code": "family_excursions",  "title": "Family Excursions & Vacations", "source": "events + media_files",     "default": False},
+            {"code": "growth_timeline",  "title": "Growth & Milestone Timeline",  "source": "milestones + student_skills", "pillar": "personal", "default": True},
+            {"code": "art_gallery",      "title": "Digital Art & Project Gallery", "source": "media_files",                "pillar": "extracurricular", "default": True},
+            {"code": "memory_scrapbook", "title": "Memory Scrapbook",              "source": "events + media_files",       "pillar": "personal", "default": True},
+            {"code": "birthday_interviews", "title": "Birthday Interview Log",     "source": "events (annual interview)",  "pillar": "personal", "default": True},
+            {"code": "family_excursions",  "title": "Family Excursions & Vacations", "source": "events + media_files",     "pillar": "personal", "default": False},
         ],
         "privacy_forced": {"password_protected": True, "hide_from_search": True, "pii_locked": True, "comments_disabled": True},
         "privacy_optional": [],
@@ -1524,11 +1538,11 @@ _WEBSITE_BANDS = {
     "band_6_12": {
         "label": "Ages 6-12 \u00b7 Developmental Portfolio", "control_mode": "shared",
         "sections": [
-            {"code": "athlete_tracker",   "title": "Student-Athlete Tracker (PRs, times)", "source": "personal_records + events + power index", "default": True},
-            {"code": "leadership_milestones", "title": "Leadership & Group Milestones",    "source": "affiliations + milestones", "default": True},
-            {"code": "fine_arts",         "title": "Fine Arts Showcase",                   "source": "affiliations (music) + media", "default": True},
-            {"code": "stem_portfolio",    "title": "Academic & STEM Portfolio",            "source": "events + courses_taken", "default": True},
-            {"code": "writing_book_log",  "title": "Writing & Book Log",                   "source": "events (reading log)", "default": False},
+            {"code": "athlete_tracker",   "title": "Student-Athlete Tracker (PRs, times)", "source": "personal_records + events + power index", "pillar": "extracurricular", "default": True},
+            {"code": "leadership_milestones", "title": "Leadership & Group Milestones",    "source": "affiliations + milestones", "pillar": "extracurricular", "default": True},
+            {"code": "fine_arts",         "title": "Fine Arts Showcase",                   "source": "affiliations (music) + media", "pillar": "extracurricular", "default": True},
+            {"code": "stem_portfolio",    "title": "Academic & STEM Portfolio",            "source": "events + courses_taken", "pillar": "academics", "default": True},
+            {"code": "writing_book_log",  "title": "Writing & Book Log",                   "source": "events (reading log)", "pillar": "academics", "default": False},
         ],
         "privacy_forced": {"hide_from_search": True, "pii_locked": True, "comment_moderation": True},
         "privacy_optional": ["two_gate_private_portal", "password_protected"],
@@ -1548,13 +1562,12 @@ _WEBSITE_BANDS = {
     "band_13_18": {
         "label": "Ages 13-18 \u00b7 Professional Launchpad", "control_mode": "student_led",
         "sections": [
-            {"code": "resume_cv",         "title": "Resume / CV Tab",                    "source": "resume engine (uca_form_instances)", "default": True},
-            {"code": "academic_capstone", "title": "Academic Capstone & Research",       "source": "events + essays + verified_documents", "default": True},
-            {"code": "essay_vault",       "title": "Essay & Writing Vault",              "source": "essays", "default": False},
-            {"code": "recruitment_portal", "title": "Athletics Recruitment Portal",      "source": "swim bests + power index + coach contacts + grad year", "default": True},
-            {"code": "highlight_reel",    "title": "Highlight Reel (video)",             "source": "media_files (video)", "default": False},
-            {"code": "leadership_impact", "title": "Leadership & Extracurricular Impact", "source": "affiliations + service logs", "default": True},
-            {"code": "branding",          "title": "Professional Branding (domain, LinkedIn)", "source": "digital_presence", "default": True},
+            {"code": "academic_capstone", "title": "Academic Capstone & Research",       "source": "events + essays + verified_documents", "pillar": "academics", "default": True},
+            {"code": "essay_vault",       "title": "Essay & Writing Vault",              "source": "essays", "pillar": "higher_education", "default": False},
+            {"code": "recruitment_portal", "title": "Athletics Recruitment Portal",      "source": "swim bests + power index + coach contacts + grad year", "pillar": "extracurricular", "default": True},
+            {"code": "highlight_reel",    "title": "Highlight Reel (video)",             "source": "media_files (video)", "pillar": "extracurricular", "default": False},
+            {"code": "leadership_impact", "title": "Leadership & Extracurricular Impact", "source": "affiliations + service logs", "pillar": "extracurricular", "default": True},
+            {"code": "branding",          "title": "Professional Branding (domain, LinkedIn)", "source": "digital_presence", "pillar": "career", "default": True},
         ],
         "privacy_forced": {},
         "privacy_optional": ["two_gate_private_portal", "hide_from_search", "password_protected"],
@@ -1594,6 +1607,8 @@ class WebsiteConfigRequest(BaseModel):
     theme_key: Optional[str] = None
     language_primary: Optional[str] = None    # BCP-47, e.g. en, es, zh
     language_secondary: Optional[str] = None  # enables a second site in the native language
+    is_public: Optional[bool] = None          # master switch (v0.12.96)
+    pillars: Optional[dict] = None            # {pillar_code: bool} (v0.12.96)
 
 
 @router.get("/student/{student_id}/website-config")
@@ -1608,7 +1623,7 @@ async def get_website_config(request: Request, student_id: str):
             age = None
         row = await conn.fetchrow(
             "SELECT age_band, control_mode, sections, privacy, domain, notes, theme_key, "
-            "language_primary, language_secondary, updated_at "
+            "language_primary, language_secondary, is_public, pillars, updated_at "
             "FROM website_configs WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
         slug = await conn.fetchval("SELECT slug FROM tenants WHERE id=$1::uuid", tenant_id)
     band = (row and row["age_band"]) or _website_band_for_age(age)
@@ -1620,10 +1635,12 @@ async def get_website_config(request: Request, student_id: str):
                "sections": json.loads(row["sections"]) if isinstance(row["sections"], str) else (row["sections"] or {}),
                "privacy": json.loads(row["privacy"]) if isinstance(row["privacy"], str) else (row["privacy"] or {}),
                "domain": row["domain"], "notes": row["notes"], "theme_key": row["theme_key"],
-               "language_primary": row["language_primary"], "language_secondary": row["language_secondary"]}
+               "language_primary": row["language_primary"], "language_secondary": row["language_secondary"],
+               "is_public": row["is_public"] if row["is_public"] is not None else True,
+               "pillars": json.loads(row["pillars"]) if isinstance(row["pillars"], str) else (row["pillars"] or _default_pillars())}
     lang2 = cfg and cfg.get("language_secondary")
     return {"student_id": student_id, "student_age": age, "computed_band": _website_band_for_age(age),
-            "band_catalog": _WEBSITE_BANDS, "config": cfg,
+            "band_catalog": _WEBSITE_BANDS, "config": cfg, "pillars_catalog": _SITE_PILLARS, "blocked_pillars": sorted(_BLOCKED_PILLARS),
             "site_slug": slug,
             "site_url": f"https://app.outcomestar.app/{slug}" if slug else None,
             "site_url_secondary": (f"https://app.outcomestar.app/{slug}/{lang2}" if (slug and lang2) else None)}
@@ -1657,20 +1674,28 @@ async def post_website_config(request: Request, student_id: str, body: WebsiteCo
         ls = (body.language_secondary or "").strip().lower()[:12] or None
         if ls == lp:
             ls = None
+        is_public_val = True if body.is_public is None else bool(body.is_public)
+        pillars_in = body.pillars or {}
+        pillars_val = {p["code"]: bool(pillars_in.get(p["code"], True)) for p in _SITE_PILLARS}
+        pj_pillars = json.dumps(pillars_val)
         if row:
             await conn.execute(
                 "UPDATE website_configs SET age_band=$2, control_mode=$3, sections=$4::jsonb, "
                 "privacy=$5::jsonb, domain=$6, notes=$7, theme_key=COALESCE($8, theme_key), "
-                "language_primary=$9, language_secondary=$10, updated_at=now() WHERE id=$1",
-                row["id"], band, mode, sj, pj, body.domain, body.notes, theme, lp, ls)
+                "language_primary=$9, language_secondary=$10, is_public=$11, pillars=$12::jsonb, "
+                "updated_at=now() WHERE id=$1",
+                row["id"], band, mode, sj, pj, body.domain, body.notes, theme, lp, ls,
+                is_public_val, pj_pillars)
         else:
             await conn.execute(
                 "INSERT INTO website_configs (tenant_id, student_id, age_band, control_mode, sections, privacy, "
-                "domain, notes, theme_key, language_primary, language_secondary) "
-                "VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11)",
-                tenant_id, student_id, band, mode, sj, pj, body.domain, body.notes, theme, lp, ls)
+                "domain, notes, theme_key, language_primary, language_secondary, is_public, pillars) "
+                "VALUES ($1::uuid, $2::uuid, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10, $11, $12, $13::jsonb)",
+                tenant_id, student_id, band, mode, sj, pj, body.domain, body.notes, theme, lp, ls,
+                is_public_val, pj_pillars)
     return {"ok": True, "age_band": band, "control_mode": mode, "privacy": privacy, "theme_key": theme,
-            "language_primary": lp, "language_secondary": ls}
+            "language_primary": lp, "language_secondary": ls,
+            "is_public": is_public_val, "pillars": pillars_val}
 
 
 # --------------------- Public site config (v0.12.82) ---------------------
@@ -1807,6 +1832,24 @@ async def public_site_section(request: Request, slug: str, code: str):
             if isinstance(sections_dict, dict):
                 if not sections_dict.get(code, False):
                     raise HTTPException(404, {"error": "section_not_enabled"})
+            wc = await tconn.fetchrow(
+                "SELECT age_band, is_public, pillars FROM website_configs "
+                "WHERE tenant_id=$1::uuid AND student_id=$2",
+                str(tenant["id"]), student["id"])
+            if wc and wc["is_public"] is False:
+                raise HTTPException(404, {"error": "not_public"})
+            band_cat = _WEBSITE_BANDS.get(
+                wc["age_band"] if wc else "band_6_12", _WEBSITE_BANDS["band_6_12"])
+            sec_meta = next((x for x in band_cat["sections"] if x["code"] == code), None)
+            pillar_code = (sec_meta or {}).get("pillar", "personal")
+            if pillar_code in _BLOCKED_PILLARS:
+                raise HTTPException(404, {"error": "pillar_blocked"})
+            p_cfg = wc["pillars"] if wc and wc["pillars"] else _default_pillars()
+            if isinstance(p_cfg, str):
+                import json as _json
+                p_cfg = _json.loads(p_cfg)
+            if not p_cfg.get(pillar_code, True):
+                raise HTTPException(404, {"error": "pillar_disabled"})
             title = SECTION_TITLES.get(code, code.replace("_", " ").title())
             items = await _section_items(tconn, student["id"], code)
     return {"slug": slug, "student_first_name": student["first_name"],
@@ -1886,7 +1929,7 @@ async def public_site_config(request: Request, slug: str):
                 raise HTTPException(404, {"error": "site_not_found"})
             cfg = await tconn.fetchrow(
                 "SELECT age_band, control_mode, sections, privacy, theme_key, "
-                "language_primary, language_secondary "
+                "language_primary, language_secondary, is_public, pillars "
                 "FROM website_configs WHERE tenant_id = $1::uuid AND student_id = $2",
                 tenant_id, student["id"])
             has_hero = bool(await tconn.fetchval(
@@ -1897,15 +1940,25 @@ async def public_site_config(request: Request, slug: str):
     band = cfg["age_band"] or _website_band_for_age(student["age"])
     cat = _WEBSITE_BANDS.get(band, _WEBSITE_BANDS["band_6_12"])
     saved_sections = cfg["sections"] if isinstance(cfg["sections"], dict) else json.loads(cfg["sections"] or "{}")
+    if cfg and cfg["is_public"] is False:
+        raise HTTPException(404, {"error": "not_public"})
+    pillar_cfg = cfg["pillars"] if cfg and cfg["pillars"] else _default_pillars()
+    if isinstance(pillar_cfg, str):
+        import json as _json
+        pillar_cfg = _json.loads(pillar_cfg)
     enabled = [
         {"code": sdef["code"], "title": sdef["title"]}
         for sdef in cat["sections"]
         if saved_sections.get(sdef["code"], sdef["default"])
+        and pillar_cfg.get(sdef.get("pillar", "personal"), True)
+        and sdef.get("pillar", "personal") not in _BLOCKED_PILLARS
     ]
     theme = next((t for t in cat["themes"] if t["key"] == cfg["theme_key"]), None)         or (cat["themes"][0] if cat["themes"] else None)
     return {
         "slug": slug,
         "hero_url": (f"https://focms-api.onrender.com/focms/v1/public/site/{slug}/hero" if has_hero else None),
+        "is_public": bool(cfg["is_public"]) if cfg else True,
+        "pillars_enabled": pillar_cfg,
         "student_first_name": student["first_name"],
         "graduation_year": student["expected_hs_graduation_year"],
         "age_band": band,
