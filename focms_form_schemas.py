@@ -1751,24 +1751,28 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
     """v0.12.95: return public rows for a section code across relevant tables."""
     items: list[dict] = []
     if code == "athlete_tracker":
-        rows = await tconn.fetch(
-            "SELECT title, event_date, public_description FROM events "
-            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
-            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
-        for r in rows:
-            items.append({"title": r["title"] or "Event",
-                          "date": r["event_date"].isoformat() if r["event_date"] else None,
-                          "body": r["public_description"]})
         prs = await tconn.fetch(
-            "SELECT title, achieved_date, value_text, value_numeric, value_unit, public_description "
-            "FROM personal_records WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
-            "ORDER BY achieved_date DESC NULLS LAST LIMIT 50", student_id)
+            "SELECT title, achieved_date, value_text, value_numeric, value_unit, details, "
+            "record_kind::text AS record_kind FROM personal_records "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND record_kind = 'swim_best' "
+            "ORDER BY achieved_date DESC NULLS LAST", student_id)
         for r in prs:
-            val = r["value_text"] or (f"{r['value_numeric']} {r['value_unit'] or ''}".strip() if r["value_numeric"] is not None else None)
-            body_parts = [x for x in (val, r["public_description"]) if x]
-            items.append({"title": r["title"] or "Personal record",
-                          "date": r["achieved_date"].isoformat() if r["achieved_date"] else None,
-                          "body": " \u2014 ".join(body_parts) if body_parts else None})
+            d = r["details"] if isinstance(r["details"], dict) else (json.loads(r["details"]) if r["details"] else {})
+            items.append({
+                "title": r["title"],
+                "date": r["achieved_date"].isoformat() if r["achieved_date"] else None,
+                "body": r["value_text"],
+                "meta": {
+                    "stroke": d.get("stroke"),
+                    "course": d.get("course"),
+                    "event": d.get("event"),
+                    "best_time": r["value_text"],
+                    "first_time": d.get("first_time"),
+                    "power_points": d.get("power_points"),
+                    "usa_standard": d.get("usa_standard"),
+                },
+            })
     elif code in ("leadership_milestones", "leadership_extracurricular"):
         rows = await tconn.fetch(
             "SELECT title, event_date, public_description FROM events "
