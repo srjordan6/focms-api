@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.94 public latest/section endpoints; v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.95 real section content mapping (athlete_tracker/leadership/portfolio/essays); v0.12.94 latest/section endpoints; v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -1706,11 +1706,86 @@ async def public_site_latest(request: Request, slug: str):
     return {"latest": {"date": row["ts"].isoformat(), "kind": row["kind"]}}
 
 
+SECTION_TITLES = {
+    "athlete_tracker": "Student-Athlete Tracker",
+    "leadership_milestones": "Leadership & Group Milestones",
+    "fine_arts": "Fine Arts Showcase",
+    "stem_portfolio": "Academic & STEM Portfolio",
+    "writing_book_log": "Writing & Book Log",
+    "resume_cv": "Resume / CV",
+    "academic_capstone": "Academic Capstone & Research",
+    "essay_vault": "Essay & Writing Vault",
+    "athletics_recruitment": "Athletics Recruitment Profile",
+    "highlight_reel": "Highlight Reel",
+    "leadership_extracurricular": "Leadership & Extracurricular Impact",
+    "professional_branding": "Professional Branding",
+}
+
+
+async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
+    """v0.12.95: return public rows for a section code across relevant tables."""
+    items: list[dict] = []
+    if code == "athlete_tracker":
+        rows = await tconn.fetch(
+            "SELECT title, event_date, public_description FROM events "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in rows:
+            items.append({"title": r["title"] or "Event",
+                          "date": r["event_date"].isoformat() if r["event_date"] else None,
+                          "body": r["public_description"]})
+        prs = await tconn.fetch(
+            "SELECT title, achieved_date, value_text, value_numeric, value_unit, public_description "
+            "FROM personal_records WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY achieved_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in prs:
+            val = r["value_text"] or (f"{r['value_numeric']} {r['value_unit'] or ''}".strip() if r["value_numeric"] is not None else None)
+            body_parts = [x for x in (val, r["public_description"]) if x]
+            items.append({"title": r["title"] or "Personal record",
+                          "date": r["achieved_date"].isoformat() if r["achieved_date"] else None,
+                          "body": " \u2014 ".join(body_parts) if body_parts else None})
+    elif code in ("leadership_milestones", "leadership_extracurricular"):
+        rows = await tconn.fetch(
+            "SELECT title, event_date, public_description FROM events "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in rows:
+            items.append({"title": r["title"] or "Event",
+                          "date": r["event_date"].isoformat() if r["event_date"] else None,
+                          "body": r["public_description"]})
+    elif code in ("fine_arts", "stem_portfolio", "highlight_reel", "academic_capstone"):
+        rows = await tconn.fetch(
+            "SELECT title, created_at, public_description FROM portfolio_artifacts "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 50", student_id)
+        for r in rows:
+            items.append({"title": r["title"] or "Portfolio item",
+                          "date": r["created_at"].date().isoformat() if r["created_at"] else None,
+                          "body": r["public_description"]})
+    elif code in ("writing_book_log", "essay_vault"):
+        rows = await tconn.fetch(
+            "SELECT title, updated_at, public_description FROM essays "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY updated_at DESC LIMIT 50", student_id)
+        for r in rows:
+            items.append({"title": r["title"] or "Essay",
+                          "date": r["updated_at"].date().isoformat() if r["updated_at"] else None,
+                          "body": r["public_description"]})
+    elif code == "resume_cv":
+        rows = await tconn.fetch(
+            "SELECT title, event_date, public_description FROM events "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY event_date DESC NULLS LAST LIMIT 20", student_id)
+        for r in rows:
+            items.append({"title": r["title"] or "Event",
+                          "date": r["event_date"].isoformat() if r["event_date"] else None,
+                          "body": r["public_description"]})
+    return items
+
+
 @router.get("/public/site/{slug}/section/{code}")
 async def public_site_section(request: Request, slug: str, code: str):
-    """v0.12.94: section detail - returns section title + placeholder items array.
-    Real per-section content wiring is future work; endpoint validates the code and
-    returns empty items so the section page renders a proper empty state."""
+    """v0.12.95: section detail - returns section title + items (public rows only)."""
     pool: asyncpg.Pool = request.app.state.pool
     slug = slug.strip().lower()
     async with pool.acquire() as conn:
@@ -1726,14 +1801,16 @@ async def public_site_section(request: Request, slug: str, code: str):
             cfg = await tconn.fetchrow(
                 "SELECT sections FROM website_configs WHERE tenant_id=$1::uuid AND student_id=$2",
                 str(tenant["id"]), student["id"])
-    if not cfg:
-        raise HTTPException(404, {"error": "no_website_config"})
-    secs = cfg["sections"] or []
-    match = next((sec for sec in secs if sec.get("code") == code), None)
-    if not match:
-        raise HTTPException(404, {"error": "unknown_section"})
+            if not cfg:
+                raise HTTPException(404, {"error": "no_website_config"})
+            sections_dict = cfg["sections"] or {}
+            if isinstance(sections_dict, dict):
+                if not sections_dict.get(code, False):
+                    raise HTTPException(404, {"error": "section_not_enabled"})
+            title = SECTION_TITLES.get(code, code.replace("_", " ").title())
+            items = await _section_items(tconn, student["id"], code)
     return {"slug": slug, "student_first_name": student["first_name"],
-            "code": code, "title": match.get("title", code), "items": []}
+            "code": code, "title": title, "items": items}
 
 
 class SiteHeroRequest(BaseModel):
