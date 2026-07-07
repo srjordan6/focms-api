@@ -1492,7 +1492,7 @@ async def get_verified_doc_file(request: Request, student_id: str, doc_id: str):
                     headers={"Content-Disposition": f'attachment; filename="{row["file_name"] or "document.pdf"}"'})
 
 
-# --------------------- UCA form instances (v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
+# --------------------- UCA form instances (v0.12.94 public latest/section endpoints; v0.12.93 site hero photo endpoints + hero_url in feed; v0.12.92 all 30 themes marked built (theme sprint shipped: token-driven ThemedSite + /{slug}/{lang} translated sites in showcase); v0.12.91 website-config returns site_slug + site URLs (secondary at /{slug}/{lang}); v0.12.90 zip geography + occupations catalogs, home/mobile/work phones; v0.12.89 family relationship enum fix (parent + parent_role) - father/mother saves were 500ing on the check constraint; v0.12.88 ISO 3166-2 subdivisions catalog + county of residence; v0.12.87 family education_level; v0.12.86 current_mailing kind fix + address row ids for validation; v0.12.85 student+family physical/mailing addresses, address fields server-locked from public; v0.12.84 middle name; v0.12.83 legal first/last name on personal-details; v0.12.82 anonymous /public/site/{slug} for showcase renderer; v0.12.81 signup-token auth fallback; v0.12.80 dual-language sites; v0.12.79 universal front-page PII + slug guardrails; v0.12.78 age-banded theme catalog (10 per band) + theme_key; v0.12.77 website pillar config; v0.12.76 adds /report-compose; v0.12.75 20-rule resume standard; v0.12.74 ATS-shape tailoring; v0.12.73 (adds /resume-tailor); v0.12.72) ---------------------
 
 # --------------------- Website pillar config (v0.12.80) ---------------------
 
@@ -1678,6 +1678,63 @@ async def post_website_config(request: Request, student_id: str, body: WebsiteCo
 # only publish-safe fields: first name (universal first-name-only rule),
 # graduation year, age band, theme, enabled sections, languages. 404 when the
 # family has not configured a website (config row is the publish switch).
+
+@router.get("/public/site/{slug}/latest")
+async def public_site_latest(request: Request, slug: str):
+    """v0.12.94: latest public activity across visibility=public records."""
+    pool: asyncpg.Pool = request.app.state.pool
+    slug = slug.strip().lower()
+    tables = ['events','awards_honors','personal_records','assessments','essays','work_experiences','portfolio_artifacts']
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE slug=$1 AND status='active'", slug)
+        if not tenant:
+            raise HTTPException(404, {"error": "not_found"})
+        async with _tenant_conn(pool, str(tenant["id"])) as tconn:
+            student = await tconn.fetchrow(
+                "SELECT id FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1",
+                str(tenant["id"]))
+            if not student:
+                return {"latest": None}
+            parts = " UNION ALL ".join(
+                f"SELECT MAX(updated_at) AS ts, '{t}' AS kind FROM {t} "
+                f"WHERE student_id=$1::uuid AND visibility='public'" for t in tables)
+            row = await tconn.fetchrow(
+                f"SELECT ts, kind FROM ({parts}) x WHERE ts IS NOT NULL ORDER BY ts DESC LIMIT 1",
+                student["id"])
+    if not row:
+        return {"latest": None}
+    return {"latest": {"date": row["ts"].isoformat(), "kind": row["kind"]}}
+
+
+@router.get("/public/site/{slug}/section/{code}")
+async def public_site_section(request: Request, slug: str, code: str):
+    """v0.12.94: section detail - returns section title + placeholder items array.
+    Real per-section content wiring is future work; endpoint validates the code and
+    returns empty items so the section page renders a proper empty state."""
+    pool: asyncpg.Pool = request.app.state.pool
+    slug = slug.strip().lower()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE slug=$1 AND status='active'", slug)
+        if not tenant:
+            raise HTTPException(404, {"error": "not_found"})
+        async with _tenant_conn(pool, str(tenant["id"])) as tconn:
+            student = await tconn.fetchrow(
+                "SELECT id, first_name FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1",
+                str(tenant["id"]))
+            if not student:
+                raise HTTPException(404, {"error": "not_found"})
+            cfg = await tconn.fetchrow(
+                "SELECT sections FROM website_configs WHERE tenant_id=$1::uuid AND student_id=$2",
+                str(tenant["id"]), student["id"])
+    if not cfg:
+        raise HTTPException(404, {"error": "no_website_config"})
+    secs = cfg["sections"] or []
+    match = next((sec for sec in secs if sec.get("code") == code), None)
+    if not match:
+        raise HTTPException(404, {"error": "unknown_section"})
+    return {"slug": slug, "student_first_name": student["first_name"],
+            "code": code, "title": match.get("title", code), "items": []}
+
 
 class SiteHeroRequest(BaseModel):
     content_type: str
