@@ -221,20 +221,34 @@ async def check_rate_limit(client_ip: str, code: str) -> None:
 # Request / response models
 # ---------------------------------------------------------------------------
 
-VALID_GRADES = {"K", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
+VALID_GRADES = {"NONE", "PRE-K", "K", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"}
+
+# v0.12.102: plausible age window per grade (inclusive), computed from birth year.
+_GRADE_AGE_WINDOWS = {"NONE": (0, 6), "PRE-K": (2, 6), "K": (4, 7)}
+
+
+def _grade_age_window(grade: str) -> tuple[int, int]:
+    g = (grade or "").strip().upper()
+    if g in _GRADE_AGE_WINDOWS:
+        return _GRADE_AGE_WINDOWS[g]
+    try:
+        n = int(g)
+        return (n + 4, n + 8)
+    except ValueError:
+        return (0, 19)
 
 
 class CohortSignupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    code: str = Field(..., min_length=1, max_length=64)
+    code: Optional[str] = Field(None, max_length=64)
     parent_email: EmailStr
     parent_display_name: str = Field(..., min_length=1, max_length=200)
     parent_first_name: str = Field(..., min_length=1, max_length=100)
     parent_last_name: str = Field(..., min_length=1, max_length=100)
     student_first_name: str = Field(..., min_length=1, max_length=100)
     student_last_name: str = Field(..., min_length=1, max_length=100)
-    student_grade: str = Field(..., min_length=1, max_length=2)
+    student_grade: str = Field(..., min_length=1, max_length=6)
     student_birth_year: int = Field(..., ge=2000, le=2030)
     student_email: Optional[EmailStr] = None
     storage_plan_key: Optional[str] = None   # required when student is under 13
@@ -245,8 +259,10 @@ class CohortSignupRequest(BaseModel):
 
     @field_validator("code")
     @classmethod
-    def normalize_code(cls, v: str) -> str:
-        return v.strip().upper()
+    def normalize_code(cls, v: Optional[str]) -> str:
+        # v0.12.102: blank code = general-public signup cohort
+        v = (v or "").strip().upper()
+        return v or os.environ.get("DEFAULT_COHORT_CODE", "PUBLIC")
 
     @field_validator("student_grade")
     @classmethod
@@ -346,7 +362,7 @@ def _looks_edu(email: str) -> bool:
 def _membership_key_for_grade(grade: str) -> str:
     """v0.12.101: grade-band membership pricing. Prices live in pricing_tiers."""
     g = (grade or "").strip().lower()
-    if g in ("pre-k", "prek", "k", "kindergarten", "1", "2", "3", "4", "5"):
+    if g in ("none", "not_yet", "pre-k", "prek", "k", "kindergarten", "1", "2", "3", "4", "5"):
         return "membership_k5"
     if g in ("6", "7", "8"):
         return "membership_6_8"
@@ -354,7 +370,10 @@ def _membership_key_for_grade(grade: str) -> str:
         return "membership_9_11"
     if g == "12":
         return "membership_12"
-    return "membership_alumni"
+    if g in ("alumni", "13", "post-12", "graduated"):
+        return "membership_alumni"
+    # Unknown grades never overbill - default to the free band.
+    return "membership_k5"
 
 
 async def _verify_turnstile(token, request: Request) -> None:
@@ -478,10 +497,20 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
     # Sanity: computed age plausible for K-12 (4-19)
     await _verify_turnstile(body.turnstile_token, request)
     age = compute_current_age(body.student_birth_year)
-    if age < 4 or age > 19:
+    if age < 0 or age > 19:
         raise HTTPException(400, {
             "error": "invalid_request",
-            "message": "student_birth_year is not plausible for a K-12 student.",
+            "message": "student_birth_year is not plausible for a Pre-K to grade-12 student.",
+        })
+    lo, hi = _grade_age_window(body.student_grade)
+    if not (lo <= age <= hi):
+        yr = datetime.now().year
+        _glabel = {"NONE": "not yet in school", "PRE-K": "Pre-K", "K": "kindergarten"}.get(
+            body.student_grade, f"grade {body.student_grade}")
+        raise HTTPException(400, {
+            "error": "grade_age_mismatch",
+            "message": f"A student who is {_glabel} is usually {lo}-{hi} years old "
+                       f"(born {yr - hi}-{yr - lo}). Check the grade and birth year and try again.",
         })
 
     pool: asyncpg.Pool = request.app.state.pool
