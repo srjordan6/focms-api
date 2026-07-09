@@ -359,21 +359,18 @@ def _looks_edu(email: str) -> bool:
     return bool(EDU_DOMAIN_RE.search("." + domain))
 
 
-def _membership_key_for_grade(grade: str) -> str:
-    """v0.12.101: grade-band membership pricing. Prices live in pricing_tiers."""
-    g = (grade or "").strip().lower()
-    if g in ("none", "not_yet", "pre-k", "prek", "k", "kindergarten", "1", "2", "3", "4", "5"):
-        return "membership_k5"
-    if g in ("6", "7", "8"):
-        return "membership_6_8"
-    if g in ("9", "10", "11"):
-        return "membership_9_11"
-    if g == "12":
-        return "membership_12"
-    if g in ("alumni", "13", "post-12", "graduated"):
-        return "membership_alumni"
-    # Unknown grades never overbill - default to the free band.
-    return "membership_k5"
+def _membership_key_for_age(age: int) -> str:
+    """v0.12.103: age-band membership pricing. Prices live in pricing_tiers.
+    0-10 free; 11-13, 14-16, 17-18 paid bands; 19+ alumni archive."""
+    if age <= 10:
+        return "membership_age_0_10"
+    if age <= 13:
+        return "membership_age_11_13"
+    if age <= 16:
+        return "membership_age_14_16"
+    if age <= 18:
+        return "membership_age_17_18"
+    return "membership_age_19_plus"
 
 
 async def _verify_turnstile(token, request: Request) -> None:
@@ -529,7 +526,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             })
         requested = (body.storage_plan_key or "").strip().lower()
         one_time = requested == "free"
-        mem_key = _membership_key_for_grade(body.student_grade)
+        mem_key = _membership_key_for_age(age)
         async with pool.acquire() as conn:
             mem = await conn.fetchrow(
                 "SELECT plan_key, display_name, price_usd_cents FROM pricing_tiers "
@@ -1432,7 +1429,8 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
         return {"received": True, "ignored": "pending_missing"}
     p = json.loads(pend["payload"])
     plan_key = meta.get("plan_key", "keepsake")
-    membership_key = meta.get("membership_key") or _membership_key_for_grade(p.get("student_grade", ""))
+    membership_key = meta.get("membership_key") or _membership_key_for_age(
+        compute_current_age(int(p.get("student_birth_year") or 0)) if p.get("student_birth_year") else 0)
 
     async with pool.acquire() as conn:
         async with conn.transaction():
