@@ -125,6 +125,14 @@ async def _resolve_context(request: Request) -> dict:
             raise
     # authenticate returns {"tenant_id", "user_id", "role"} plus maybe more.
     # Normalize to the shape the endpoints expect.
+    # v0.12.107: billing hold blocks all writes (public site is gated separately).
+    if ctx.get("billing_hold") and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        raise HTTPException(402, {
+            "error": "billing_hold",
+            "message": "Membership payment for the new age band did not go through. "
+                       "Update the card in Storage & Billing - editing unlocks the moment "
+                       "payment succeeds. Nothing has been deleted.",
+        })
     return {
         "token_id":    ctx.get("token_id"),
         "tenant_id":   ctx.get("tenant_id"),
@@ -1711,7 +1719,7 @@ async def public_site_latest(request: Request, slug: str):
     slug = slug.strip().lower()
     tables = ['events','awards_honors','personal_records','assessments','essays','work_experiences','portfolio_artifacts']
     async with pool.acquire() as conn:
-        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE slug=$1 AND status='active'", slug)
+        tenant = await conn.fetchrow("SELECT t.id FROM tenants t WHERE t.slug=$1 AND t.status='active' AND NOT coalesce((SELECT (ts.feature_flags->>'billing_hold')::bool FROM tenant_settings ts WHERE ts.tenant_id=t.id), false)", slug)
         if not tenant:
             raise HTTPException(404, {"error": "not_found"})
         async with _tenant_conn(pool, str(tenant["id"])) as tconn:
@@ -1818,7 +1826,7 @@ async def public_site_section(request: Request, slug: str, code: str):
     pool: asyncpg.Pool = request.app.state.pool
     slug = slug.strip().lower()
     async with pool.acquire() as conn:
-        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE slug=$1 AND status='active'", slug)
+        tenant = await conn.fetchrow("SELECT t.id FROM tenants t WHERE t.slug=$1 AND t.status='active' AND NOT coalesce((SELECT (ts.feature_flags->>'billing_hold')::bool FROM tenant_settings ts WHERE ts.tenant_id=t.id), false)", slug)
         if not tenant:
             raise HTTPException(404, {"error": "not_found"})
         async with _tenant_conn(pool, str(tenant["id"])) as tconn:
@@ -1898,7 +1906,7 @@ async def public_site_hero(request: Request, slug: str):
     pool: asyncpg.Pool = request.app.state.pool
     slug = slug.strip().lower()
     async with pool.acquire() as conn:
-        tenant = await conn.fetchrow("SELECT id FROM tenants WHERE slug=$1 AND status='active'", slug)
+        tenant = await conn.fetchrow("SELECT t.id FROM tenants t WHERE t.slug=$1 AND t.status='active' AND NOT coalesce((SELECT (ts.feature_flags->>'billing_hold')::bool FROM tenant_settings ts WHERE ts.tenant_id=t.id), false)", slug)
         if not tenant:
             raise HTTPException(404, {"error": "not_found"})
         async with _tenant_conn(pool, str(tenant["id"])) as tconn:
@@ -1919,7 +1927,9 @@ async def public_site_config(request: Request, slug: str):
     slug = slug.strip().lower()
     async with pool.acquire() as conn:
         tenant = await conn.fetchrow(
-            "SELECT id FROM tenants WHERE slug = $1 AND status = 'active'", slug)
+            "SELECT t.id FROM tenants t WHERE t.slug = $1 AND t.status = 'active' "
+            "AND NOT coalesce((SELECT (ts.feature_flags->>'billing_hold')::bool "
+            "FROM tenant_settings ts WHERE ts.tenant_id=t.id), false)", slug)
         if not tenant:
             raise HTTPException(404, {"error": "site_not_found"})
         tenant_id = str(tenant["id"])

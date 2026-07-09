@@ -1171,6 +1171,31 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
                     "WHERE id = $1::uuid", t_id)
         log.info("idv_%s tenant=%s session=%s", "verified" if verified else "update", t_id, iv.get("id"))
         return {"received": True}
+    # v0.12.107: birthday-billing retry succeeded - clear the hold instantly.
+    if etype == "payment_intent.succeeded":
+        pi = event["data"]["object"]
+        pmeta = pi.get("metadata") or {}
+        if pmeta.get("birthday_billing") == "1" and pmeta.get("tenant_id"):
+            _now = datetime.now(timezone.utc)
+            pool: asyncpg.Pool = request.app.state.pool
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                       VALUES ($1::uuid, jsonb_build_object('billing_hold', false, 'membership', $2::jsonb))
+                       ON CONFLICT (tenant_id) DO UPDATE SET
+                       feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                       || jsonb_build_object('billing_hold', false)
+                                       || jsonb_build_object('membership',
+                                          coalesce(tenant_settings.feature_flags->'membership','{}'::jsonb) || $2::jsonb),
+                       updated_at = now()""",
+                    pmeta["tenant_id"],
+                    json.dumps({"paid_key": pmeta.get("membership_key"),
+                                "paid_at": _now.date().isoformat(),
+                                "paid_until": (_now + timedelta(days=365)).date().isoformat(),
+                                "payment_intent": pi.get("id"), "pending_hold": None}))
+            log.info("birthday_billing_paid tenant=%s pi=%s", pmeta["tenant_id"], pi.get("id"))
+            return {"received": True}
+        return {"received": True, "ignored": "pi_no_birthday_meta"}
     if etype != "checkout.session.completed":
         return {"received": True, "ignored": etype}
     sess = event["data"]["object"]

@@ -859,9 +859,11 @@ async def db_token_principal(pool, token: str) -> Optional[dict]:
     token_hash = _hashlib.sha256(token.encode()).hexdigest()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT tenant_id, created_by, scope, student_ids FROM api_tokens "
-            "WHERE token_hash = $1 AND revoked_at IS NULL "
-            "AND (expires_at IS NULL OR expires_at > now())",
+            "SELECT a.tenant_id, a.created_by, a.scope, a.student_ids, "
+            "coalesce((ts.feature_flags->>'billing_hold')::bool, false) AS billing_hold "
+            "FROM api_tokens a LEFT JOIN tenant_settings ts ON ts.tenant_id = a.tenant_id "
+            "WHERE a.token_hash = $1 AND a.revoked_at IS NULL "
+            "AND (a.expires_at IS NULL OR a.expires_at > now())",
             token_hash,
         )
     if not row:
@@ -872,6 +874,7 @@ async def db_token_principal(pool, token: str) -> Optional[dict]:
         "role": "tenant_owner" if row["scope"] == "parent_portal" else "tenant_admin",
         "scope": row["scope"],
         "student_ids": [str(x) for x in (row["student_ids"] or [])],
+        "billing_hold": bool(row["billing_hold"]),
     }
     _DB_TOKEN_CACHE[token] = (now + _DB_TOKEN_TTL, principal)
     return dict(principal)
