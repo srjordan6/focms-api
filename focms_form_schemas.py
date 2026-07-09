@@ -4217,6 +4217,7 @@ class AffiliationItem(BaseModel):
     id: Optional[str] = None
     skills_gained: List[str] = []
     show_on_showcase: Optional[bool] = None
+    program_code: Optional[str] = None  # v0.12.98: catalog link (details->>'program_code')
     affiliation_type: str
     organization_name: str
     organization_url: Optional[str] = None
@@ -4246,6 +4247,7 @@ async def get_student_affiliations(request: Request, student_id: str):
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT a.id, a.affiliation_type::text AS affiliation_type, a.organization_name, "
+            "a.details->>'program_code' AS program_code, "
             "a.organization_url, a.organization_city, a.organization_state, a.role, "
             "a.role_start_date, a.role_end_date, a.weekly_hours, a.total_hours, "
             "a.coach_name, a.coach_email, a.coach_role, a.notes, a.public_description, "
@@ -4305,13 +4307,16 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "organization_state=$7, role=$8, role_start_date=$9::date, "
                         "role_end_date=$10::date, weekly_hours=$11, total_hours=$12, "
                         "coach_name=$13, coach_email=$14, coach_role=$15, notes=$16, "
-                        "public_description=$17, updated_at=now(), updated_by=$18::uuid "
+                        "public_description=$17, "
+                        "details = CASE WHEN $19::text IS NULL THEN details "
+                        "ELSE details || jsonb_build_object('program_code', $19::text) END, "
+                        "updated_at=now(), updated_by=$18::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, atype, name, it.organization_url,
                         it.organization_city, it.organization_state, it.role,
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
-                        it.notes, it.public_description, user_id)
+                        it.notes, it.public_description, user_id, it.program_code)
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "affiliations", it.id, it.skills_gained, it.show_on_showcase)
@@ -4322,15 +4327,18 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "organization_name, organization_url, organization_city, organization_state, "
                         "role, role_start_date, role_end_date, weekly_hours, total_hours, "
                         "coach_name, coach_email, coach_role, notes, public_description, "
-                        "visibility, source_system, created_by, updated_by) "
+                        "details, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3::affiliation_type_enum,$4,$5,$6,$7,$8,"
-                        "$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,'private','parent_portal',"
+                        "$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,"
+                        "CASE WHEN $19::text IS NULL THEN '{}'::jsonb "
+                        "ELSE jsonb_build_object('program_code', $19::text) END,"
+                        "'private','parent_portal',"
                         "$18::uuid,$18::uuid) RETURNING id",
                         tenant_id, student_id, atype, name, it.organization_url,
                         it.organization_city, it.organization_state, it.role,
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
-                        it.notes, it.public_description, user_id)
+                        it.notes, it.public_description, user_id, it.program_code)
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "affiliations", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
