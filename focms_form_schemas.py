@@ -4554,6 +4554,7 @@ class EcSessionItem(BaseModel):
     instrument: Optional[str] = None      # v0.12.99: music_performance detail
     music_played: Optional[str] = None    # v0.12.99: piece(s) performed
     composer: Optional[str] = None        # v0.12.99: composer(s)
+    milestone_kind: Optional[str] = None  # v0.12.100: rank | merit_badge | award | training
 
 
 class EcSessionsRequest(BaseModel):
@@ -4570,7 +4571,7 @@ async def get_ec_sessions(request: Request, student_id: str):
             "SELECT e.id::text AS id, e.event_type::text AS event_type, e.title, e.event_date, "
             "e.duration_minutes, e.location_name AS location, e.affiliation_id::text AS related_affiliation_id, "
             "e.details->>'instrument' AS instrument, e.details->>'music_played' AS music_played, "
-            "e.details->>'composer' AS composer, "
+            "e.details->>'composer' AS composer, e.details->>'milestone_kind' AS milestone_kind, "
             "e.notes, e.source_system, (e.visibility='public') AS show_on_showcase, "
             "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
             " FROM student_skills ss WHERE ss.source_activity = 'events:'||e.id::text "
@@ -4619,13 +4620,14 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "event_date=NULLIF($5,'')::date, duration_minutes=$6, location_name=$7, "
                         "affiliation_id=NULLIF($8,'')::uuid, notes=$9, "
                         "details = details || jsonb_strip_nulls(jsonb_build_object("
-                        "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text)), "
+                        "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
+                        "'milestone_kind', $14::text)), "
                         "updated_at=now(), updated_by=$10::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
-                        it.instrument, it.music_played, it.composer)
+                        it.instrument, it.music_played, it.composer, it.milestone_kind)
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "events", it.id, it.skills_gained, it.show_on_showcase)
@@ -4638,12 +4640,13 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,NULLIF($5,'')::date,$6,$7,"
                         "NULLIF($8,'')::uuid,$9,"
                         "jsonb_strip_nulls(jsonb_build_object("
-                        "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text)),"
+                        "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
+                        "'milestone_kind', $14::text)),"
                         "'private','parent_portal',$10::uuid,$10::uuid) RETURNING id",
                         tenant_id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
-                        it.instrument, it.music_played, it.composer)
+                        it.instrument, it.music_played, it.composer, it.milestone_kind)
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
