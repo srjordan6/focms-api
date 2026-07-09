@@ -343,6 +343,20 @@ def _looks_edu(email: str) -> bool:
     return bool(EDU_DOMAIN_RE.search("." + domain))
 
 
+def _membership_key_for_grade(grade: str) -> str:
+    """v0.12.101: grade-band membership pricing. Prices live in pricing_tiers."""
+    g = (grade or "").strip().lower()
+    if g in ("pre-k", "prek", "k", "kindergarten", "1", "2", "3", "4", "5"):
+        return "membership_k5"
+    if g in ("6", "7", "8"):
+        return "membership_6_8"
+    if g in ("9", "10", "11"):
+        return "membership_9_11"
+    if g == "12":
+        return "membership_12"
+    return "membership_alumni"
+
+
 async def _verify_turnstile(token, request: Request) -> None:
     """v0.11.17: enforce Turnstile when TURNSTILE_SECRET is configured."""
     secret = os.environ.get("TURNSTILE_SECRET")
@@ -486,7 +500,12 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             })
         requested = (body.storage_plan_key or "").strip().lower()
         one_time = requested == "free"
+        mem_key = _membership_key_for_grade(body.student_grade)
         async with pool.acquire() as conn:
+            mem = await conn.fetchrow(
+                "SELECT plan_key, display_name, price_usd_cents FROM pricing_tiers "
+                "WHERE plan_key = $1 AND active", mem_key)
+            mem_cents = int(mem["price_usd_cents"]) if mem else 0
             if one_time:
                 tier = await conn.fetchrow(
                     "SELECT 'free'::text AS plan_key, stripe_price_id FROM pricing_tiers "
@@ -518,18 +537,44 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             pending_id = await conn.fetchval(
                 "INSERT INTO pending_signups (payload, cohort_code) VALUES ($1::jsonb, $2) RETURNING id",
                 json.dumps(_pend), body.code)
-        form = {
-            "mode": "payment" if one_time else "subscription",
-            "line_items[0][price]": tier["stripe_price_id"],
-            "line_items[0][quantity]": "1",
-            **({"customer_creation": "always",
-                "payment_intent_data[setup_future_usage]": "off_session"} if one_time else {}),
-            "success_url": "https://outcomestar.app/signup.html?vpc=complete",
-            "cancel_url": "https://outcomestar.app/signup.html?vpc=cancelled",
-            "customer_email": body.parent_email,
-            "metadata[pending_signup_id]": str(pending_id),
-            "metadata[plan_key]": tier["plan_key"],
-        }
+        # v0.12.101: grade-band membership billing. When membership costs money the
+        # session is a yearly subscription with the membership as an inline
+        # price_data line item; a paid storage plan rides as a second line item.
+        # When membership is free (Pre-K to grade 5) behavior is unchanged:
+        # $1 one-time consent (free storage) or the storage subscription alone.
+        if mem_cents > 0:
+            form = {
+                "mode": "subscription",
+                "line_items[0][price_data][currency]": "usd",
+                "line_items[0][price_data][unit_amount]": str(mem_cents),
+                "line_items[0][price_data][recurring][interval]": "year",
+                "line_items[0][price_data][product_data][name]":
+                    f"outcomestar {mem['display_name']}",
+                "line_items[0][quantity]": "1",
+                "success_url": "https://outcomestar.app/signup.html?vpc=complete",
+                "cancel_url": "https://outcomestar.app/signup.html?vpc=cancelled",
+                "customer_email": body.parent_email,
+                "metadata[pending_signup_id]": str(pending_id),
+                "metadata[plan_key]": tier["plan_key"],
+                "metadata[membership_key]": mem_key,
+            }
+            if not one_time:
+                form["line_items[1][price]"] = tier["stripe_price_id"]
+                form["line_items[1][quantity]"] = "1"
+        else:
+            form = {
+                "mode": "payment" if one_time else "subscription",
+                "line_items[0][price]": tier["stripe_price_id"],
+                "line_items[0][quantity]": "1",
+                **({"customer_creation": "always",
+                    "payment_intent_data[setup_future_usage]": "off_session"} if one_time else {}),
+                "success_url": "https://outcomestar.app/signup.html?vpc=complete",
+                "cancel_url": "https://outcomestar.app/signup.html?vpc=cancelled",
+                "customer_email": body.parent_email,
+                "metadata[pending_signup_id]": str(pending_id),
+                "metadata[plan_key]": tier["plan_key"],
+                "metadata[membership_key]": mem_key,
+            }
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post("https://api.stripe.com/v1/checkout/sessions",
                                   headers={"Authorization": f"Bearer {api_key}"}, data=form)
@@ -1358,6 +1403,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
         return {"received": True, "ignored": "pending_missing"}
     p = json.loads(pend["payload"])
     plan_key = meta.get("plan_key", "keepsake")
+    membership_key = meta.get("membership_key") or _membership_key_for_grade(p.get("student_grade", ""))
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -1384,7 +1430,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                        VALUES ($1,$2,$3,$4,'US','en-US','America/Chicago',$5,'active',0,$6,$7,$8,now())
                        RETURNING id""",
                     slug, generate_short_id(), f"{p['parent_last_name']} Family",
-                    p["parent_email"], cohort["tier"], plan_key, quota, sess.get("customer"))
+                    p["parent_email"], membership_key or cohort["tier"], plan_key, quota, sess.get("customer"))
             except asyncpg.UniqueViolationError:
                 slug = generate_family_slug(p["student_first_name"], p["student_last_name"])
                 family_tenant_id = await conn.fetchval(
@@ -1394,7 +1440,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                        VALUES ($1,$2,$3,$4,'US','en-US','America/Chicago',$5,'active',0,$6,$7,$8,now())
                        RETURNING id""",
                     slug, generate_short_id(), f"{p['parent_last_name']} Family",
-                    p["parent_email"], cohort["tier"], plan_key, quota, sess.get("customer"))
+                    p["parent_email"], membership_key or cohort["tier"], plan_key, quota, sess.get("customer"))
 
             parent_user_id = await conn.fetchval(
                 """INSERT INTO users (email, display_name, first_name, last_name, mfa_enabled,
