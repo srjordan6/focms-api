@@ -4304,8 +4304,8 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                     r = await conn.execute(
                         "UPDATE affiliations SET affiliation_type=$3::affiliation_type_enum, "
                         "organization_name=$4, organization_url=$5, organization_city=$6, "
-                        "organization_state=$7, role=$8, role_start_date=$9::date, "
-                        "role_end_date=$10::date, weekly_hours=$11, total_hours=$12, "
+                        "organization_state=$7, role=$8, role_start_date=NULLIF($9,'')::date, "
+                        "role_end_date=NULLIF($10,'')::date, weekly_hours=$11, total_hours=$12, "
                         "coach_name=$13, coach_email=$14, coach_role=$15, notes=$16, "
                         "public_description=$17, "
                         "details = CASE WHEN $19::text IS NULL THEN details "
@@ -4329,7 +4329,7 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "coach_name, coach_email, coach_role, notes, public_description, "
                         "details, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3::affiliation_type_enum,$4,$5,$6,$7,$8,"
-                        "$9::date,$10::date,$11,$12,$13,$14,$15,$16,$17,"
+                        "NULLIF($9,'')::date,NULLIF($10,'')::date,$11,$12,$13,$14,$15,$16,$17,"
                         "CASE WHEN $19::text IS NULL THEN '{}'::jsonb "
                         "ELSE jsonb_build_object('program_code', $19::text) END,"
                         "'private','parent_portal',"
@@ -4616,7 +4616,7 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                     except Exception: continue
                     r = await conn.execute(
                         "UPDATE events SET event_type=$3::event_type_enum, title=$4, "
-                        "event_date=$5::date, duration_minutes=$6, location_name=$7, "
+                        "event_date=NULLIF($5,'')::date, duration_minutes=$6, location_name=$7, "
                         "affiliation_id=NULLIF($8,'')::uuid, notes=$9, "
                         "details = details || jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text)), "
@@ -4635,7 +4635,7 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "INSERT INTO events (tenant_id, student_id, event_type, title, "
                         "event_date, duration_minutes, location_name, affiliation_id, notes, "
                         "details, visibility, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,$5::date,$6,$7,"
+                        "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,NULLIF($5,'')::date,$6,$7,"
                         "NULLIF($8,'')::uuid,$9,"
                         "jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text)),"
