@@ -163,7 +163,7 @@ import re
 import secrets
 import time
 from collections import defaultdict, deque
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
@@ -253,6 +253,9 @@ class CohortSignupRequest(BaseModel):
     student_birth_date: Optional[date] = None  # v0.12.104: exact DOB preferred
     student_email: Optional[EmailStr] = None
     storage_plan_key: Optional[str] = None   # required when student is under 13
+    birth_certificate_b64: Optional[str] = Field(None, max_length=11_500_000)  # v0.12.105: required age 0-10 (~8MB file)
+    birth_certificate_mime: Optional[str] = Field(None, max_length=100)
+    birth_certificate_filename: Optional[str] = Field(None, max_length=300)
     password: Optional[str] = Field(None, min_length=12, max_length=200)
     turnstile_token: Optional[str] = None
     accept_user_agreement: bool
@@ -519,6 +522,33 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                        "Check the grade and birth date and try again.",
         })
 
+    # v0.12.105: ages 0-10 require a birth certificate upload for age validation.
+    _ALLOWED_DOC_MIMES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
+    doc_bytes = None
+    if age <= 10:
+        if not body.birth_certificate_b64:
+            raise HTTPException(400, {
+                "error": "birth_certificate_required",
+                "message": "For students aged 0-10, upload the student's birth certificate "
+                           "(JPG, PNG, or PDF) so we can validate the birth date for free access.",
+            })
+        if (body.birth_certificate_mime or "").lower() not in _ALLOWED_DOC_MIMES:
+            raise HTTPException(400, {
+                "error": "birth_certificate_invalid",
+                "message": "Birth certificate must be a JPG, PNG, WEBP, or PDF file.",
+            })
+        import base64 as _b64
+        try:
+            doc_bytes = _b64.b64decode(body.birth_certificate_b64, validate=True)
+        except Exception:
+            raise HTTPException(400, {"error": "birth_certificate_invalid",
+                                      "message": "Birth certificate upload could not be read - try again."})
+        if len(doc_bytes) < 10_000 or len(doc_bytes) > 8_000_000:
+            raise HTTPException(400, {
+                "error": "birth_certificate_invalid",
+                "message": "Birth certificate file must be between 10 KB and 8 MB.",
+            })
+
     pool: asyncpg.Pool = request.app.state.pool
 
     # v0.11.14: payment-first for ALL ages. The card payment verifies the
@@ -536,15 +566,19 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
         requested = (body.storage_plan_key or "").strip().lower()
         one_time = requested == "free"
         mem_key = _membership_key_for_age(age)
+        needs_idv = age <= 10  # v0.12.106: commercial IDV for the free age band
         async with pool.acquire() as conn:
             mem = await conn.fetchrow(
                 "SELECT plan_key, display_name, price_usd_cents FROM pricing_tiers "
                 "WHERE plan_key = $1 AND active", mem_key)
             mem_cents = int(mem["price_usd_cents"]) if mem else 0
+            idv = await conn.fetchrow(
+                "SELECT display_name, price_usd_cents FROM pricing_tiers "
+                "WHERE plan_key = 'idv_verification' AND active") if needs_idv else None
             if one_time:
-                tier = await conn.fetchrow(
+                tier = ({"plan_key": "free", "stripe_price_id": None} if idv else await conn.fetchrow(
                     "SELECT 'free'::text AS plan_key, stripe_price_id FROM pricing_tiers "
-                    "WHERE plan_key = 'vpc_consent' AND stripe_price_id IS NOT NULL")
+                    "WHERE plan_key = 'vpc_consent' AND stripe_price_id IS NOT NULL"))
             else:
                 tier = await conn.fetchrow(
                     "SELECT plan_key, stripe_price_id FROM pricing_tiers "
@@ -565,18 +599,31 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                                           "message": "An account with this email already exists."})
             # v0.11.13: never park a plaintext password - hash before storing
             _pend = json.loads(body.model_dump_json())
+            _pend.pop("birth_certificate_b64", None)  # v0.12.105: bytes go to columns, not payload
             if _pend.get("password"):
-                _pend["password_hash"] = _hash_password(_pend.pop("password"))
+                _pend["password_hash"] = _pend.pop("password")
+                _pend["password_hash"] = _hash_password(_pend["password_hash"])
             else:
                 _pend.pop("password", None)
             pending_id = await conn.fetchval(
-                "INSERT INTO pending_signups (payload, cohort_code) VALUES ($1::jsonb, $2) RETURNING id",
-                json.dumps(_pend), body.code)
+                "INSERT INTO pending_signups (payload, cohort_code, doc_bytes, doc_mime, doc_filename) "
+                "VALUES ($1::jsonb, $2, $3, $4, $5) RETURNING id",
+                json.dumps(_pend), body.code, doc_bytes,
+                body.birth_certificate_mime if doc_bytes else None,
+                (body.birth_certificate_filename or "birth_certificate") if doc_bytes else None)
         # v0.12.101: grade-band membership billing. When membership costs money the
         # session is a yearly subscription with the membership as an inline
         # price_data line item; a paid storage plan rides as a second line item.
-        # When membership is free (Pre-K to grade 5) behavior is unchanged:
-        # $1 one-time consent (free storage) or the storage subscription alone.
+        # v0.12.106: ages 0-10 add a one-time Identity & Age Verification item
+        # (Stripe Identity cost + margin, valid 10 years) - it replaces the old $1.
+        def _idv_item(idx: int) -> dict:
+            return {
+                f"line_items[{idx}][price_data][currency]": "usd",
+                f"line_items[{idx}][price_data][unit_amount]": str(int(idv["price_usd_cents"])),
+                f"line_items[{idx}][price_data][product_data][name]":
+                    f"outcomestar {idv['display_name']}",
+                f"line_items[{idx}][quantity]": "1",
+            }
         if mem_cents > 0:
             form = {
                 "mode": "subscription",
@@ -596,6 +643,25 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             if not one_time:
                 form["line_items[1][price]"] = tier["stripe_price_id"]
                 form["line_items[1][quantity]"] = "1"
+        elif needs_idv and idv:
+            form = {
+                "mode": "payment" if one_time else "subscription",
+                "success_url": "https://outcomestar.app/signup?vpc=complete",
+                "cancel_url": "https://outcomestar.app/signup?vpc=cancelled",
+                "customer_email": body.parent_email,
+                "metadata[pending_signup_id]": str(pending_id),
+                "metadata[plan_key]": tier["plan_key"],
+                "metadata[membership_key]": mem_key,
+                "metadata[idv]": "1",
+            }
+            if one_time:
+                form.update(_idv_item(0))
+                form.update({"customer_creation": "always",
+                             "payment_intent_data[setup_future_usage]": "off_session"})
+            else:
+                form["line_items[0][price]"] = tier["stripe_price_id"]
+                form["line_items[0][quantity]"] = "1"
+                form.update(_idv_item(1))
         else:
             form = {
                 "mode": "payment" if one_time else "subscription",
@@ -1074,8 +1140,39 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         raise HTTPException(400, {"error": "bad_signature"})
     event = json.loads(payload)
     log.info("stripe_webhook event=%s type=%s", event.get("id"), event.get("type"))
-    if event.get("type") != "checkout.session.completed":
-        return {"received": True, "ignored": event.get("type")}
+    etype = event.get("type") or ""
+    # v0.12.106: Stripe Identity results - stamp the tenant with a 10-year validity.
+    if etype.startswith("identity.verification_session."):
+        iv = event["data"]["object"]
+        t_id = (iv.get("metadata") or {}).get("tenant_id")
+        if not t_id:
+            return {"received": True, "ignored": "idv_no_tenant"}
+        verified = etype.endswith(".verified")
+        idv_state = {"session_id": iv.get("id"), "status": iv.get("status"),
+                     "updated_at": datetime.now(timezone.utc).isoformat()}
+        if verified:
+            _now = datetime.now(timezone.utc)
+            idv_state["verified_at"] = _now.isoformat()
+            idv_state["valid_until"] = (_now + timedelta(days=3653)).isoformat()  # 10 years
+        pool: asyncpg.Pool = request.app.state.pool
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                   VALUES ($1::uuid, jsonb_build_object('idv', $2::jsonb))
+                   ON CONFLICT (tenant_id) DO UPDATE SET
+                   feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                   || jsonb_build_object('idv',
+                                      coalesce(tenant_settings.feature_flags->'idv','{}'::jsonb) || $2::jsonb),
+                   updated_at = now()""",
+                t_id, json.dumps(idv_state))
+            if verified:
+                await conn.execute(
+                    "UPDATE tenants SET billing_verified_at = COALESCE(billing_verified_at, now()) "
+                    "WHERE id = $1::uuid", t_id)
+        log.info("idv_%s tenant=%s session=%s", "verified" if verified else "update", t_id, iv.get("id"))
+        return {"received": True}
+    if etype != "checkout.session.completed":
+        return {"received": True, "ignored": etype}
     sess = event["data"]["object"]
     meta = sess.get("metadata") or {}
     pending_id = meta.get("pending_signup_id")
@@ -1431,7 +1528,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         pend = await conn.fetchrow(
-            "SELECT id, payload, cohort_code FROM pending_signups "
+            "SELECT id, payload, cohort_code, doc_bytes, doc_mime, doc_filename FROM pending_signups "
             "WHERE id = $1::uuid AND consumed_at IS NULL AND expires_at > now()", pending_id)
     if not pend:
         log.warning("pending signup %s missing/expired/consumed", pending_id)
@@ -1504,6 +1601,25 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 f"{p['student_first_name']} {p['student_last_name']}",
                 approx_birth_date, p["student_grade"], hs_grad, parent_user_id)
 
+            # v0.12.105: attach the signup-staged birth certificate for age validation.
+            if pend["doc_bytes"]:
+                _doc_kind = "document" if (pend["doc_mime"] or "").endswith("pdf") else "image"
+                _art_id = await conn.fetchval(
+                    """INSERT INTO media_files (tenant_id, student_id, kind, mime_type, original_filename,
+                       byte_size, content, visibility, sha256_hex, created_by, storage_kind, bucket)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,'private',$8,$9,'inline_bytea','private') RETURNING id""",
+                    family_tenant_id, student_id, _doc_kind, pend["doc_mime"],
+                    pend["doc_filename"] or "birth_certificate", len(pend["doc_bytes"]),
+                    pend["doc_bytes"], hashlib.sha256(pend["doc_bytes"]).hexdigest(), parent_user_id)
+                await conn.execute(
+                    """INSERT INTO student_identity_documents (tenant_id, student_id, doc_type, artifact_id,
+                       status, notes, source_system, created_by, updated_by)
+                       VALUES ($1,$2,'birth_certificate',$3,'pending',
+                               'Uploaded at signup for age 0-10 free-tier age validation. Verify name, birth date, registrar seal, and filing date against the record before approving.',
+                               'signup',$4,$4)""",
+                    family_tenant_id, student_id, _art_id, parent_user_id)
+                await conn.execute("UPDATE pending_signups SET doc_bytes=NULL WHERE id=$1::uuid", pending_id)
+
             await conn.execute(
                 """INSERT INTO user_tenant_roles (user_id, tenant_id, role, granted_at, granted_by,
                    invitation_email, accepted_at) VALUES ($1,$2,'tenant_owner',now(),$1,$3,now())""",
@@ -1566,6 +1682,49 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
         await _send_welcome_email(p["parent_email"], p["parent_display_name"], raw_token)
     except Exception as exc:
         log.warning("welcome email failed (non-fatal): %r", exc)
+
+    # v0.12.106: for the free age band, open a Stripe Identity verification
+    # session (parent ID document check) and email the link. Result arrives on
+    # the same stripe-webhook (identity.verification_session.verified) and is
+    # good for 10 years.
+    if (meta.get("idv") == "1" or _pending_age() <= 10) and os.environ.get("STRIPE_SECRET_KEY"):
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r = await client.post(
+                    "https://api.stripe.com/v1/identity/verification_sessions",
+                    headers={"Authorization": f"Bearer {os.environ['STRIPE_SECRET_KEY']}"},
+                    data={"type": "document", "metadata[tenant_id]": str(family_tenant_id),
+                          "return_url": "https://outcomestar.app/portal"})
+            if r.status_code < 300:
+                iv = r.json()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                           VALUES ($1::uuid, jsonb_build_object('idv', $2::jsonb))
+                           ON CONFLICT (tenant_id) DO UPDATE SET
+                           feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                           || jsonb_build_object('idv', $2::jsonb),
+                           updated_at = now()""",
+                        family_tenant_id,
+                        json.dumps({"session_id": iv.get("id"), "status": iv.get("status"),
+                                    "url": iv.get("url"), "created_at": datetime.now(timezone.utc).isoformat()}))
+                try:
+                    await _send_email(
+                        p["parent_email"],
+                        "outcomestar - complete your identity verification",
+                        f"<p>Hi {p['parent_display_name']},</p>"
+                        "<p>One last step for free access: verify your identity with a "
+                        "government-issued photo ID. It takes about two minutes, is handled "
+                        "securely by Stripe, and is valid for 10 years.</p>"
+                        f"<p><a href='{iv.get('url')}'>Verify my identity</a></p>"
+                        "<p>Your child's record is fully accessible in the meantime.</p>")
+                except Exception as exc:
+                    log.warning("idv email failed (non-fatal): %r", exc)
+            else:
+                log.warning("identity session create failed %s: %s (enable Stripe Identity in the dashboard)",
+                            r.status_code, r.text[:200])
+        except Exception as exc:
+            log.warning("identity session create errored (non-fatal): %r", exc)
 
     log.info("under13_signup_completed tenant=%s student=%s pending=%s", family_tenant_id, student_id, pending_id)
     return {"received": True, "provisioned": str(family_tenant_id)}
