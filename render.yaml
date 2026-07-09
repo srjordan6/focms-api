@@ -23,6 +23,27 @@ services:
         value: INFO
 
   - type: cron
+    name: birthday-billing
+    runtime: python
+    plan: starter
+    region: ohio
+    schedule: "0 9 * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python focms_birthday_billing.py
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: GMAIL_SMTP_USER
+        sync: false
+      - key: GMAIL_SMTP_PASS
+        sync: false
+      - key: EMAIL_FROM
+        value: outcomestar <support@outcomestar.app>
+
+  - type: cron
     name: nces-scorecard-refresh
     runtime: python
     plan: starter
