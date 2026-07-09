@@ -249,7 +249,8 @@ class CohortSignupRequest(BaseModel):
     student_first_name: str = Field(..., min_length=1, max_length=100)
     student_last_name: str = Field(..., min_length=1, max_length=100)
     student_grade: str = Field(..., min_length=1, max_length=6)
-    student_birth_year: int = Field(..., ge=2000, le=2030)
+    student_birth_year: Optional[int] = Field(None, ge=2000, le=2030)  # legacy; derived from birth_date when absent
+    student_birth_date: Optional[date] = None  # v0.12.104: exact DOB preferred
     student_email: Optional[EmailStr] = None
     storage_plan_key: Optional[str] = None   # required when student is under 13
     password: Optional[str] = Field(None, min_length=12, max_length=200)
@@ -493,21 +494,29 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
 
     # Sanity: computed age plausible for K-12 (4-19)
     await _verify_turnstile(body.turnstile_token, request)
-    age = compute_current_age(body.student_birth_year)
-    if age < 0 or age > 19:
+    # v0.12.104: exact birth date preferred; fall back to July-1 of birth year.
+    if not body.student_birth_date and not body.student_birth_year:
+        raise HTTPException(400, {"error": "invalid_request",
+                                  "message": "student_birth_date is required."})
+    bdate = body.student_birth_date or date(body.student_birth_year, 7, 1)
+    if body.student_birth_year is None:
+        body.student_birth_year = bdate.year
+    today = date.today()
+    age = today.year - bdate.year - ((today.month, today.day) < (bdate.month, bdate.day))
+    if bdate > today or age > 19:
         raise HTTPException(400, {
             "error": "invalid_request",
-            "message": "student_birth_year is not plausible for a Pre-K to grade-12 student.",
+            "message": "student_birth_date is not plausible for a Pre-K to grade-12 student.",
         })
     lo, hi = _grade_age_window(body.student_grade)
     if not (lo <= age <= hi):
-        yr = datetime.now().year
         _glabel = {"NONE": "not yet in school", "PRE-K": "Pre-K", "K": "kindergarten"}.get(
             body.student_grade, f"grade {body.student_grade}")
         raise HTTPException(400, {
             "error": "grade_age_mismatch",
-            "message": f"A student who is {_glabel} is usually {lo}-{hi} years old "
-                       f"(born {yr - hi}-{yr - lo}). Check the grade and birth year and try again.",
+            "message": f"A student who is {_glabel} is usually {lo}-{hi} years old, "
+                       f"but this birth date makes the student {age}. "
+                       "Check the grade and birth date and try again.",
         })
 
     pool: asyncpg.Pool = request.app.state.pool
@@ -733,7 +742,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             # Step 6: create student
             # Birth date approximated as July 1 of birth year (used only if
             # nothing better; the parent can correct it later in the portal).
-            approx_birth_date = date(body.student_birth_year, 7, 1)
+            approx_birth_date = body.student_birth_date or date(body.student_birth_year, 7, 1)
             hs_grad = compute_hs_graduation_year(body.student_birth_year, body.student_grade)
             display_name = f"{body.student_first_name} {body.student_last_name}"
             student_id = await conn.fetchval(
@@ -1429,8 +1438,16 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
         return {"received": True, "ignored": "pending_missing"}
     p = json.loads(pend["payload"])
     plan_key = meta.get("plan_key", "keepsake")
-    membership_key = meta.get("membership_key") or _membership_key_for_age(
-        compute_current_age(int(p.get("student_birth_year") or 0)) if p.get("student_birth_year") else 0)
+    def _pending_age() -> int:
+        try:
+            if p.get("student_birth_date"):
+                b = date.fromisoformat(p["student_birth_date"])
+                t = date.today()
+                return t.year - b.year - ((t.month, t.day) < (b.month, b.day))
+            return compute_current_age(int(p.get("student_birth_year") or 0))
+        except Exception:
+            return 0
+    membership_key = meta.get("membership_key") or _membership_key_for_age(_pending_age())
 
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -1475,8 +1492,10 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                    VALUES ($1,$2,$3,$4,false,'[]'::jsonb,'{}'::jsonb,true,false,0) RETURNING id""",
                 p["parent_email"], p["parent_display_name"], p["parent_first_name"], p["parent_last_name"])
 
-            approx_birth_date = date(int(p["student_birth_year"]), 7, 1)
-            hs_grad = compute_hs_graduation_year(int(p["student_birth_year"]), p["student_grade"])
+            approx_birth_date = (date.fromisoformat(p["student_birth_date"])
+                                 if p.get("student_birth_date") else date(int(p["student_birth_year"]), 7, 1))
+            _byear = int(p.get("student_birth_year") or approx_birth_date.year)
+            hs_grad = compute_hs_graduation_year(_byear, p["student_grade"])
             student_id = await conn.fetchval(
                 """INSERT INTO students (tenant_id, first_name, last_name, display_name, birth_date,
                    current_grade, expected_hs_graduation_year, residence_country, created_by, updated_by)
@@ -1533,7 +1552,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 json.dumps({"method": "payment_transaction", "processor": "stripe",
                             "checkout_session": sess.get("id"), "subscription": sess.get("subscription"),
                             "plan_key": plan_key, "pending_signup_id": pending_id,
-                            "student_age_at_capture": compute_current_age(int(p["student_birth_year"])),
+                            "student_age_at_capture": _pending_age(),
                             "cohort_code": pend["cohort_code"]}))
         except Exception as exc:
             log.warning("vpc audit insert failed (non-fatal): %r", exc)
