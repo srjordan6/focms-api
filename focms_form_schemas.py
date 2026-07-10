@@ -3288,6 +3288,7 @@ async def get_identity_documents(request: Request, student_id: str):
 async def post_identity_documents(request: Request, student_id: str, body: IdentityDocsRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = 0
+    _verify_targets = []  # (row_id, artifact_id) for age-proof docs
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
@@ -3300,13 +3301,109 @@ async def post_identity_documents(request: Request, student_id: str, body: Ident
                 await conn.execute(
                     "DELETE FROM student_identity_documents WHERE tenant_id=$1::uuid "
                     "AND student_id=$2::uuid AND doc_type=$3", tenant_id, student_id, dt)
-                await conn.execute(
+                _row_id = await conn.fetchval(
                     "INSERT INTO student_identity_documents (tenant_id, student_id, doc_type, "
                     "artifact_id, status, notes, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,$4::uuid,'submitted',$5,'parent_portal',$6::uuid,$6::uuid)",
+                    "VALUES ($1::uuid,$2::uuid,$3,$4::uuid,'submitted',$5,'parent_portal',$6::uuid,$6::uuid) "
+                    "RETURNING id",
                     tenant_id, student_id, dt, it.artifact_id.strip(), (it.notes or None), user_id)
                 saved += 1
-    return {"student_id": student_id, "saved": saved}
+                if dt == "birth_certificate":
+                    _verify_targets.append((str(_row_id), it.artifact_id.strip()))
+    # v0.12.111: automated verification on upload - verified or rejected, no queue.
+    result = {"student_id": student_id, "saved": saved}
+    for _row_id, _art_id in _verify_targets:
+        try:
+            outcome = await _auto_verify_birth_certificate(pool, tenant_id, student_id, _row_id, _art_id)
+            if outcome:
+                result["verification"] = outcome
+        except Exception as exc:
+            log.warning("identity-doc auto-verify errored (non-fatal): %r", exc)
+    return result
+
+
+async def _auto_verify_birth_certificate(pool, tenant_id: str, student_id: str,
+                                         row_id: str, artifact_id: str):
+    """v0.12.111: fetch the uploaded artifact bytes (bytea or R2), run the same
+    automated check as signup, and set verified/rejected. Returns a dict for
+    the portal to display, or None when the check is unavailable (stays
+    submitted; re-checked on next upload)."""
+    from focms_cohort_signup import _ai_verify_birth_certificate, _bc_rejection_reasons, _send_email
+    import focms_storage as _st
+    async with _tenant_conn(pool, tenant_id) as conn:
+        media = await conn.fetchrow(
+            "SELECT mime_type, content, storage_kind, storage_uri, bucket FROM media_files "
+            "WHERE id=$1::uuid AND tenant_id=$2::uuid AND deleted_at IS NULL",
+            artifact_id, tenant_id)
+        student = await conn.fetchrow(
+            "SELECT first_name, last_name, birth_date FROM students WHERE id=$1::uuid", student_id)
+        parent_email = await conn.fetchval(
+            "SELECT primary_email FROM tenants WHERE id=$1::uuid", tenant_id)
+    if not media or not student:
+        return None
+    doc_bytes = None
+    if media["content"]:
+        doc_bytes = bytes(media["content"])
+    elif media["storage_kind"] == "r2" and media["storage_uri"]:
+        try:
+            import asyncio as _aio
+            def _fetch():
+                client = _st.get_r2_client()
+                bucket = _st._resolve_bucket_name(media["bucket"] or "private")
+                return client.get_object(Bucket=bucket, Key=media["storage_uri"])["Body"].read()
+            doc_bytes = await _aio.to_thread(_fetch)
+        except Exception as exc:
+            log.warning("bc auto-verify: R2 fetch failed: %r", exc)
+            return None
+    if not doc_bytes:
+        return None
+    verdict = await _ai_verify_birth_certificate(
+        doc_bytes, media["mime_type"] or "image/jpeg",
+        student["first_name"], student["last_name"],
+        student["birth_date"].isoformat() if student["birth_date"] else None)
+    if not verdict:
+        return None
+    ok = bool(verdict.get("is_birth_certificate")) and bool(verdict.get("name_matches")) \
+         and bool(verdict.get("birth_date_matches")) and bool(verdict.get("registrar_seal_visible")) \
+         and not bool(verdict.get("tamper_signs")) \
+         and (verdict.get("confidence") or "").lower() == "high"
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    _now = _dt.now(_tz.utc)
+    async with _tenant_conn(pool, tenant_id) as conn:
+        if ok:
+            await conn.execute(
+                "UPDATE student_identity_documents SET status='verified', verified_at=now(), "
+                "notes=$2, updated_at=now() WHERE id=$1::uuid",
+                row_id, "Automated document check passed: " + json.dumps(verdict)[:1500])
+            await conn.execute(
+                """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                   VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
+                   ON CONFLICT (tenant_id) DO UPDATE SET
+                   feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                   || jsonb_build_object('age_verification', $2::jsonb),
+                   updated_at = now()""",
+                tenant_id,
+                json.dumps({"status": "verified", "method": "ai_birth_certificate",
+                            "verified_at": _now.isoformat(),
+                            "valid_until": (_now + _td(days=3653)).isoformat()}))
+            return {"status": "verified"}
+        reasons = _bc_rejection_reasons(verdict)
+        await conn.execute(
+            "UPDATE student_identity_documents SET status='rejected', "
+            "notes=$2, updated_at=now() WHERE id=$1::uuid",
+            row_id, "Automated document check failed: " + json.dumps(verdict)[:1500])
+    if parent_email:
+        try:
+            await _send_email(
+                parent_email, "outcomestar - birth certificate could not be verified",
+                "<p>The automated review could not verify the birth certificate you uploaded:</p><ul>"
+                + "".join(f"<li>{x}</li>" for x in reasons)
+                + "</ul><p>Upload a clear, complete photo or scan of the official certified "
+                  "birth certificate in Personal &rarr; Identity Documents - it is re-checked "
+                  "automatically the moment you upload.</p>")
+        except Exception as exc:
+            log.warning("bc rejection email failed (non-fatal): %r", exc)
+    return {"status": "rejected", "reasons": reasons}
 
 
 # ======================================================================

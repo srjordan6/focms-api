@@ -575,21 +575,24 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             idv = await conn.fetchrow(
                 "SELECT display_name, price_usd_cents FROM pricing_tiers "
                 "WHERE plan_key = 'idv_verification' AND active") if needs_idv else None
+            if needs_idv and not idv:
+                raise HTTPException(503, {
+                    "error": "billing_misconfigured",
+                    "message": "Age verification pricing is unavailable - try again shortly.",
+                })
             if one_time:
-                tier = ({"plan_key": "free", "stripe_price_id": None} if idv else await conn.fetchrow(
-                    "SELECT 'free'::text AS plan_key, stripe_price_id FROM pricing_tiers "
-                    "WHERE plan_key = 'vpc_consent' AND stripe_price_id IS NOT NULL"))
+                tier = {"plan_key": "free", "display_name": None, "price_usd_cents": 0}
             else:
                 tier = await conn.fetchrow(
-                    "SELECT plan_key, stripe_price_id FROM pricing_tiers "
-                    "WHERE plan_key = $1 AND active AND stripe_price_id IS NOT NULL AND NOT stackable",
+                    "SELECT plan_key, display_name, price_usd_cents FROM pricing_tiers "
+                    "WHERE plan_key = $1 AND active AND price_usd_cents > 0 AND NOT stackable",
                     requested)
             if not tier:
                 raise HTTPException(400, {
                     "error": "vpc_plan_required",
-                    "message": "Choose the $1 one-time parent verification (free plan) "
-                               "or a storage plan - the card payment verifies the parent "
-                               "and stays on file for billing.",
+                    "message": "Choose the included storage (with the one-time age "
+                               "verification for ages 0-10) or a storage plan - the card "
+                               "payment verifies the parent and stays on file for billing.",
                 })
             existing = await conn.fetchval(
                 "SELECT id FROM users WHERE email = $1 AND deactivated_at IS NULL",
@@ -611,17 +614,24 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 json.dumps(_pend), body.code, doc_bytes,
                 body.birth_certificate_mime if doc_bytes else None,
                 (body.birth_certificate_filename or "birth_certificate") if doc_bytes else None)
-        # v0.12.101: grade-band membership billing. When membership costs money the
-        # session is a yearly subscription with the membership as an inline
-        # price_data line item; a paid storage plan rides as a second line item.
-        # v0.12.106: ages 0-10 add a one-time Identity & Age Verification item
-        # (Stripe Identity cost + margin, valid 10 years) - it replaces the old $1.
+        # v0.12.109: ALL prices are inline price_data read from pricing_tiers -
+        # Stripe's product catalog is no longer referenced anywhere. Changing any
+        # price is a single UPDATE on pricing_tiers.
         def _idv_item(idx: int) -> dict:
             return {
                 f"line_items[{idx}][price_data][currency]": "usd",
                 f"line_items[{idx}][price_data][unit_amount]": str(int(idv["price_usd_cents"])),
                 f"line_items[{idx}][price_data][product_data][name]":
                     f"outcomestar {idv['display_name']}",
+                f"line_items[{idx}][quantity]": "1",
+            }
+        def _storage_item(idx: int) -> dict:
+            return {
+                f"line_items[{idx}][price_data][currency]": "usd",
+                f"line_items[{idx}][price_data][unit_amount]": str(int(tier["price_usd_cents"])),
+                f"line_items[{idx}][price_data][recurring][interval]": "year",
+                f"line_items[{idx}][price_data][product_data][name]":
+                    f"outcomestar {tier['display_name']}",
                 f"line_items[{idx}][quantity]": "1",
             }
         if mem_cents > 0:
@@ -641,8 +651,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "metadata[membership_key]": mem_key,
             }
             if not one_time:
-                form["line_items[1][price]"] = tier["stripe_price_id"]
-                form["line_items[1][quantity]"] = "1"
+                form.update(_storage_item(1))
         elif needs_idv and idv:
             form = {
                 "mode": "payment" if one_time else "subscription",
@@ -659,14 +668,11 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 form.update({"customer_creation": "always",
                              "payment_intent_data[setup_future_usage]": "off_session"})
             else:
-                form["line_items[0][price]"] = tier["stripe_price_id"]
-                form["line_items[0][quantity]"] = "1"
+                form.update(_storage_item(0))
                 form.update(_idv_item(1))
         else:
             form = {
                 "mode": "payment" if one_time else "subscription",
-                "line_items[0][price]": tier["stripe_price_id"],
-                "line_items[0][quantity]": "1",
                 **({"customer_creation": "always",
                     "payment_intent_data[setup_future_usage]": "off_session"} if one_time else {}),
                 "success_url": "https://outcomestar.app/signup?vpc=complete",
@@ -676,6 +682,8 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "metadata[plan_key]": tier["plan_key"],
                 "metadata[membership_key]": mem_key,
             }
+            if not one_time:
+                form.update(_storage_item(0))
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post("https://api.stripe.com/v1/checkout/sessions",
                                   headers={"Authorization": f"Bearer {api_key}"}, data=form)
@@ -1090,8 +1098,8 @@ async def billing_session(body: BillingSessionRequest, request: Request) -> dict
     async with pool.acquire() as conn:
         principal = await _tenant_from_bearer(request, conn)
         tier = await conn.fetchrow(
-            "SELECT plan_key, display_name, stripe_price_id, stackable FROM pricing_tiers "
-            "WHERE plan_key = $1 AND active AND stripe_price_id IS NOT NULL",
+            "SELECT plan_key, display_name, price_usd_cents, stackable FROM pricing_tiers "
+            "WHERE plan_key = $1 AND active AND price_usd_cents > 0",
             body.plan_key,
         )
     if not tier:
@@ -1099,7 +1107,10 @@ async def billing_session(body: BillingSessionRequest, request: Request) -> dict
     qty = body.quantity if tier["stackable"] else 1
     form = {
         "mode": "subscription",
-        "line_items[0][price]": tier["stripe_price_id"],
+        "line_items[0][price_data][currency]": "usd",
+        "line_items[0][price_data][unit_amount]": str(int(tier["price_usd_cents"])),
+        "line_items[0][price_data][recurring][interval]": "year",
+        "line_items[0][price_data][product_data][name]": f"outcomestar {tier['display_name']}",
         "line_items[0][quantity]": str(qty),
         "success_url": body.success_url,
         "cancel_url": body.cancel_url,
@@ -1695,6 +1706,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 ok = bool(verdict.get("is_birth_certificate")) \
                      and bool(verdict.get("name_matches")) \
                      and bool(verdict.get("birth_date_matches")) \
+                     and bool(verdict.get("registrar_seal_visible")) \
                      and not bool(verdict.get("tamper_signs")) \
                      and (verdict.get("confidence") or "").lower() == "high"
                 async with pool.acquire() as conn:
@@ -1702,7 +1714,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                         await conn.execute(
                             "UPDATE student_identity_documents SET status='verified', verified_at=now(), "
                             "notes=$2, updated_at=now() WHERE id=$1::uuid",
-                            _bc_doc_id, "AI document check passed: " + json.dumps(verdict)[:1500])
+                            _bc_doc_id, "Automated document check passed: " + json.dumps(verdict)[:1500])
                         await conn.execute(
                             """INSERT INTO tenant_settings (tenant_id, feature_flags)
                                VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
@@ -1716,14 +1728,30 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                                         "valid_until": (_now + timedelta(days=3653)).isoformat()}))
                         log.info("birth_certificate_verified tenant=%s student=%s", family_tenant_id, student_id)
                     else:
+                        _reasons = _bc_rejection_reasons(verdict)
                         await conn.execute(
-                            "UPDATE student_identity_documents SET "
+                            "UPDATE student_identity_documents SET status='rejected', "
                             "notes=$2, updated_at=now() WHERE id=$1::uuid",
-                            _bc_doc_id, "AI document check needs manual review: " + json.dumps(verdict)[:1500])
-                        log.warning("birth_certificate_needs_review tenant=%s verdict=%s",
+                            _bc_doc_id, "Automated document check failed: " + json.dumps(verdict)[:1500])
+                        try:
+                            await _send_email(
+                                p["parent_email"],
+                                "outcomestar - birth certificate could not be verified",
+                                f"<p>Hi {p['parent_display_name']},</p>"
+                                "<p>The automated review could not verify the birth certificate "
+                                f"you uploaded for {p['student_first_name']}:</p><ul>"
+                                + "".join(f"<li>{x}</li>" for x in _reasons) +
+                                "</ul><p>Please upload a clear, complete photo or scan of the "
+                                "official certified birth certificate in your parent portal "
+                                "(Personal &rarr; Identity Documents). It is re-checked "
+                                "automatically the moment you upload. Your account and record "
+                                "are fully usable in the meantime.</p>")
+                        except Exception as exc:
+                            log.warning("bc rejection email failed (non-fatal): %r", exc)
+                        log.warning("birth_certificate_rejected tenant=%s verdict=%s",
                                     family_tenant_id, json.dumps(verdict)[:300])
             else:
-                log.warning("birth certificate AI check unavailable - left pending for manual review")
+                log.warning("birth certificate check unavailable - stays submitted, re-checked on portal re-upload")
         except Exception as exc:
             log.warning("birth certificate AI check errored (non-fatal, stays pending): %r", exc)
 
@@ -1731,22 +1759,45 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
     return {"received": True, "provisioned": str(family_tenant_id)}
 
 
+def _bc_rejection_reasons(verdict: dict) -> list[str]:
+    """v0.12.111: parent-facing reasons from a failed automated check."""
+    r = []
+    if not verdict.get("is_birth_certificate"):
+        r.append("The uploaded file does not appear to be a birth certificate.")
+    if not verdict.get("name_matches"):
+        found = verdict.get("child_name_on_document")
+        r.append(f"The child's name on the document{(' (' + found + ')') if found else ''} "
+                 "does not match the name entered at signup.")
+    if not verdict.get("birth_date_matches"):
+        found = verdict.get("birth_date_on_document")
+        r.append(f"The birth date on the document{(' (' + found + ')') if found else ''} "
+                 "does not match the birth date entered at signup.")
+    if not verdict.get("registrar_seal_visible"):
+        r.append("The official registrar seal is not visible - upload the certified copy, "
+                 "not a hospital keepsake certificate.")
+    if verdict.get("tamper_signs"):
+        r.append("The document shows signs of digital editing.")
+    if (verdict.get("confidence") or "").lower() != "high":
+        r.append("The scan is not clear enough to read reliably - retake it in good light, "
+                 "flat and fully in frame.")
+    return r or ["The document could not be verified."]
+
+
 async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
                                        expected_first: str, expected_last: str,
                                        expected_birth_date: Optional[str]) -> Optional[dict]:
-    """v0.12.108: vision-LLM check of an uploaded birth certificate.
-    Uses the same provider env as the rest of FOCMS (ANTHROPIC_API_KEY /
-    FOCMS_LLM_MODEL). Returns the parsed verdict dict, or None if unavailable."""
+    """v0.12.110: provider-swappable vision check of an uploaded birth
+    certificate. FOCMS_LLM_PROVIDER=anthropic|openai_compatible with
+    FOCMS_LLM_API_KEY / FOCMS_LLM_BASE_URL / FOCMS_LLM_MODEL - identical env
+    contract to the rest of FOCMS, no vendor lock. Returns the parsed verdict
+    dict, or None (-> document stays pending for manual review)."""
+    provider = os.environ.get("FOCMS_LLM_PROVIDER", "anthropic").lower()
     api_key = os.environ.get("FOCMS_LLM_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    model = os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
     if not api_key:
         return None
-    model = os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
     import base64 as _b64
-    block = {
-        "type": "document" if doc_mime == "application/pdf" else "image",
-        "source": {"type": "base64", "media_type": doc_mime,
-                   "data": _b64.b64encode(doc_bytes).decode()},
-    }
+    b64 = _b64.b64encode(doc_bytes).decode()
     system = (
         "You verify scanned US birth certificates for a child-age validation system. "
         "Examine the document and return ONLY a JSON object with these keys: "
@@ -1756,25 +1807,57 @@ async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
         "name_matches (bool - does the child name match the expected name, allowing middle names, "
         "nicknames of the expected first name, and hyphenation differences?), "
         "birth_date_matches (bool - exact match to the expected birth date?), "
-        "registrar_seal_visible (bool), filing_or_registration_date_visible (bool), "
-        "tamper_signs (bool - visible editing, font inconsistencies, misaligned or pasted text), "
+        "registrar_seal_visible (bool - official state/county/city registrar seal, embossed or printed), "
+        "filing_or_registration_date_visible (bool), "
+        "security_features_visible (bool - security paper patterns, intaglio-style borders, watermarks, or microprint), "
+        "tamper_signs (bool - visible editing, font inconsistencies, misaligned or pasted text, "
+        "pixel-density mismatches around data fields), "
         "confidence (high|medium|low - high only when the document is clearly legible and all "
         "determinations are certain), notes (short string). No prose outside the JSON.")
     user_text = (f"Expected child: {expected_first} {expected_last}. "
                  f"Expected birth date: {expected_birth_date or 'unknown'}. "
                  "Return ONLY the JSON object.")
-    async with httpx.AsyncClient(timeout=90) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
-                     "content-type": "application/json"},
-            json={"model": model, "max_tokens": 800, "system": system,
-                  "messages": [{"role": "user",
-                                "content": [block, {"type": "text", "text": user_text}]}]})
-    if r.status_code != 200:
-        log.warning("birth cert LLM error %s: %s", r.status_code, r.text[:200])
-        return None
-    txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+    txt = ""
+    if provider == "openai_compatible":
+        base = os.environ.get("FOCMS_LLM_BASE_URL", "").rstrip("/")
+        if not base:
+            log.warning("birth cert check: FOCMS_LLM_BASE_URL required for openai_compatible")
+            return None
+        if doc_mime == "application/pdf":
+            # OpenAI-format vision takes images only; PDFs go to manual review.
+            log.info("birth cert PDF with openai_compatible provider - manual review")
+            return None
+        payload = {"model": model, "max_tokens": 800,
+                   "messages": [
+                       {"role": "system", "content": system},
+                       {"role": "user", "content": [
+                           {"type": "text", "text": user_text},
+                           {"type": "image_url",
+                            "image_url": {"url": f"data:{doc_mime};base64,{b64}"}}]}]}
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(base + "/chat/completions",
+                headers={"Authorization": "Bearer " + api_key, "content-type": "application/json"},
+                json=payload)
+        if r.status_code != 200:
+            log.warning("birth cert LLM error %s: %s", r.status_code, r.text[:200])
+            return None
+        msg = r.json()["choices"][0]["message"]
+        txt = (msg.get("content") or "") or (msg.get("reasoning") or "")
+    else:  # anthropic-format (default; FOCMS_LLM_BASE_URL overrides the host)
+        base = os.environ.get("FOCMS_LLM_BASE_URL", "https://api.anthropic.com").rstrip("/")
+        block = {"type": "document" if doc_mime == "application/pdf" else "image",
+                 "source": {"type": "base64", "media_type": doc_mime, "data": b64}}
+        async with httpx.AsyncClient(timeout=90) as client:
+            r = await client.post(base + "/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": model, "max_tokens": 800, "system": system,
+                      "messages": [{"role": "user",
+                                    "content": [block, {"type": "text", "text": user_text}]}]})
+        if r.status_code != 200:
+            log.warning("birth cert LLM error %s: %s", r.status_code, r.text[:200])
+            return None
+        txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
     start, end = txt.find("{"), txt.rfind("}")
     if start < 0 or end <= start:
         return None
