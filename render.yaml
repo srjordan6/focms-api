@@ -22,52 +22,6 @@ services:
       - key: FOCMS_WORKER_LOG_LEVEL
         value: INFO
 
-  # One cron for every NorthStar scheduled job. focms_nightly_jobs.py runs each
-  # job in an isolated subprocess: USA Swimming scrape (daily), birthday billing
-  # (daily), NCES/Scorecard refresh (1st of month). Add jobs by appending to
-  # JOBS in focms_nightly_jobs.py.
-  # REMINDER: Cron Jobs require a Manual Build after every code change.
-  - type: cron
-    name: northstar-nightly
-    runtime: python
-    plan: starter
-    region: ohio
-    schedule: "0 9 * * *"
-    buildCommand: pip install -r requirements.txt && playwright install --with-deps chromium
-    startCommand: python focms_nightly_jobs.py
-    autoDeploy: true
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: DATABASE_URL_POOLED
-        sync: false
-      - key: SCORECARD_API_KEY
-        sync: false
-      - key: FOCMS_API_TOKENS_JSON
-        sync: false
-      - key: STRIPE_SECRET_KEY
-        sync: false
-      - key: GMAIL_SMTP_USER
-        sync: false
-      - key: GMAIL_SMTP_PASS
-        sync: false
-      - key: EMAIL_FROM
-        value: outcomestar <support@outcomestar.app>
-      - key: TENANT_ID
-        sync: false
-      - key: STUDENT_ID
-        sync: false
-      - key: CREATED_BY
-        sync: false
-      - key: SWIMMER_FIRST_NAME
-        value: John
-      - key: SWIMMER_LAST_NAME
-        value: Jordan
-      - key: SWIMMER_CLUB
-        value: Iron Horse Aquatics
-      - key: SWIMMER_LSC
-        value: NT
-      - key: FOCMS_API_LOG_LEVEL
-        value: INFO
-      - key: FOCMS_WORKER_LOG_LEVEL
-        value: INFO
+# All cron jobs live in the focms-scraper repo (Render service: NorthStar-Scraper,
+# entry point focms_nightly_jobs.py). nces_scorecard_worker.py remains here only
+# as the historical original; the running copy is in focms-scraper.
