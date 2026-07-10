@@ -1141,36 +1141,6 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
     event = json.loads(payload)
     log.info("stripe_webhook event=%s type=%s", event.get("id"), event.get("type"))
     etype = event.get("type") or ""
-    # v0.12.106: Stripe Identity results - stamp the tenant with a 10-year validity.
-    if etype.startswith("identity.verification_session."):
-        iv = event["data"]["object"]
-        t_id = (iv.get("metadata") or {}).get("tenant_id")
-        if not t_id:
-            return {"received": True, "ignored": "idv_no_tenant"}
-        verified = etype.endswith(".verified")
-        idv_state = {"session_id": iv.get("id"), "status": iv.get("status"),
-                     "updated_at": datetime.now(timezone.utc).isoformat()}
-        if verified:
-            _now = datetime.now(timezone.utc)
-            idv_state["verified_at"] = _now.isoformat()
-            idv_state["valid_until"] = (_now + timedelta(days=3653)).isoformat()  # 10 years
-        pool: asyncpg.Pool = request.app.state.pool
-        async with pool.acquire() as conn:
-            await conn.execute(
-                """INSERT INTO tenant_settings (tenant_id, feature_flags)
-                   VALUES ($1::uuid, jsonb_build_object('idv', $2::jsonb))
-                   ON CONFLICT (tenant_id) DO UPDATE SET
-                   feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
-                                   || jsonb_build_object('idv',
-                                      coalesce(tenant_settings.feature_flags->'idv','{}'::jsonb) || $2::jsonb),
-                   updated_at = now()""",
-                t_id, json.dumps(idv_state))
-            if verified:
-                await conn.execute(
-                    "UPDATE tenants SET billing_verified_at = COALESCE(billing_verified_at, now()) "
-                    "WHERE id = $1::uuid", t_id)
-        log.info("idv_%s tenant=%s session=%s", "verified" if verified else "update", t_id, iv.get("id"))
-        return {"received": True}
     # v0.12.107: birthday-billing retry succeeded - clear the hold instantly.
     if etype == "payment_intent.succeeded":
         pi = event["data"]["object"]
@@ -1627,6 +1597,7 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 approx_birth_date, p["student_grade"], hs_grad, parent_user_id)
 
             # v0.12.105: attach the signup-staged birth certificate for age validation.
+            _bc_doc_id = None
             if pend["doc_bytes"]:
                 _doc_kind = "document" if (pend["doc_mime"] or "").endswith("pdf") else "image"
                 _art_id = await conn.fetchval(
@@ -1636,12 +1607,12 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                     family_tenant_id, student_id, _doc_kind, pend["doc_mime"],
                     pend["doc_filename"] or "birth_certificate", len(pend["doc_bytes"]),
                     pend["doc_bytes"], hashlib.sha256(pend["doc_bytes"]).hexdigest(), parent_user_id)
-                await conn.execute(
+                _bc_doc_id = await conn.fetchval(
                     """INSERT INTO student_identity_documents (tenant_id, student_id, doc_type, artifact_id,
                        status, notes, source_system, created_by, updated_by)
                        VALUES ($1,$2,'birth_certificate',$3,'pending',
-                               'Uploaded at signup for age 0-10 free-tier age validation. Verify name, birth date, registrar seal, and filing date against the record before approving.',
-                               'signup',$4,$4)""",
+                               'Uploaded at signup for age 0-10 free-tier age validation.',
+                               'signup',$4,$4) RETURNING id""",
                     family_tenant_id, student_id, _art_id, parent_user_id)
                 await conn.execute("UPDATE pending_signups SET doc_bytes=NULL WHERE id=$1::uuid", pending_id)
 
@@ -1708,55 +1679,111 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
     except Exception as exc:
         log.warning("welcome email failed (non-fatal): %r", exc)
 
-    # v0.12.106: for the free age band, open a Stripe Identity verification
-    # session (parent ID document check) and email the link. Result arrives on
-    # the same stripe-webhook (identity.verification_session.verified) and is
-    # good for 10 years.
-    if (meta.get("idv") == "1" or _pending_age() <= 10) and os.environ.get("STRIPE_SECRET_KEY"):
+    # v0.12.108: AI birth-certificate verification (replaces Stripe Identity -
+    # the parent is already verified by the card payment; what we verify is the
+    # CHILD's birth certificate). Vision LLM extracts the name/DOB/registrar
+    # features and compares to the signup data. Full match -> verified with a
+    # 10-year validity; anything else stays pending for manual review.
+    if pend["doc_bytes"] and _bc_doc_id:
         try:
-            async with httpx.AsyncClient(timeout=20) as client:
-                r = await client.post(
-                    "https://api.stripe.com/v1/identity/verification_sessions",
-                    headers={"Authorization": f"Bearer {os.environ['STRIPE_SECRET_KEY']}"},
-                    data={"type": "document", "metadata[tenant_id]": str(family_tenant_id),
-                          "return_url": "https://outcomestar.app/portal"})
-            if r.status_code < 300:
-                iv = r.json()
+            verdict = await _ai_verify_birth_certificate(
+                bytes(pend["doc_bytes"]), pend["doc_mime"] or "image/jpeg",
+                p["student_first_name"], p["student_last_name"],
+                p.get("student_birth_date"))
+            _now = datetime.now(timezone.utc)
+            if verdict:
+                ok = bool(verdict.get("is_birth_certificate")) \
+                     and bool(verdict.get("name_matches")) \
+                     and bool(verdict.get("birth_date_matches")) \
+                     and not bool(verdict.get("tamper_signs")) \
+                     and (verdict.get("confidence") or "").lower() == "high"
                 async with pool.acquire() as conn:
-                    await conn.execute(
-                        """INSERT INTO tenant_settings (tenant_id, feature_flags)
-                           VALUES ($1::uuid, jsonb_build_object('idv', $2::jsonb))
-                           ON CONFLICT (tenant_id) DO UPDATE SET
-                           feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
-                                           || jsonb_build_object('idv', $2::jsonb),
-                           updated_at = now()""",
-                        family_tenant_id,
-                        json.dumps({"session_id": iv.get("id"), "status": iv.get("status"),
-                                    "url": iv.get("url"), "created_at": datetime.now(timezone.utc).isoformat()}))
-                try:
-                    await _send_email(
-                        p["parent_email"],
-                        "outcomestar - complete your identity verification",
-                        f"<p>Hi {p['parent_display_name']},</p>"
-                        "<p>One last step for free access: verify your identity with a "
-                        "government-issued photo ID. It takes about two minutes, is handled "
-                        "securely by Stripe, and is valid for 10 years.</p>"
-                        f"<p><a href='{iv.get('url')}'>Verify my identity</a></p>"
-                        "<p>Your child's record is fully accessible in the meantime.</p>")
-                except Exception as exc:
-                    log.warning("idv email failed (non-fatal): %r", exc)
+                    if ok:
+                        await conn.execute(
+                            "UPDATE student_identity_documents SET status='verified', verified_at=now(), "
+                            "notes=$2, updated_at=now() WHERE id=$1::uuid",
+                            _bc_doc_id, "AI document check passed: " + json.dumps(verdict)[:1500])
+                        await conn.execute(
+                            """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                               VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
+                               ON CONFLICT (tenant_id) DO UPDATE SET
+                               feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                               || jsonb_build_object('age_verification', $2::jsonb),
+                               updated_at = now()""",
+                            family_tenant_id,
+                            json.dumps({"status": "verified", "method": "ai_birth_certificate",
+                                        "verified_at": _now.isoformat(),
+                                        "valid_until": (_now + timedelta(days=3653)).isoformat()}))
+                        log.info("birth_certificate_verified tenant=%s student=%s", family_tenant_id, student_id)
+                    else:
+                        await conn.execute(
+                            "UPDATE student_identity_documents SET "
+                            "notes=$2, updated_at=now() WHERE id=$1::uuid",
+                            _bc_doc_id, "AI document check needs manual review: " + json.dumps(verdict)[:1500])
+                        log.warning("birth_certificate_needs_review tenant=%s verdict=%s",
+                                    family_tenant_id, json.dumps(verdict)[:300])
             else:
-                log.warning("identity session create failed %s: %s (enable Stripe Identity in the dashboard)",
-                            r.status_code, r.text[:200])
+                log.warning("birth certificate AI check unavailable - left pending for manual review")
         except Exception as exc:
-            log.warning("identity session create errored (non-fatal): %r", exc)
+            log.warning("birth certificate AI check errored (non-fatal, stays pending): %r", exc)
 
     log.info("under13_signup_completed tenant=%s student=%s pending=%s", family_tenant_id, student_id, pending_id)
     return {"received": True, "provisioned": str(family_tenant_id)}
 
 
-async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
-    await _send_email(to_email, "Welcome to outcomestar - your portal access", html)
+async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
+                                       expected_first: str, expected_last: str,
+                                       expected_birth_date: Optional[str]) -> Optional[dict]:
+    """v0.12.108: vision-LLM check of an uploaded birth certificate.
+    Uses the same provider env as the rest of FOCMS (ANTHROPIC_API_KEY /
+    FOCMS_LLM_MODEL). Returns the parsed verdict dict, or None if unavailable."""
+    api_key = os.environ.get("FOCMS_LLM_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    model = os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
+    import base64 as _b64
+    block = {
+        "type": "document" if doc_mime == "application/pdf" else "image",
+        "source": {"type": "base64", "media_type": doc_mime,
+                   "data": _b64.b64encode(doc_bytes).decode()},
+    }
+    system = (
+        "You verify scanned US birth certificates for a child-age validation system. "
+        "Examine the document and return ONLY a JSON object with these keys: "
+        "is_birth_certificate (bool - is this actually a birth certificate?), "
+        "child_name_on_document (string or null), "
+        "birth_date_on_document (ISO YYYY-MM-DD or null), "
+        "name_matches (bool - does the child name match the expected name, allowing middle names, "
+        "nicknames of the expected first name, and hyphenation differences?), "
+        "birth_date_matches (bool - exact match to the expected birth date?), "
+        "registrar_seal_visible (bool), filing_or_registration_date_visible (bool), "
+        "tamper_signs (bool - visible editing, font inconsistencies, misaligned or pasted text), "
+        "confidence (high|medium|low - high only when the document is clearly legible and all "
+        "determinations are certain), notes (short string). No prose outside the JSON.")
+    user_text = (f"Expected child: {expected_first} {expected_last}. "
+                 f"Expected birth date: {expected_birth_date or 'unknown'}. "
+                 "Return ONLY the JSON object.")
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                     "content-type": "application/json"},
+            json={"model": model, "max_tokens": 800, "system": system,
+                  "messages": [{"role": "user",
+                                "content": [block, {"type": "text", "text": user_text}]}]})
+    if r.status_code != 200:
+        log.warning("birth cert LLM error %s: %s", r.status_code, r.text[:200])
+        return None
+    txt = "".join(b.get("text", "") for b in r.json().get("content", []) if b.get("type") == "text")
+    start, end = txt.find("{"), txt.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(txt[start:end + 1])
+    except Exception:
+        return None
+
+
 async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
     api_key = os.environ.get("RESEND_API_KEY")
     if not api_key:
