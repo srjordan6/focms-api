@@ -1790,12 +1790,49 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
             items.append({"title": r["title"] or "Event",
                           "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
-    elif code in ("fine_arts", "stem_portfolio", "highlight_reel", "academic_capstone"):
-        rows = await tconn.fetch(
+    elif code in ("fine_arts", "highlight_reel"):
+        # Music-performance events + portfolio artifacts (v0.12.115 real-source fix).
+        ev = await tconn.fetch(
+            "SELECT title, event_date, public_description FROM events "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND event_type = 'music_performance' "
+            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in ev:
+            items.append({"title": r["title"] or "Performance",
+                          "date": r["event_date"].isoformat() if r["event_date"] else None,
+                          "body": r["public_description"]})
+        pa = await tconn.fetch(
             "SELECT title, created_at, public_description FROM portfolio_artifacts "
             "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
             "ORDER BY created_at DESC LIMIT 50", student_id)
-        for r in rows:
+        for r in pa:
+            items.append({"title": r["title"] or "Portfolio item",
+                          "date": r["created_at"].date().isoformat() if r["created_at"] else None,
+                          "body": r["public_description"]})
+    elif code in ("stem_portfolio", "academic_capstone"):
+        # STEM/experience/competition events + public courses + portfolio (v0.12.115 real-source fix).
+        ev = await tconn.fetch(
+            "SELECT title, event_date, public_description FROM events "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND event_type IN ('stem_event','competition','summer_experience') "
+            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in ev:
+            items.append({"title": r["title"] or "Experience",
+                          "date": r["event_date"].isoformat() if r["event_date"] else None,
+                          "body": r["public_description"]})
+        crs = await tconn.fetch(
+            "SELECT course_name, term, school_year FROM courses_taken "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 50", student_id)
+        for r in crs:
+            items.append({"title": r["course_name"] or "Course",
+                          "date": None,
+                          "body": r["term"] or r["school_year"]})
+        pa = await tconn.fetch(
+            "SELECT title, created_at, public_description FROM portfolio_artifacts "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 50", student_id)
+        for r in pa:
             items.append({"title": r["title"] or "Portfolio item",
                           "date": r["created_at"].date().isoformat() if r["created_at"] else None,
                           "body": r["public_description"]})
@@ -1807,6 +1844,15 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
         for r in rows:
             items.append({"title": r["title"] or "Essay",
                           "date": r["updated_at"].date().isoformat() if r["updated_at"] else None,
+                          "body": r["public_description"]})
+        ev = await tconn.fetch(
+            "SELECT title, event_date, public_description FROM events "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND event_type = 'essay_draft' "
+            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in ev:
+            items.append({"title": r["title"] or "Writing",
+                          "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
     elif code == "resume_cv":
         rows = await tconn.fetch(
