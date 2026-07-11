@@ -1961,7 +1961,7 @@ async def public_site_config(request: Request, slug: str):
         import json as _json
         pillar_cfg = _json.loads(pillar_cfg)
     enabled = [
-        {"code": sdef["code"], "title": sdef["title"]}
+        {"code": sdef["code"], "title": sdef["title"], "pillar": sdef.get("pillar", "personal")}
         for sdef in cat["sections"]
         if saved_sections.get(sdef["code"], sdef["default"])
         and pillar_cfg.get(sdef.get("pillar", "personal"), True)
