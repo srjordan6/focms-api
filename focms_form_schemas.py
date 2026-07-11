@@ -2076,6 +2076,16 @@ async def public_site_config(request: Request, slug: str):
         and pillar_cfg.get(sdef.get("pillar", "personal"), True)
         and sdef.get("pillar", "personal") not in _BLOCKED_PILLARS
     ]
+    # v0.12.115: attach live item count + first preview so cards show real
+    # depth instead of the generic grow-note when a section has public rows.
+    async with _tenant_conn(pool, tenant_id) as tconn2:
+        for sec in enabled:
+            try:
+                rows = await _section_items(tconn2, str(student["id"]), sec["code"])
+            except Exception:
+                rows = []
+            sec["count"] = len(rows)
+            sec["preview"] = rows[0]["title"] if rows else None
     theme = next((t for t in cat["themes"] if t["key"] == cfg["theme_key"]), None)         or (cat["themes"][0] if cat["themes"] else None)
     return {
         "slug": slug,
