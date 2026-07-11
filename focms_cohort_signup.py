@@ -1152,6 +1152,38 @@ async def billing_session(body: BillingSessionRequest, request: Request) -> dict
     return {"checkout_url": sess["url"], "session_id": sess["id"]}
 
 
+class BillingPortalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    return_url: str = Field("https://outcomestar.app/portal")
+
+
+@router.post("/billing-portal-session")
+async def billing_portal_session(body: BillingPortalRequest, request: Request) -> dict[str, Any]:
+    """v0.12.114: Stripe Customer Portal - lets the parent cancel a plan,
+    change the payment method, and see invoices. Requires the tenant to
+    have a stripe_customer_id (set at first checkout). The portal itself
+    is Stripe-hosted; configure defaults once in Stripe Dashboard ->
+    Settings -> Billing -> Customer portal."""
+    api_key = os.environ.get("STRIPE_SECRET_KEY")
+    if not api_key:
+        raise HTTPException(503, {"error": "billing_unavailable", "message": "Billing is not configured."})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        principal = await _tenant_from_bearer(request, conn)
+    if not principal.get("stripe_customer_id"):
+        raise HTTPException(404, {"error": "no_billing_account",
+                                  "message": "No paid plan on file yet - there is nothing to manage or cancel."})
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post("https://api.stripe.com/v1/billing_portal/sessions",
+                              headers={"Authorization": f"Bearer {api_key}"},
+                              data={"customer": principal["stripe_customer_id"],
+                                    "return_url": body.return_url})
+    if r.status_code >= 300:
+        log.warning("stripe portal create failed %s: %s", r.status_code, r.text[:300])
+        raise HTTPException(502, {"error": "stripe_error", "message": "Could not open the billing portal."})
+    return {"portal_url": r.json()["url"]}
+
+
 def _stripe_sig_ok(payload: bytes, header: str, secret: str) -> bool:
     try:
         parts = dict(p.split("=", 1) for p in header.split(","))
