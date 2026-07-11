@@ -1802,11 +1802,11 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
                           "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
         pa = await tconn.fetch(
-            "SELECT title, created_at, public_description FROM portfolio_artifacts "
+            "SELECT artifact_title, created_at, public_description FROM portfolio_artifacts "
             "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
             "ORDER BY created_at DESC LIMIT 50", student_id)
         for r in pa:
-            items.append({"title": r["title"] or "Portfolio item",
+            items.append({"title": r["artifact_title"] or "Portfolio item",
                           "date": r["created_at"].date().isoformat() if r["created_at"] else None,
                           "body": r["public_description"]})
     elif code in ("stem_portfolio", "academic_capstone"):
@@ -1829,11 +1829,11 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
                           "date": None,
                           "body": r["term"] or r["school_year"]})
         pa = await tconn.fetch(
-            "SELECT title, created_at, public_description FROM portfolio_artifacts "
+            "SELECT artifact_title, created_at, public_description FROM portfolio_artifacts "
             "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
             "ORDER BY created_at DESC LIMIT 50", student_id)
         for r in pa:
-            items.append({"title": r["title"] or "Portfolio item",
+            items.append({"title": r["artifact_title"] or "Portfolio item",
                           "date": r["created_at"].date().isoformat() if r["created_at"] else None,
                           "body": r["public_description"]})
     elif code in ("writing_book_log", "essay_vault"):
