@@ -1866,6 +1866,32 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
     return items
 
 
+@router.get("/public/site/{slug}/_debug_events")
+async def public_site_debug_events(request: Request, slug: str):
+    """TEMP debug (v0.12.115): shows exactly what the tenant session sees for events,
+    to diagnose why typed section queries return 0. Remove after fix."""
+    pool: asyncpg.Pool = request.app.state.pool
+    slug = slug.strip().lower()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow("SELECT t.id FROM tenants t WHERE t.slug=$1 AND t.status='active'", slug)
+        if not tenant:
+            raise HTTPException(404, {"error": "not_found"})
+        async with _tenant_conn(pool, str(tenant["id"])) as tconn:
+            student = await tconn.fetchrow(
+                "SELECT id FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1", str(tenant["id"]))
+            sid = student["id"]
+            by_type = await tconn.fetch(
+                "SELECT event_type::text AS et, visibility::text AS vis, count(*) AS n FROM events "
+                "WHERE student_id=$1::uuid AND deleted_at IS NULL GROUP BY 1,2 ORDER BY 3 DESC", sid)
+            typed = await tconn.fetchval(
+                "SELECT count(*) FROM events WHERE student_id=$1::uuid AND visibility='public' "
+                "AND deleted_at IS NULL AND event_type IN ('stem_event','competition','summer_experience')", sid)
+            sid_type = type(sid).__name__
+    return {"student_id": str(sid), "student_id_pytype": sid_type,
+            "typed_stem_count": typed,
+            "events_by_type": [{"event_type": r["et"], "visibility": r["vis"], "n": r["n"]} for r in by_type]}
+
+
 @router.get("/public/site/{slug}/section/{code}")
 async def public_site_section(request: Request, slug: str, code: str):
     """v0.12.95: section detail - returns section title + items (public rows only)."""
