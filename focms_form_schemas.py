@@ -1921,6 +1921,69 @@ async def public_site_hero(request: Request, slug: str):
                     headers={"Cache-Control": "public, max-age=300"})
 
 
+@router.get("/public/site/{slug}/badges")
+async def public_site_badges(request: Request, slug: str):
+    """v0.12.115 (roadmap A4): virtual trophy case. Derives achievement badges
+    from records the family has ALREADY made public - no new data entry. Only
+    public personal_records / affiliations / public events feed this, so the
+    three-layer visibility gate is honored automatically."""
+    pool: asyncpg.Pool = request.app.state.pool
+    slug = slug.strip().lower()
+    async with pool.acquire() as conn:
+        tenant = await conn.fetchrow(
+            "SELECT t.id FROM tenants t WHERE t.slug=$1 AND t.status='active' "
+            "AND NOT coalesce((SELECT (ts.feature_flags->>'billing_hold')::bool "
+            "FROM tenant_settings ts WHERE ts.tenant_id=t.id), false)", slug)
+        if not tenant:
+            raise HTTPException(404, {"error": "not_found"})
+        tid = str(tenant["id"])
+        async with _tenant_conn(pool, tid) as tconn:
+            student = await tconn.fetchrow(
+                "SELECT id FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1", tid)
+            if not student:
+                raise HTTPException(404, {"error": "not_found"})
+            sid = student["id"]
+            pr_count = await tconn.fetchval(
+                "SELECT count(*) FROM personal_records "
+                "WHERE student_id=$1 AND visibility='public'", sid) or 0
+            best_drop = await tconn.fetchval(
+                "SELECT max(total_drop_numeric) FROM personal_records "
+                "WHERE student_id=$1 AND visibility='public' AND total_drop_numeric IS NOT NULL", sid)
+            race_count = await tconn.fetchval(
+                "SELECT count(*) FROM events "
+                "WHERE student_id=$1 AND event_type='swim_race' AND visibility='public'", sid) or 0
+            affil_count = await tconn.fetchval(
+                "SELECT count(*) FROM affiliations "
+                "WHERE student_id=$1 AND visibility='public'", sid) or 0
+            years_active = await tconn.fetchval(
+                "SELECT count(DISTINCT extract(year from achieved_date)) FROM personal_records "
+                "WHERE student_id=$1 AND visibility='public' AND achieved_date IS NOT NULL", sid) or 0
+            top_pr = await tconn.fetchrow(
+                "SELECT title, public_description FROM personal_records "
+                "WHERE student_id=$1 AND visibility='public' "
+                "ORDER BY achieved_date DESC NULLS LAST LIMIT 1", sid)
+    badges: list[dict] = []
+    def add(icon, label, sub):
+        badges.append({"icon": icon, "label": label, "sub": sub})
+    if pr_count >= 1:
+        add("medal", f"{pr_count} Personal Record{'s' if pr_count != 1 else ''}", "Logged and verified")
+    for threshold, star in ((25, "gold"), (10, "silver"), (5, "bronze")):
+        if pr_count >= threshold:
+            add(star, f"{threshold}+ Records Club", "Consistency badge")
+            break
+    if race_count >= 1:
+        add("lane", f"{race_count} Race{'s' if race_count != 1 else ''} Swum", "Every start counts")
+    if best_drop and best_drop > 0:
+        add("bolt", "Time Dropper", f"Best drop {round(float(best_drop), 2)}s")
+    if affil_count >= 1:
+        add("team", f"{affil_count} Team{'s' if affil_count != 1 else ''} & Group{'s' if affil_count != 1 else ''}", "Shows up and belongs")
+    if years_active >= 2:
+        add("calendar", f"{years_active}-Year Streak", "Long-haul dedication")
+    if top_pr:
+        add("trophy", "Latest Milestone", top_pr["public_description"] or top_pr["title"])
+    return {"slug": slug, "badges": badges}
+
+
 @router.get("/public/site/{slug}")
 async def public_site_config(request: Request, slug: str):
     pool: asyncpg.Pool = request.app.state.pool
