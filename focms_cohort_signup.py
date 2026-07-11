@@ -378,10 +378,17 @@ def _membership_key_for_age(age: int) -> str:
 
 
 async def _verify_turnstile(token, request: Request) -> None:
-    """v0.11.17: enforce Turnstile when TURNSTILE_SECRET is configured."""
+    """v0.11.17: enforce Turnstile when TURNSTILE_SECRET is configured.
+    v0.12.113: FOCMS_TURNSTILE_MODE=soft (default) fails OPEN - a missing
+    token (widget failed to load or solve: Cloudflare degradation, blocked
+    challenge domains, flagged visitor IP) no longer blocks signup/login;
+    a PRESENT token is still strictly verified, and a siteverify outage
+    also fails open. Set FOCMS_TURNSTILE_MODE=enforce to restore the hard
+    requirement."""
     secret = os.environ.get("TURNSTILE_SECRET")
     if not secret:
         return
+    mode = os.environ.get("FOCMS_TURNSTILE_MODE", "soft").lower()
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         try:
@@ -391,17 +398,29 @@ async def _verify_turnstile(token, request: Request) -> None:
         except Exception:
             pass
     if not token:
-        raise HTTPException(400, {"error": "turnstile_required",
-                                  "message": "Please complete the security check."})
+        if mode == "enforce":
+            raise HTTPException(400, {"error": "turnstile_required",
+                                      "message": "Please complete the security check."})
+        log.warning("turnstile soft-pass: no token (widget likely failed) ip=%s",
+                    request.headers.get("cf-connecting-ip")
+                    or (request.client.host if request.client else "?"))
+        return
     ip = request.headers.get("cf-connecting-ip") or (request.client.host if request.client else None)
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify",
-                              data={"secret": secret, "response": token, "remoteip": ip or ""})
-        ok = False
-        try:
-            ok = bool(r.json().get("success"))
-        except Exception:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post("https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                                  data={"secret": secret, "response": token, "remoteip": ip or ""})
             ok = False
+            try:
+                ok = bool(r.json().get("success"))
+            except Exception:
+                ok = False
+    except Exception as exc:
+        if mode == "enforce":
+            raise HTTPException(400, {"error": "turnstile_failed",
+                                      "message": "Security check unavailable - reload and try again."})
+        log.warning("turnstile soft-pass: siteverify unreachable (%r)", exc)
+        return
     if not ok:
         raise HTTPException(400, {"error": "turnstile_failed",
                                   "message": "Security check failed - reload the page and try again."})
@@ -1790,10 +1809,18 @@ async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
     certificate. FOCMS_LLM_PROVIDER=anthropic|openai_compatible with
     FOCMS_LLM_API_KEY / FOCMS_LLM_BASE_URL / FOCMS_LLM_MODEL - identical env
     contract to the rest of FOCMS, no vendor lock. Returns the parsed verdict
-    dict, or None (-> document stays pending for manual review)."""
-    provider = os.environ.get("FOCMS_LLM_PROVIDER", "anthropic").lower()
-    api_key = os.environ.get("FOCMS_LLM_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
-    model = os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6")
+    dict, or None (-> document stays pending for manual review).
+    v0.12.112: FOCMS_VISION_PROVIDER / FOCMS_VISION_MODEL / FOCMS_VISION_BASE_URL /
+    FOCMS_VISION_API_KEY override the FOCMS_LLM_* values for this check only,
+    because the general text model (e.g. a coder model) is often not
+    vision-capable."""
+    provider = (os.environ.get("FOCMS_VISION_PROVIDER")
+                or os.environ.get("FOCMS_LLM_PROVIDER", "anthropic")).lower()
+    api_key = (os.environ.get("FOCMS_VISION_API_KEY")
+               or os.environ.get("FOCMS_LLM_API_KEY")
+               or os.environ.get("ANTHROPIC_API_KEY"))
+    model = (os.environ.get("FOCMS_VISION_MODEL")
+             or os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6"))
     if not api_key:
         return None
     import base64 as _b64
@@ -1819,7 +1846,8 @@ async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
                  "Return ONLY the JSON object.")
     txt = ""
     if provider == "openai_compatible":
-        base = os.environ.get("FOCMS_LLM_BASE_URL", "").rstrip("/")
+        base = (os.environ.get("FOCMS_VISION_BASE_URL")
+                or os.environ.get("FOCMS_LLM_BASE_URL", "")).rstrip("/")
         if not base:
             log.warning("birth cert check: FOCMS_LLM_BASE_URL required for openai_compatible")
             return None
@@ -1843,8 +1871,9 @@ async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
             return None
         msg = r.json()["choices"][0]["message"]
         txt = (msg.get("content") or "") or (msg.get("reasoning") or "")
-    else:  # anthropic-format (default; FOCMS_LLM_BASE_URL overrides the host)
-        base = os.environ.get("FOCMS_LLM_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    else:  # anthropic-format (default; FOCMS_VISION_BASE_URL/FOCMS_LLM_BASE_URL override the host)
+        base = (os.environ.get("FOCMS_VISION_BASE_URL")
+                or os.environ.get("FOCMS_LLM_BASE_URL", "https://api.anthropic.com")).rstrip("/")
         block = {"type": "document" if doc_mime == "application/pdf" else "image",
                  "source": {"type": "base64", "media_type": doc_mime, "data": b64}}
         async with httpx.AsyncClient(timeout=90) as client:
