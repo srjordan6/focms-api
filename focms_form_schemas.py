@@ -6328,6 +6328,7 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
 class TeacherItem(BaseModel):
     id: Optional[str] = None
     teacher_name: str
+    role: Optional[str] = None                     # v0.12.121 'teacher' | 'counselor'
     school_name: Optional[str] = None
     school_leaid: Optional[str] = None
     street_address: Optional[str] = None
@@ -6347,17 +6348,23 @@ class TeachersRequest(BaseModel):
 
 
 @router.get("/student/{student_id}/teachers")
-async def get_teachers(request: Request, student_id: str):
+async def get_teachers(request: Request, student_id: str, role: Optional[str] = None):
+    """v0.12.121: same registry serves teachers and counselors (role column).
+    Pass ?role=counselor to list counselors only; omit for everyone."""
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
+    sql = ("SELECT id::text AS id, teacher_name, role, school_name, school_leaid, "
+           "street_address, city_town, state_province, zip_postal_code, "
+           "school_phone, teacher_email, subject_taught, title_position, notes "
+           "FROM teachers WHERE (student_id=$1::uuid OR student_id IS NULL) "
+           "AND deleted_at IS NULL ")
+    args: list = [student_id]
+    if role in ("teacher", "counselor"):
+        args.append(role)
+        sql += f"AND coalesce(role,'teacher')=${len(args)} "
+    sql += "ORDER BY teacher_name"
     async with _tenant_conn(pool, tenant_id) as conn:
-        rows = await conn.fetch(
-            "SELECT id::text AS id, teacher_name, school_name, school_leaid, "
-            "street_address, city_town, state_province, zip_postal_code, "
-            "school_phone, teacher_email, subject_taught, title_position, notes "
-            "FROM teachers WHERE (student_id=$1::uuid OR student_id IS NULL) "
-            "AND deleted_at IS NULL ORDER BY teacher_name",
-            student_id)
+        rows = await conn.fetch(sql, *args)
     return {"student_id": student_id, "teachers": [dict(r) for r in rows]}
 
 
@@ -6380,6 +6387,9 @@ async def post_teachers(request: Request, student_id: str, body: TeachersRequest
             for it in body.items or []:
                 nm = (it.teacher_name or "").strip()
                 if not nm: continue
+                _role = (it.role or "teacher").strip().lower()
+                if _role not in ("teacher", "counselor"):
+                    _role = "teacher"
                 if it.id:
                     try: _uuid.UUID(it.id)
                     except Exception: continue
@@ -6388,26 +6398,26 @@ async def post_teachers(request: Request, student_id: str, body: TeachersRequest
                         "school_leaid=$4, street_address=$5, city_town=$6, "
                         "state_province=$7, zip_postal_code=$8, school_phone=$9, "
                         "teacher_email=$10, subject_taught=$11, title_position=$12, "
-                        "notes=$13, updated_at=now(), updated_by=$14::uuid "
+                        "notes=$13, role=$15, updated_at=now(), updated_by=$14::uuid "
                         "WHERE id=$1::uuid AND deleted_at IS NULL",
                         it.id, nm, it.school_name, it.school_leaid, it.street_address,
                         it.city_town, it.state_province, it.zip_postal_code,
                         it.school_phone, it.teacher_email, it.subject_taught,
-                        it.title_position, it.notes, user_id)
+                        it.title_position, it.notes, user_id, _role)
                     if r and r.endswith(" 1"): updated += 1
                 else:
                     await conn.execute(
                         "INSERT INTO teachers (tenant_id, student_id, teacher_name, "
                         "school_name, school_leaid, street_address, city_town, "
                         "state_province, zip_postal_code, school_phone, teacher_email, "
-                        "subject_taught, title_position, notes, source_system, "
+                        "subject_taught, title_position, notes, role, source_system, "
                         "created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
-                        "$14,'parent_portal',$15::uuid,$15::uuid)",
+                        "$14,$16,'parent_portal',$15::uuid,$15::uuid)",
                         tenant_id, student_id, nm, it.school_name, it.school_leaid,
                         it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.school_phone, it.teacher_email,
-                        it.subject_taught, it.title_position, it.notes, user_id)
+                        it.subject_taught, it.title_position, it.notes, user_id, _role)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
