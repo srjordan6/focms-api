@@ -1173,6 +1173,7 @@ _RIGOR = {"regular", "honors", "ap", "ib", "dual"}
 
 
 class CourseItem(BaseModel):
+    id: Optional[str] = None                       # v0.12.116 (upsert mode)
     course_name: Optional[str] = None
     course_code: Optional[str] = None
     sced_code: Optional[str] = None
@@ -1198,6 +1199,8 @@ class CourseItem(BaseModel):
 
 class CoursesRequest(BaseModel):
     items: list[CourseItem] = Field(default_factory=list)
+    delete_ids: list[str] = Field(default_factory=list)   # v0.12.116
+    mode: Optional[str] = None                            # v0.12.116 'replace' (default) | 'upsert'
 
 
 @router.get("/student/{student_id}/courses")
@@ -2524,6 +2527,8 @@ async def get_subject_catalog(request: Request):
 async def post_student_courses(request: Request, student_id: str, body: CoursesRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = 0
+    updated = 0
+    deleted = 0
     import traceback as _tb
     pool: asyncpg.Pool = request.app.state.pool
     try:
@@ -2531,9 +2536,29 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             default_school = await _pp_current_school_name(conn, student_id)
-            await conn.execute("DELETE FROM courses_taken WHERE tenant_id=$1::uuid "
-                               "AND student_id=$2::uuid AND source_system='parent_portal'",
-                               tenant_id, student_id)
+            # v0.12.116 DATA-LOSS FIX. The old code always did a blanket
+            # DELETE of every parent_portal course and re-inserted body.items.
+            # Callers that save ONE course (the band UI) therefore wiped every
+            # other course, and a delete_ids-only post wiped all of them.
+            #   upsert mode  -> no blanket delete; id => UPDATE, no id => INSERT
+            #   replace mode -> legacy full-list replace (the old Academics form)
+            upsert = (body.mode or "").strip().lower() == "upsert" \
+                     or bool(body.delete_ids) \
+                     or any((it.id or "").strip() for it in body.items)
+            for did in body.delete_ids or []:
+                try:
+                    _uuid.UUID(did)
+                except Exception:
+                    continue
+                await conn.execute(
+                    "UPDATE courses_taken SET deleted_at=now(), deleted_by=$3::uuid "
+                    "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                    did, student_id, user_id)
+                deleted += 1
+            if not upsert:
+                await conn.execute("DELETE FROM courses_taken WHERE tenant_id=$1::uuid "
+                                   "AND student_id=$2::uuid AND source_system='parent_portal'",
+                                   tenant_id, student_id)
             for it in body.items:
                 name = (it.course_name or "").strip()
                 if not name:
@@ -2562,6 +2587,38 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                     "is_private_tutoring": (ctype == "private_tutoring"),
                 }
                 _details = {k: v for k, v in _details.items() if v is not None}
+                _cid = (it.id or "").strip()
+                if _cid:
+                    try:
+                        _uuid.UUID(_cid)
+                    except Exception:
+                        _cid = ""
+                if _cid:
+                    # v0.12.116: in-place UPDATE (upsert mode)
+                    await conn.execute(
+                        "UPDATE courses_taken SET course_name=$3, course_code=$4, sced_code=$5, "
+                        "school_name=$6, course_type=$7, subject=$8, subject_other=$9, "
+                        "grade_level=$10, school_year=$11, term=$12, credit_hours=$13, "
+                        "grade_received=$14, is_honors=$15, is_ap=$16, is_ib=$17, is_dual_credit=$18, "
+                        "ap_exam_score=$19, teacher_name=$20, teacher_email=$21, "
+                        "course_description=$22, details=$23::jsonb, grade_points_4_0=$24, "
+                        "grade_points_weighted=$25, notes=$26, admission_traits_developed=$27::jsonb, "
+                        "evidence_artifact_ids=$28::text[]::uuid[], updated_at=now(), updated_by=$29::uuid "
+                        "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+                        _cid, student_id, name, (it.course_code or None), (it.sced_code or None),
+                        school, ctype, subj, (it.subject_other or None),
+                        _pp_int(it.grade_level), (it.school_year or None), (it.term or None),
+                        _pp_num(it.credit_hours), (it.grade_received or None),
+                        rigor == "honors", rigor == "ap", rigor == "ib", rigor == "dual",
+                        _pp_int(it.ap_exam_score), (it.teacher_name or None), (it.teacher_email or None),
+                        (it.course_description or None), json.dumps(_details), gp, gpw,
+                        (it.notes or None), json.dumps(_pp_skills(it.skills)),
+                        _pp_artifacts(it.artifact_ids), user_id)
+                    if it.skills:
+                        await _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
+                                                          _cid, it.skills)
+                    updated += 1
+                    continue
                 await conn.execute(
                     "INSERT INTO courses_taken (tenant_id, student_id, course_name, course_code, sced_code, school_name, "
                     "course_type, subject, subject_other, grade_level, school_year, term, credit_hours, grade_received, "
@@ -2596,7 +2653,7 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 saved += 1
     except Exception as _e:
         raise HTTPException(status_code=400, detail="course_insert_error: " + str(_e)[:300])
-    return {"student_id": student_id, "saved": saved}
+    return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
 
 # --------------------------- Standardized Tests ----------------------------
