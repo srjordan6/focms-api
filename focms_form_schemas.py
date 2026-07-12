@@ -5829,22 +5829,29 @@ async def report_card_parse(request: Request, student_id: str, body: dict):
     if len(text) < 20:
         raise HTTPException(400, {"error": "empty", "message": "Paste the report card text first."})
     system = (
-        "You extract report-card data from text a parent pasted from a school portal. "
-        "Respond ONLY with JSON - no prose, no code fences. Schema: "
+        "You extract report-card data from text a parent pasted from a school portal, "
+        "or from a district report card. Respond ONLY with JSON - no prose, no code fences. "
+        "Schema: "
         '{"school_year": str|null, "term": str|null, "grade_level": int|null, '
+        '"school_name": str|null, "counselor": str|null, '
+        '"student_school_id": str|null, "state_student_id": str|null, '
         '"gpa_unweighted": number|null, "gpa_weighted": number|null, '
         '"days_present": int|null, "days_absent": int|null, "days_tardy": int|null, '
         '"teacher_comments": str|null, '
-        '"subjects": [{"subject": str, "period": str|null, "teacher": str|null, '
-        '"mp1": str|null, "mp2": str|null, "exam": str|null, "grade": str|null}]}. '
-        "Rules: `subject` is the course name exactly as written. Keep grades as written "
-        "(numeric like 94, or letter like A-). If the card shows two marking periods in a "
-        "semester, put them in mp1 and mp2 and leave `grade` as the semester average if one "
-        "is printed. If only a single grade per course is shown, put it in `grade` and leave "
-        "mp1/mp2/exam null. `term` should be one of: Full year, Semester 1, Semester 2, "
-        "Quarter 1, Quarter 2, Quarter 3, Quarter 4, Trimester 1, Trimester 2, Trimester 3, "
-        "Summer, Summer I, Summer II - pick the closest, else null. "
-        "Never invent a course, a grade, or a teacher that is not in the text."
+        '"subjects": [{"subject": str, "course_code": str|null, "period": str|null, '
+        '"teacher": str|null, "q1": str|null, "q2": str|null, "sem1": str|null, '
+        '"q3": str|null, "q4": str|null, "sem2": str|null, "fin": str|null, "grade": str|null}]}. '
+        "Column mapping: many district cards print a table with columns "
+        "Pd | Course | Sect | Description | Teacher | Q1 | Q2 | SEM1 | Q3 | Q4 | SEM2 | FIN | ABS | TDY. "
+        "Map Pd->period, Course->course_code, Description->subject (the readable course name), "
+        "Teacher->teacher, and each grading column to its matching field. "
+        "If a card shows all four quarters and a FIN, set term to 'Full year'. "
+        "If it shows only Q1/Q2/SEM1, set term to 'Semester 1'; only Q3/Q4/SEM2 -> 'Semester 2'. "
+        "Otherwise term is one of: Quarter 1..4, Trimester 1..3, Summer, Summer I, Summer II, else null. "
+        "Keep grades exactly as written (numeric like 94, or letter like A-). "
+        "student_school_id is the district's ID for the student (often in parentheses after the name); "
+        "state_student_id is a separate 'Unique State ID' if present. "
+        "Never invent a course, grade, teacher, or ID that is not in the text."
     )
     res = await _llm_complete(system, "REPORT CARD TEXT:\n" + text, max_tokens=2200, want_json=True)
     if res.get("unavailable"):
@@ -5862,8 +5869,11 @@ async def report_card_parse(request: Request, student_id: str, body: dict):
             v = s.get(k)
             v = "" if v is None else str(v).strip()
             return v or None
-        subs.append({"subject": name[:200], "period": _v("period"), "teacher": _v("teacher"),
-                     "mp1": _v("mp1"), "mp2": _v("mp2"), "exam": _v("exam"), "grade": _v("grade")})
+        subs.append({"subject": name[:200], "course_code": _v("course_code"),
+                     "period": _v("period"), "teacher": _v("teacher"),
+                     "q1": _v("q1"), "q2": _v("q2"), "sem1": _v("sem1"),
+                     "q3": _v("q3"), "q4": _v("q4"), "sem2": _v("sem2"),
+                     "fin": _v("fin"), "grade": _v("grade")})
     if not subs:
         raise HTTPException(422, {"error": "no_subjects",
                                   "message": "No courses were found in that text. Check the paste, or enter the grades manually."})
@@ -5874,6 +5884,10 @@ async def report_card_parse(request: Request, student_id: str, body: dict):
         "school_year": (str(data.get("school_year")).strip() if data.get("school_year") else None),
         "term": (str(data.get("term")).strip() if data.get("term") else None),
         "grade_level": data.get("grade_level") if isinstance(data.get("grade_level"), int) else None,
+        "school_name": (str(data.get("school_name")).strip() if data.get("school_name") else None),
+        "counselor": (str(data.get("counselor")).strip() if data.get("counselor") else None),
+        "student_school_id": (str(data.get("student_school_id")).strip() if data.get("student_school_id") else None),
+        "state_student_id": (str(data.get("state_student_id")).strip() if data.get("state_student_id") else None),
         "gpa_unweighted": _num("gpa_unweighted"),
         "gpa_weighted": _num("gpa_weighted"),
         "days_present": _num("days_present"),
