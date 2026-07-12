@@ -2512,7 +2512,7 @@ async def get_course_catalog(request: Request, subject: Optional[str] = None, q:
         args.append(subject); sql += f" AND subject_code=${len(args)}"
     if q:
         args.append("%" + q + "%"); sql += f" AND title ILIKE ${len(args)}"
-    sql += " ORDER BY code LIMIT 500"
+    sql += " ORDER BY code LIMIT 3000"
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(sql, *args)
     return {"courses": [dict(r) for r in rows]}
