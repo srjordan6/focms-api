@@ -1,6 +1,13 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.116 · Private Tutoring course_type (subject, school, teacher, teacher email,
+         school year, notes, skills gained, course description, grade received OR
+         award/certificate of completion) on courses_taken; universal course
+         skills-gained -> student_skills; meta-skill inference rule R11
+         (course subject/name/description/skills -> meta-skills, internal-only);
+         removed TEMP _debug_events endpoint.
+
 v0.12.52 · feat: SCED subject taxonomy — /catalogs/subjects endpoint; courses_taken.subject check now SCED codes 01-23 + other.
          v0.12.51 · fix: courses subject must match check-constraint enum (invalid->other); add courses_taken.subject_other free-text; GRANT DELETE done via MCP.
          v0.12.50 · feat: job_experiences.supervisor_email (Ask-for-Recommendation mailto); remove temporary debug_raw passthrough.
@@ -1180,6 +1187,10 @@ class CourseItem(BaseModel):
     rigor: Optional[str] = None
     ap_exam_score: Optional[int] = None
     teacher_name: Optional[str] = None
+    teacher_email: Optional[str] = None            # v0.12.116
+    course_type: Optional[str] = None              # v0.12.116 'regular'|'private_tutoring'
+    course_description: Optional[str] = None       # v0.12.116 subject/course description
+    completion_award: Optional[str] = None         # v0.12.116 award/certificate of completion
     notes: Optional[str] = None
     skills: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
@@ -1197,7 +1208,8 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
     async with _tenant_conn(pool, tenant_id) as conn:
         base = ("SELECT id::text AS id, course_name, course_code, sced_code, school_name, subject, subject_other, school_year, grade_level, term, grade_received, "
                 "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
-                "teacher_name, notes, admission_traits_developed, evidence_artifact_ids, "
+                "teacher_name, teacher_email, course_description, details, "
+                "notes, admission_traits_developed, evidence_artifact_ids, "
                 "(visibility='public') AS show_on_showcase "
                 "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL ")
         if bounds:
@@ -1211,7 +1223,18 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
         if r["is_ib"]: return "ib"
         if r["is_dual_credit"]: return "dual"
         if r["is_honors"]: return "honors"
-        return r["course_type"] or "regular"
+        # v0.12.116: course_type now carries the record TYPE, not the rigor.
+        ct = r["course_type"]
+        return ct if ct in _RIGOR else "regular"
+
+    def _cdet(r):
+        d = r["details"]
+        if isinstance(d, str):
+            try:
+                return json.loads(d)
+            except Exception:
+                return {}
+        return d or {}
 
     out = [
         {"id": r["id"], "course_name": r["course_name"], "course_code": r["course_code"], "sced_code": r["sced_code"], "school_name": r["school_name"], "subject": r["subject"],
@@ -1221,6 +1244,11 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
          "credit_hours": float(r["credit_hours"]) if r["credit_hours"] is not None else None,
          "rigor": rigor_of(r), "is_honors": r["is_honors"], "is_ap": r["is_ap"], "is_ib": r["is_ib"], "is_dual_credit": r["is_dual_credit"],
          "ap_exam_score": r["ap_exam_score"], "teacher_name": r["teacher_name"],
+         "teacher_email": r["teacher_email"],
+         "course_type": r["course_type"],
+         "course_description": r["course_description"] or _cdet(r).get("course_description"),
+         "completion_award": _cdet(r).get("completion_award"),
+         "is_private_tutoring": (r["course_type"] == "private_tutoring") or bool(_cdet(r).get("is_private_tutoring")),
          "show_on_showcase": r["show_on_showcase"],
          "notes": r["notes"], "skills": _pp_skills(r["admission_traits_developed"]),
          "artifact_ids": _pp_artifacts(r["evidence_artifact_ids"])} for r in rows]
@@ -1864,32 +1892,6 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
                           "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
     return items
-
-
-@router.get("/public/site/{slug}/_debug_events")
-async def public_site_debug_events(request: Request, slug: str):
-    """TEMP debug (v0.12.115): shows exactly what the tenant session sees for events,
-    to diagnose why typed section queries return 0. Remove after fix."""
-    pool: asyncpg.Pool = request.app.state.pool
-    slug = slug.strip().lower()
-    async with pool.acquire() as conn:
-        tenant = await conn.fetchrow("SELECT t.id FROM tenants t WHERE t.slug=$1 AND t.status='active'", slug)
-        if not tenant:
-            raise HTTPException(404, {"error": "not_found"})
-        async with _tenant_conn(pool, str(tenant["id"])) as tconn:
-            student = await tconn.fetchrow(
-                "SELECT id FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1", str(tenant["id"]))
-            sid = student["id"]
-            by_type = await tconn.fetch(
-                "SELECT event_type::text AS et, visibility::text AS vis, count(*) AS n FROM events "
-                "WHERE student_id=$1::uuid AND deleted_at IS NULL GROUP BY 1,2 ORDER BY 3 DESC", sid)
-            typed = await tconn.fetchval(
-                "SELECT count(*) FROM events WHERE student_id=$1::uuid AND visibility='public' "
-                "AND deleted_at IS NULL AND event_type IN ('stem_event','competition','summer_experience')", sid)
-            sid_type = type(sid).__name__
-    return {"student_id": str(sid), "student_id_pytype": sid_type,
-            "typed_stem_count": typed,
-            "events_by_type": [{"event_type": r["et"], "visibility": r["vis"], "n": r["n"]} for r in by_type]}
 
 
 @router.get("/public/site/{slug}/section/{code}")
@@ -2544,23 +2546,53 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 rigor = (it.rigor or "regular").lower()
                 if rigor not in _RIGOR:
                     rigor = "regular"
+                # v0.12.116: course_type is the record TYPE (regular vs private_tutoring),
+                # not the rigor. Rigor lives in the is_* booleans + details.rigor.
+                ctype = (it.course_type or "regular").strip().lower()
+                if ctype not in ("regular", "private_tutoring"):
+                    ctype = "regular"
                 gp = _pp_grade_points(it.grade_received)
                 gpw = (gp + _RIGOR_BONUS.get(rigor, 0.0)) if gp is not None else None
+                # v0.12.116: award/certificate of completion is an alternative to a letter
+                # grade (tutoring, pass/fail enrichment). Kept in details.
+                _details = {
+                    "rigor": rigor,
+                    "course_description": (it.course_description or None),
+                    "completion_award": (it.completion_award or None),
+                    "is_private_tutoring": (ctype == "private_tutoring"),
+                }
+                _details = {k: v for k, v in _details.items() if v is not None}
                 await conn.execute(
                     "INSERT INTO courses_taken (tenant_id, student_id, course_name, course_code, sced_code, school_name, "
                     "course_type, subject, subject_other, grade_level, school_year, term, credit_hours, grade_received, "
-                    "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, teacher_name, "
+                    "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, teacher_name, teacher_email, "
+                    "course_description, details, "
                     "grade_points_4_0, grade_points_weighted, notes, admission_traits_developed, "
                     "evidence_artifact_ids, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,$25,$26,$4,$5,$6,$24,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,"
+                    "VALUES ($1::uuid,$2::uuid,$3,$25,$26,$4,$5,$6,$24,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$27,"
+                    "$28,$29::jsonb,"
                     "$18,$19,$20,$21::jsonb,$22::text[]::uuid[],'parent_portal',$23::uuid,$23::uuid)",
-                    tenant_id, student_id, name, school, rigor, subj,
+                    tenant_id, student_id, name, school, ctype, subj,
                     _pp_int(it.grade_level), (it.school_year or None), (it.term or None),
                     _pp_num(it.credit_hours), (it.grade_received or None),
                     rigor == "honors", rigor == "ap", rigor == "ib", rigor == "dual",
                     _pp_int(it.ap_exam_score), (it.teacher_name or None),
                     gp, gpw, (it.notes or None), json.dumps(_pp_skills(it.skills)),
-                    _pp_artifacts(it.artifact_ids), user_id, (it.subject_other or None), (it.course_code or None), (it.sced_code or None))
+                    _pp_artifacts(it.artifact_ids), user_id, (it.subject_other or None),
+                    (it.course_code or None), (it.sced_code or None),
+                    (it.teacher_email or None), (it.course_description or None),
+                    json.dumps(_details))
+                # v0.12.116: universal skills-gained - mirror course skills into
+                # student_skills so EVERY course (academic or tutoring) feeds the
+                # skill inventory and the meta-skill inference engine.
+                if it.skills:
+                    _cid = await conn.fetchval(
+                        "SELECT id FROM courses_taken WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
+                        "AND source_system='parent_portal' AND course_name=$3 "
+                        "ORDER BY created_at DESC LIMIT 1", tenant_id, student_id, name)
+                    if _cid:
+                        await _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
+                                                          str(_cid), it.skills)
                 saved += 1
     except Exception as _e:
         raise HTTPException(status_code=400, detail="course_insert_error: " + str(_e)[:300])
@@ -4208,6 +4240,93 @@ async def _run_meta_inference(conn, tenant_id: str, student_id: str):
                     for code, sc, cf in metas:
                         _infer_add(findings, code, sc, cf, "work_experience", ev)
 
+    # ---------- Rule R11: coursework (incl. private tutoring) -> meta-skills ----------
+    # Reads courses_taken subject / course name / description / parent-entered
+    # skills. Realizes "meta-skills based on subject, course, and skills entered
+    # by the parent" as EVIDENCE-BASED inference. Meta-skills remain INTERNAL-ONLY;
+    # parents never enter or see them (decision of record 2026-07-02).
+    # Every meta-skill code below is verified against meta_skills_catalog.
+    crows = await conn.fetch(
+        "SELECT course_name, subject, course_description, details, "
+        "admission_traits_developed, is_ap, is_ib, is_dual_credit, is_honors "
+        "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
+    if crows:
+        n_courses = len(crows)
+        n_tutoring = 0
+        _infer_add(findings, "la_self_directed_learning", 3, "medium", "coursework",
+                   f"{n_courses} course record(s) logged")
+        n_rigor = sum(1 for c in crows if c["is_ap"] or c["is_ib"] or c["is_dual_credit"])
+        if n_rigor >= 1:
+            _infer_add(findings, "tj_critical_thinking", 4, "medium", "coursework",
+                       f"{n_rigor} advanced course(s) (AP/IB/dual-credit)")
+            _infer_add(findings, "wd_discipline", 4, "medium", "coursework",
+                       f"{n_rigor} advanced course(s)")
+        # SCED 2-digit subject area -> meta-skills
+        SUBJ_META = {
+            "02": [("tj_critical_thinking", 4, "medium"), ("tj_pattern_recognition", 3, "low")],
+            "03": [("ci_experiment_design", 4, "medium"), ("tj_evidence_evaluation", 3, "low")],
+            "01": [("cm_clear_writing", 3, "medium"), ("tj_critical_thinking", 3, "low")],
+            "04": [("tj_big_picture_thinking", 3, "low"), ("tj_critical_thinking", 3, "low")],
+            "05": [("rs_cultural_awareness", 3, "medium"), ("la_skill_transfer", 3, "low")],
+            "06": [("ci_creative_thinking", 3, "medium")],
+            "10": [("tj_systems_thinking", 3, "medium"), ("la_self_directed_learning", 3, "low")],
+            "21": [("ci_design_thinking", 3, "low")],
+            "22": [("tj_evidence_evaluation", 3, "low")],
+        }
+        CKW = {
+            "code": [("tj_systems_thinking", 3, "medium"), ("la_self_directed_learning", 3, "low")],
+            "program": [("tj_systems_thinking", 3, "medium")],
+            "robot": [("ci_design_thinking", 3, "medium"), ("tj_systems_thinking", 3, "low")],
+            "debate": [("cm_persuasive_communication", 4, "medium"), ("cm_public_speaking_presence", 3, "low")],
+            "writ": [("cm_clear_writing", 3, "medium")],
+            "research": [("la_research_ability", 3, "medium"), ("ci_curiosity_driven_exploration", 3, "low")],
+            "calculus": [("tj_critical_thinking", 4, "medium")],
+            "algebra": [("tj_critical_thinking", 3, "medium")],
+            "chemistry": [("ci_experiment_design", 3, "medium")],
+            "physics": [("ci_experiment_design", 4, "medium"), ("tj_critical_thinking", 3, "low")],
+            "biolog": [("tj_evidence_evaluation", 3, "medium")],
+            "econ": [("tj_critical_thinking", 3, "low")],
+            "music": [("ci_creative_thinking", 3, "medium")],
+            "art": [("ci_creative_thinking", 3, "medium")],
+            "language": [("rs_cultural_awareness", 3, "medium")],
+            "leadership": [("li_leadership_presence", 3, "medium")],
+        }
+        for c in crows:
+            det = c["details"]
+            if isinstance(det, str):
+                try:
+                    det = json.loads(det)
+                except Exception:
+                    det = {}
+            det = det or {}
+            cname = (c["course_name"] or "course").strip()
+            if det.get("is_private_tutoring") or "tutor" in cname.lower():
+                n_tutoring += 1
+            subj = (c["subject"] or "").strip()
+            if subj in SUBJ_META:
+                for code, sc, cf in SUBJ_META[subj]:
+                    _infer_add(findings, code, sc, cf, "coursework_subject",
+                               f"coursework in subject {subj}: {cname}")
+            blob = " ".join(filter(None, [
+                cname.lower(),
+                (c["course_description"] or "").lower(),
+                " ".join(_pp_skills(c["admission_traits_developed"])).lower(),
+            ]))
+            if blob.strip():
+                for token, metas in CKW.items():
+                    if token in blob:
+                        for code, sc, cf in metas:
+                            _infer_add(findings, code, sc, cf, "coursework_keyword",
+                                       f"course '{cname}' (matched '{token}')")
+        # Private tutoring = actively sought additional instruction.
+        if n_tutoring >= 1:
+            _infer_add(findings, "la_self_directed_learning", 4, "medium", "private_tutoring",
+                       f"{n_tutoring} private tutoring engagement(s) - sought additional instruction")
+            _infer_add(findings, "la_growth_mindset", 4, "medium", "private_tutoring",
+                       f"{n_tutoring} private tutoring engagement(s)")
+            _infer_add(findings, "wd_task_completion", 3, "low", "private_tutoring",
+                       f"{n_tutoring} private tutoring engagement(s)")
+
     return findings
 
 
@@ -4597,6 +4716,44 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
 
+
+
+# v0.12.116: course skills -> student_skills inventory. courses_taken has no
+# visibility_locked column, so this is a trimmed writer without the showcase
+# toggle. Makes EVERY course (academic or private tutoring) contribute to the
+# skill inventory and the meta-skill inference engine, exactly like
+# affiliations / awards / ec-sessions already do.
+async def _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
+                                      record_id, skills_gained):
+    if not skills_gained:
+        return
+    valid = {r["code"] for r in await conn.fetch("SELECT code FROM skills_catalog WHERE is_active")}
+    src = f"courses_taken:{record_id}"
+    for entry in skills_gained:
+        code = (entry or "").strip()
+        if not code:
+            continue
+        if code in valid:
+            existing = await conn.fetchval(
+                "SELECT id FROM student_skills WHERE student_id=$1::uuid AND skill_code=$2 "
+                "AND deleted_at IS NULL LIMIT 1", student_id, code)
+            if existing:
+                await conn.execute(
+                    "UPDATE student_skills SET acquired=true, source_activity=$3, "
+                    "updated_at=now(), updated_by=$4::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
+                    existing, student_id, src, user_id)
+            else:
+                await conn.execute(
+                    "INSERT INTO student_skills (tenant_id, student_id, skill_code, acquired, "
+                    "acquired_date, source_activity, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                    tenant_id, student_id, code, src, user_id)
+        else:
+            await conn.execute(
+                "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
+                "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
+                "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                tenant_id, student_id, code, src, user_id)
 
 
 # v0.12.25: universal activity helpers
