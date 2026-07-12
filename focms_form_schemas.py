@@ -2511,6 +2511,83 @@ async def get_course_catalog(request: Request, subject: Optional[str] = None, q:
     return {"courses": [dict(r) for r in rows]}
 
 
+# ---------------- v0.12.117: cascading K-12 school picker ----------------
+# NCES names are abbreviated and uppercase ("ISBELL EL", "FRISCO H S"), so free-text
+# search fails for the names families actually use. Instead: pick country -> state
+# -> district -> school. Backed by k12_schools (ncessch, leaid, name, district_name).
+
+def _pretty_school(name: str) -> str:
+    """ISBELL EL -> Isbell Elementary; FRISCO H S -> Frisco High School."""
+    if not name:
+        return ""
+    s = " ".join(str(name).split())
+    up = s.upper()
+    for pat, rep in (
+        (" H S", " High School"), (" HS", " High School"),
+        (" J H", " Junior High"), (" JH", " Junior High"),
+        (" EL", " Elementary"), (" ELEM", " Elementary"),
+        (" MIDDLE", " Middle School"), (" MS", " Middle School"),
+        (" ACAD", " Academy"), (" INT", " Intermediate"),
+        (" PRI", " Primary"),
+    ):
+        if up.endswith(pat):
+            s = s[: len(s) - len(pat)] + rep
+            break
+    out = s.title()
+    for k, v in (("Isd", "ISD"), ("Cisd", "CISD"), ("Stem", "STEM"), ("Jjaep", "JJAEP")):
+        out = out.replace(k, v)
+    return out
+
+
+@router.get("/catalogs/k12/states")
+async def get_k12_states(request: Request, country: str = "US"):
+    await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT state FROM k12_schools "
+            "WHERE state IS NOT NULL AND coalesce(country,'US')=$1 ORDER BY state",
+            (country or "US").upper()[:2])
+    return {"country": (country or "US").upper()[:2],
+            "states": [r["state"] for r in rows]}
+
+
+@router.get("/catalogs/k12/districts")
+async def get_k12_districts(request: Request, state: str, q: Optional[str] = None):
+    await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    st = (state or "").upper()[:2]
+    sql = ("SELECT leaid, min(district_name) AS district_name, count(*) AS schools "
+           "FROM k12_schools WHERE state=$1 AND district_name IS NOT NULL ")
+    args: list = [st]
+    if q and q.strip():
+        args.append("%" + q.strip() + "%")
+        sql += f"AND district_name ILIKE ${len(args)} "
+    sql += "GROUP BY leaid ORDER BY 2"
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    return {"state": st, "districts": [
+        {"leaid": r["leaid"],
+         "district_name": _pretty_school(r["district_name"]),
+         "schools": r["schools"]} for r in rows]}
+
+
+@router.get("/catalogs/k12/schools")
+async def get_k12_schools_in_district(request: Request, leaid: str):
+    await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT ncessch, leaid, name, address_line1, city, state, zip, phone, district_name "
+            "FROM k12_schools WHERE leaid=$1 ORDER BY name", (leaid or "").strip())
+    return {"leaid": leaid, "schools": [
+        {"ncessch": r["ncessch"], "leaid": r["leaid"],
+         "name": _pretty_school(r["name"]), "name_raw": r["name"],
+         "street": r["address_line1"], "city": (r["city"] or "").title(),
+         "state": r["state"], "zip": r["zip"], "phone": r["phone"],
+         "district_name": _pretty_school(r["district_name"])} for r in rows]}
+
+
 @router.get("/catalogs/subjects")
 async def get_subject_catalog(request: Request):
     """SCED (NCES) subject areas — canonical US K-12 subject taxonomy."""
