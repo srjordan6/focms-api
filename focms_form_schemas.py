@@ -1188,7 +1188,10 @@ class CourseItem(BaseModel):
     rigor: Optional[str] = None
     ap_exam_score: Optional[int] = None
     teacher_name: Optional[str] = None
+    teacher_id: Optional[str] = None               # v0.12.120 (teacher registry)
     teacher_email: Optional[str] = None            # v0.12.116
+    period: Optional[str] = None                   # v0.12.120 (class period)
+    school_id: Optional[str] = None                # v0.12.120 (school profile link)
     course_type: Optional[str] = None              # v0.12.116 'regular'|'private_tutoring'
     course_description: Optional[str] = None       # v0.12.116 subject/course description
     completion_award: Optional[str] = None         # v0.12.116 award/certificate of completion
@@ -1212,6 +1215,7 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
         base = ("SELECT id::text AS id, course_name, course_code, sced_code, school_name, subject, subject_other, school_year, grade_level, term, grade_received, "
                 "credit_hours, course_type, is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, "
                 "teacher_name, teacher_email, course_description, details, "
+                "period, school_id::text AS school_id, teacher_id::text AS teacher_id, "
                 "notes, admission_traits_developed, evidence_artifact_ids, "
                 "(visibility='public') AS show_on_showcase "
                 "FROM courses_taken WHERE student_id=$1::uuid AND deleted_at IS NULL ")
@@ -1248,6 +1252,9 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
          "rigor": rigor_of(r), "is_honors": r["is_honors"], "is_ap": r["is_ap"], "is_ib": r["is_ib"], "is_dual_credit": r["is_dual_credit"],
          "ap_exam_score": r["ap_exam_score"], "teacher_name": r["teacher_name"],
          "teacher_email": r["teacher_email"],
+         "teacher_id": r["teacher_id"],
+         "period": r["period"],
+         "school_id": r["school_id"],
          "course_type": r["course_type"],
          "course_description": r["course_description"] or _cdet(r).get("course_description"),
          "completion_award": _cdet(r).get("completion_award"),
@@ -2664,6 +2671,20 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                     "is_private_tutoring": (ctype == "private_tutoring"),
                 }
                 _details = {k: v for k, v in _details.items() if v is not None}
+                # v0.12.120: period + school link + teacher link
+                _period = (it.period or "").strip() or None
+                _schid = (it.school_id or "").strip()
+                if _schid:
+                    try:
+                        _uuid.UUID(_schid)
+                    except Exception:
+                        _schid = ""
+                _tchid = (it.teacher_id or "").strip()
+                if _tchid:
+                    try:
+                        _uuid.UUID(_tchid)
+                    except Exception:
+                        _tchid = ""
                 _cid = (it.id or "").strip()
                 if _cid:
                     try:
@@ -2680,7 +2701,9 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                         "ap_exam_score=$19, teacher_name=$20, teacher_email=$21, "
                         "course_description=$22, details=$23::jsonb, grade_points_4_0=$24, "
                         "grade_points_weighted=$25, notes=$26, admission_traits_developed=$27::jsonb, "
-                        "evidence_artifact_ids=$28::text[]::uuid[], updated_at=now(), updated_by=$29::uuid "
+                        "evidence_artifact_ids=$28::text[]::uuid[], "
+                        "period=$30, school_id=NULLIF($31,'')::uuid, teacher_id=NULLIF($32,'')::uuid, "
+                        "updated_at=now(), updated_by=$29::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         _cid, student_id, name, (it.course_code or None), (it.sced_code or None),
                         school, ctype, subj, (it.subject_other or None),
@@ -2690,7 +2713,8 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                         _pp_int(it.ap_exam_score), (it.teacher_name or None), (it.teacher_email or None),
                         (it.course_description or None), json.dumps(_details), gp, gpw,
                         (it.notes or None), json.dumps(_pp_skills(it.skills)),
-                        _pp_artifacts(it.artifact_ids), user_id)
+                        _pp_artifacts(it.artifact_ids), user_id,
+                        _period, _schid, _tchid)
                     if it.skills:
                         await _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
                                                           _cid, it.skills)
@@ -2701,10 +2725,12 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                     "course_type, subject, subject_other, grade_level, school_year, term, credit_hours, grade_received, "
                     "is_honors, is_ap, is_ib, is_dual_credit, ap_exam_score, teacher_name, teacher_email, "
                     "course_description, details, "
+                    "period, school_id, teacher_id, "
                     "grade_points_4_0, grade_points_weighted, notes, admission_traits_developed, "
                     "evidence_artifact_ids, source_system, created_by, updated_by) "
                     "VALUES ($1::uuid,$2::uuid,$3,$25,$26,$4,$5,$6,$24,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$27,"
                     "$28,$29::jsonb,"
+                    "$30,NULLIF($31,'')::uuid,NULLIF($32,'')::uuid,"
                     "$18,$19,$20,$21::jsonb,$22::text[]::uuid[],'parent_portal',$23::uuid,$23::uuid)",
                     tenant_id, student_id, name, school, ctype, subj,
                     _pp_int(it.grade_level), (it.school_year or None), (it.term or None),
@@ -2715,7 +2741,8 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                     _pp_artifacts(it.artifact_ids), user_id, (it.subject_other or None),
                     (it.course_code or None), (it.sced_code or None),
                     (it.teacher_email or None), (it.course_description or None),
-                    json.dumps(_details))
+                    json.dumps(_details),
+                    _period, _schid, _tchid)
                 # v0.12.116: universal skills-gained - mirror course skills into
                 # student_skills so EVERY course (academic or tutoring) feeds the
                 # skill inventory and the meta-skill inference engine.
