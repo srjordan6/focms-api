@@ -6038,6 +6038,18 @@ class ReportCardSubject(BaseModel):
     grade: Optional[str] = None
     numeric_grade: Optional[float] = None
     comment: Optional[str] = None
+    # v0.12.124: the real district report-card shape. These were being silently
+    # dropped by Pydantic, so a saved card came back with course names only.
+    course_code: Optional[str] = None
+    period: Optional[str] = None
+    teacher: Optional[str] = None
+    q1: Optional[str] = None
+    q2: Optional[str] = None
+    sem1: Optional[str] = None
+    q3: Optional[str] = None
+    q4: Optional[str] = None
+    sem2: Optional[str] = None
+    fin: Optional[str] = None
 
 
 class ReportCardItem(BaseModel):
