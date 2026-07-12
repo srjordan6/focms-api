@@ -5818,6 +5818,73 @@ class SchoolProfilesRequest(BaseModel):
     delete_ids: List[str] = []
 
 
+@router.post("/student/{student_id}/report-card-parse")
+async def report_card_parse(request: Request, student_id: str, body: dict):
+    """v0.12.123: paste a report card (text copied from the school portal, or an
+    email) and get back structured rows to review. NOTHING is saved here - the
+    parent sees the parsed rows in the form and presses Save themselves."""
+    await _pp_context(request, student_id)
+    text = (body or {}).get("text") or ""
+    text = str(text).strip()[:20000]
+    if len(text) < 20:
+        raise HTTPException(400, {"error": "empty", "message": "Paste the report card text first."})
+    system = (
+        "You extract report-card data from text a parent pasted from a school portal. "
+        "Respond ONLY with JSON - no prose, no code fences. Schema: "
+        '{"school_year": str|null, "term": str|null, "grade_level": int|null, '
+        '"gpa_unweighted": number|null, "gpa_weighted": number|null, '
+        '"days_present": int|null, "days_absent": int|null, "days_tardy": int|null, '
+        '"teacher_comments": str|null, '
+        '"subjects": [{"subject": str, "period": str|null, "teacher": str|null, '
+        '"mp1": str|null, "mp2": str|null, "exam": str|null, "grade": str|null}]}. '
+        "Rules: `subject` is the course name exactly as written. Keep grades as written "
+        "(numeric like 94, or letter like A-). If the card shows two marking periods in a "
+        "semester, put them in mp1 and mp2 and leave `grade` as the semester average if one "
+        "is printed. If only a single grade per course is shown, put it in `grade` and leave "
+        "mp1/mp2/exam null. `term` should be one of: Full year, Semester 1, Semester 2, "
+        "Quarter 1, Quarter 2, Quarter 3, Quarter 4, Trimester 1, Trimester 2, Trimester 3, "
+        "Summer, Summer I, Summer II - pick the closest, else null. "
+        "Never invent a course, a grade, or a teacher that is not in the text."
+    )
+    res = await _llm_complete(system, "REPORT CARD TEXT:\n" + text, max_tokens=2200, want_json=True)
+    if res.get("unavailable"):
+        raise HTTPException(503, {"error": "llm_unavailable",
+                                  "message": "The reader is unavailable right now - enter the grades manually."})
+    data = _extract_json(res.get("text", "")) or {}
+    subs = []
+    for s in (data.get("subjects") or [])[:30]:
+        if not isinstance(s, dict):
+            continue
+        name = str(s.get("subject") or "").strip()
+        if not name:
+            continue
+        def _v(k):
+            v = s.get(k)
+            v = "" if v is None else str(v).strip()
+            return v or None
+        subs.append({"subject": name[:200], "period": _v("period"), "teacher": _v("teacher"),
+                     "mp1": _v("mp1"), "mp2": _v("mp2"), "exam": _v("exam"), "grade": _v("grade")})
+    if not subs:
+        raise HTTPException(422, {"error": "no_subjects",
+                                  "message": "No courses were found in that text. Check the paste, or enter the grades manually."})
+    def _num(k):
+        v = data.get(k)
+        return v if isinstance(v, (int, float)) else None
+    return {
+        "school_year": (str(data.get("school_year")).strip() if data.get("school_year") else None),
+        "term": (str(data.get("term")).strip() if data.get("term") else None),
+        "grade_level": data.get("grade_level") if isinstance(data.get("grade_level"), int) else None,
+        "gpa_unweighted": _num("gpa_unweighted"),
+        "gpa_weighted": _num("gpa_weighted"),
+        "days_present": _num("days_present"),
+        "days_absent": _num("days_absent"),
+        "days_tardy": _num("days_tardy"),
+        "teacher_comments": (str(data.get("teacher_comments")).strip()[:2000]
+                             if data.get("teacher_comments") else None),
+        "subjects": subs,
+    }
+
+
 @router.get("/student/{student_id}/school-profiles")
 async def get_school_profiles(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
