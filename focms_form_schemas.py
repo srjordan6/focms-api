@@ -6082,6 +6082,8 @@ class YearRecordItem(BaseModel):
     school_year: str
     school_id: Optional[str] = None
     school_name: Optional[str] = None
+    homeroom_teacher_id: Optional[str] = None      # v0.12.119
+    homeroom_teacher_name: Optional[str] = None    # v0.12.119
     is_full_year: Optional[bool] = None
     attendance_from: Optional[str] = None
     attendance_to: Optional[str] = None
@@ -6109,7 +6111,9 @@ async def get_year_records(request: Request, student_id: str,
         if grade_level is not None:
             rows = await conn.fetch(
                 "SELECT id::text AS id, grade_level, school_year, "
-                "school_id::text AS school_id, school_name, is_full_year, "
+                "school_id::text AS school_id, school_name, "
+                "homeroom_teacher_id::text AS homeroom_teacher_id, homeroom_teacher_name, "
+                "is_full_year, "
                 "attendance_from, attendance_to, gpa_unweighted, gpa_weighted, "
                 "days_present, days_absent, days_tardy, notes, public_description, "
                 "(visibility='public') AS show_on_showcase "
@@ -6120,7 +6124,9 @@ async def get_year_records(request: Request, student_id: str,
         else:
             rows = await conn.fetch(
                 "SELECT id::text AS id, grade_level, school_year, "
-                "school_id::text AS school_id, school_name, is_full_year, "
+                "school_id::text AS school_id, school_name, "
+                "homeroom_teacher_id::text AS homeroom_teacher_id, homeroom_teacher_name, "
+                "is_full_year, "
                 "attendance_from, attendance_to, gpa_unweighted, gpa_weighted, "
                 "days_present, days_absent, days_tardy, notes, public_description, "
                 "(visibility='public') AS show_on_showcase "
@@ -6160,22 +6166,34 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
                     continue
                 sy = (it.school_year or "").strip()
                 if not sy: continue
+                # v0.12.119: parse dates (asyncpg treats $n::date as a date param,
+                # so a raw string 500s), and carry the homeroom teacher.
+                _af = _pp_parse_date(it.attendance_from)
+                _at = _pp_parse_date(it.attendance_to)
+                _htid = (it.homeroom_teacher_id or "").strip()
+                if _htid:
+                    try:
+                        _uuid.UUID(_htid)
+                    except Exception:
+                        _htid = ""
                 if it.id:
                     try: _uuid.UUID(it.id)
                     except Exception: continue
                     r = await conn.execute(
                         "UPDATE student_year_records SET grade_level=$3, school_year=$4, "
                         "school_id=NULLIF($5,'')::uuid, school_name=$6, is_full_year=$7, "
-                        "attendance_from=$8::date, attendance_to=$9::date, "
+                        "attendance_from=$8, attendance_to=$9, "
                         "gpa_unweighted=$10, gpa_weighted=$11, days_present=$12, "
                         "days_absent=$13, days_tardy=$14, notes=$15, "
-                        "public_description=$16, updated_at=now(), updated_by=$17::uuid "
+                        "public_description=$16, "
+                        "homeroom_teacher_id=NULLIF($18,'')::uuid, homeroom_teacher_name=$19, "
+                        "updated_at=now(), updated_by=$17::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, it.grade_level, sy, it.school_id or '',
-                        it.school_name, it.is_full_year, it.attendance_from,
-                        it.attendance_to, it.gpa_unweighted, it.gpa_weighted,
+                        it.school_name, it.is_full_year, _af,
+                        _at, it.gpa_unweighted, it.gpa_weighted,
                         it.days_present, it.days_absent, it.days_tardy, it.notes,
-                        it.public_description, user_id, it.job_description)
+                        it.public_description, user_id, _htid, it.homeroom_teacher_name)
                     if r and r.endswith(" 1"):
                         if it.show_on_showcase is True:
                             await conn.execute(
@@ -6192,15 +6210,17 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
                         "grade_level, school_year, school_id, school_name, is_full_year, "
                         "attendance_from, attendance_to, gpa_unweighted, gpa_weighted, "
                         "days_present, days_absent, days_tardy, notes, public_description, "
+                        "homeroom_teacher_id, homeroom_teacher_name, "
                         "visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3,$4,NULLIF($5,'')::uuid,$6,$7,"
-                        "$8::date,$9::date,$10,$11,$12,$13,$14,$15,$16,"
+                        "$8,$9,$10,$11,$12,$13,$14,$15,$16,"
+                        "NULLIF($18,'')::uuid,$19,"
                         "'private','parent_portal',$17::uuid,$17::uuid) RETURNING id",
                         tenant_id, student_id, it.grade_level, sy, it.school_id or '',
-                        it.school_name, it.is_full_year, it.attendance_from,
-                        it.attendance_to, it.gpa_unweighted, it.gpa_weighted,
+                        it.school_name, it.is_full_year, _af,
+                        _at, it.gpa_unweighted, it.gpa_weighted,
                         it.days_present, it.days_absent, it.days_tardy, it.notes,
-                        it.public_description, user_id)
+                        it.public_description, user_id, _htid, it.homeroom_teacher_name)
                     if it.show_on_showcase is True:
                         await conn.execute(
                             "UPDATE student_year_records SET visibility='public' "
