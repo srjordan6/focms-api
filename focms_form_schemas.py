@@ -85,7 +85,7 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 log = logging.getLogger("focms-form-schemas")
 router = APIRouter(prefix="/focms/v1", tags=["form-schemas"])
@@ -1173,6 +1173,10 @@ _RIGOR = {"regular", "honors", "ap", "ib", "dual"}
 
 
 class CourseItem(BaseModel):
+    # v0.12.126: extra="forbid" - an unknown field is now a loud 422 instead of a
+    # silent drop. Silent drops destroyed real report-card data (see v0.12.124).
+    model_config = ConfigDict(extra="forbid")
+
     id: Optional[str] = None                       # v0.12.116 (upsert mode)
     course_name: Optional[str] = None
     course_code: Optional[str] = None
@@ -1186,6 +1190,14 @@ class CourseItem(BaseModel):
     grade_received: Optional[str] = None
     credit_hours: Optional[float] = None
     rigor: Optional[str] = None
+    # v0.12.126: the course form sends these checkboxes; they were being silently
+    # dropped, so ticking AP / Honors / IB / Dual Credit did nothing at all.
+    is_honors: Optional[bool] = None
+    is_ap: Optional[bool] = None
+    is_ib: Optional[bool] = None
+    is_dual_credit: Optional[bool] = None
+    grade_points_4_0: Optional[float] = None
+    grade_points_weighted: Optional[float] = None
     ap_exam_score: Optional[int] = None
     teacher_name: Optional[str] = None
     teacher_id: Optional[str] = None               # v0.12.120 (teacher registry)
@@ -1198,6 +1210,12 @@ class CourseItem(BaseModel):
     notes: Optional[str] = None
     skills: list[str] = Field(default_factory=list)
     artifact_ids: list[str] = Field(default_factory=list)
+    # v0.12.126: the form also posts these; declare them so extra="forbid" does not
+    # reject a legitimate save. show_on_showcase is handled by the visibility flag;
+    # skills_gained_custom is a UI scratch field.
+    show_on_showcase: Optional[bool] = None
+    skills_gained: list[str] = Field(default_factory=list)
+    skills_gained_custom: Optional[str] = None
 
 
 class CoursesRequest(BaseModel):
@@ -2655,6 +2673,16 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 rigor = (it.rigor or "regular").lower()
                 if rigor not in _RIGOR:
                     rigor = "regular"
+                # v0.12.126: the form's AP / IB / Dual / Honors checkboxes are the
+                # source of truth when they are ticked - they were being ignored.
+                if it.is_ap:
+                    rigor = "ap"
+                elif it.is_ib:
+                    rigor = "ib"
+                elif it.is_dual_credit:
+                    rigor = "dual"
+                elif it.is_honors:
+                    rigor = "honors"
                 # v0.12.116: course_type is the record TYPE (regular vs private_tutoring),
                 # not the rigor. Rigor lives in the is_* booleans + details.rigor.
                 ctype = (it.course_type or "regular").strip().lower()
@@ -6037,6 +6065,8 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
 # ---- Report cards ----
 
 class ReportCardSubject(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # v0.12.126: never silently drop again
+
     subject: str
     grade: Optional[str] = None
     numeric_grade: Optional[float] = None
@@ -6056,8 +6086,11 @@ class ReportCardSubject(BaseModel):
 
 
 class ReportCardItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")   # v0.12.126
+
     id: Optional[str] = None
     school_name: Optional[str] = None
+    school_id: Optional[str] = None             # v0.12.126 (school picker)
     school_year: str
     grade_level: int
     period_kind: str
@@ -6434,7 +6467,9 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
 
 class TeacherItem(BaseModel):
     id: Optional[str] = None
-    teacher_name: str
+    teacher_name: Optional[str] = None             # v0.12.127: derived from first+last
+    first_name: Optional[str] = None               # v0.12.127
+    last_name: Optional[str] = None                # v0.12.127
     role: Optional[str] = None                     # v0.12.121 'teacher' | 'counselor'
     school_name: Optional[str] = None
     school_leaid: Optional[str] = None
@@ -6460,7 +6495,8 @@ async def get_teachers(request: Request, student_id: str, role: Optional[str] = 
     Pass ?role=counselor to list counselors only; omit for everyone."""
     tenant_id, _ = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
-    sql = ("SELECT id::text AS id, teacher_name, role, school_name, school_leaid, "
+    sql = ("SELECT id::text AS id, teacher_name, first_name, last_name, role, "
+           "school_name, school_leaid, "
            "street_address, city_town, state_province, zip_postal_code, "
            "school_phone, teacher_email, subject_taught, title_position, notes "
            "FROM teachers WHERE (student_id=$1::uuid OR student_id IS NULL) "
@@ -6469,7 +6505,11 @@ async def get_teachers(request: Request, student_id: str, role: Optional[str] = 
     if role in ("teacher", "counselor"):
         args.append(role)
         sql += f"AND coalesce(role,'teacher')=${len(args)} "
-    sql += "ORDER BY teacher_name"
+    # v0.12.127: alphabetical by last name (fall back to the last word of the
+    # full name for any record that predates the split).
+    sql += ("ORDER BY lower(coalesce(nullif(last_name,''), "
+            "split_part(teacher_name, ' ', array_length(string_to_array(teacher_name,' '),1)))), "
+            "lower(coalesce(first_name, teacher_name))")
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(sql, *args)
     return {"student_id": student_id, "teachers": [dict(r) for r in rows]}
@@ -6494,8 +6534,16 @@ async def post_teachers(request: Request, student_id: str, body: TeachersRequest
                     did, user_id)
                 if r and r.endswith(" 1"): deleted += 1
             for it in body.items or []:
-                nm = (it.teacher_name or "").strip()
+                # v0.12.127: first + last are the source of truth; teacher_name is
+                # the derived display value (kept because courses reference it).
+                _fn = (it.first_name or "").strip()
+                _ln = (it.last_name or "").strip()
+                nm = (" ".join(p for p in (_fn, _ln) if p)).strip() or (it.teacher_name or "").strip()
                 if not nm: continue
+                if not _fn and not _ln and nm:
+                    parts = nm.split()
+                    _fn = parts[0]
+                    _ln = " ".join(parts[1:]) if len(parts) > 1 else ""
                 _role = (it.role or "teacher").strip().lower()
                 if _role not in ("teacher", "counselor"):
                     _role = "teacher"
@@ -6507,26 +6555,30 @@ async def post_teachers(request: Request, student_id: str, body: TeachersRequest
                         "school_leaid=$4, street_address=$5, city_town=$6, "
                         "state_province=$7, zip_postal_code=$8, school_phone=$9, "
                         "teacher_email=$10, subject_taught=$11, title_position=$12, "
-                        "notes=$13, role=$15, updated_at=now(), updated_by=$14::uuid "
+                        "notes=$13, role=$15, first_name=$16, last_name=$17, "
+                        "updated_at=now(), updated_by=$14::uuid "
                         "WHERE id=$1::uuid AND deleted_at IS NULL",
                         it.id, nm, it.school_name, it.school_leaid, it.street_address,
                         it.city_town, it.state_province, it.zip_postal_code,
                         it.school_phone, it.teacher_email, it.subject_taught,
-                        it.title_position, it.notes, user_id, _role)
+                        it.title_position, it.notes, user_id, _role,
+                        (_fn or None), (_ln or None))
                     if r and r.endswith(" 1"): updated += 1
                 else:
                     await conn.execute(
                         "INSERT INTO teachers (tenant_id, student_id, teacher_name, "
+                        "first_name, last_name, "
                         "school_name, school_leaid, street_address, city_town, "
                         "state_province, zip_postal_code, school_phone, teacher_email, "
                         "subject_taught, title_position, notes, role, source_system, "
                         "created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
+                        "VALUES ($1::uuid,$2::uuid,$3,$17,$18,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
                         "$14,$16,'parent_portal',$15::uuid,$15::uuid)",
                         tenant_id, student_id, nm, it.school_name, it.school_leaid,
                         it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.school_phone, it.teacher_email,
-                        it.subject_taught, it.title_position, it.notes, user_id, _role)
+                        it.subject_taught, it.title_position, it.notes, user_id, _role,
+                        (_fn or None), (_ln or None))
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
