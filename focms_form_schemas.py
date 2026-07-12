@@ -6076,12 +6076,22 @@ async def post_report_cards(request: Request, student_id: str, body: ReportCards
 # ======================================================================
 
 
+class YearTeacherItem(BaseModel):
+    """v0.12.119: a teacher for one grade year. Elementary students commonly have
+    two or more (e.g. one for ELA/Social Studies, one for Math/Science)."""
+    teacher_id: Optional[str] = None
+    teacher_name: Optional[str] = None
+    subject_taught: Optional[str] = None
+    is_homeroom: Optional[bool] = False
+
+
 class YearRecordItem(BaseModel):
     id: Optional[str] = None
     grade_level: int
     school_year: str
     school_id: Optional[str] = None
     school_name: Optional[str] = None
+    teachers: List[YearTeacherItem] = []            # v0.12.119
     homeroom_teacher_id: Optional[str] = None      # v0.12.119
     homeroom_teacher_name: Optional[str] = None    # v0.12.119
     is_full_year: Optional[bool] = None
@@ -6142,7 +6152,59 @@ async def get_year_records(request: Request, student_id: str,
         for k in ("gpa_unweighted", "gpa_weighted"):
             d[k] = float(d[k]) if d[k] is not None else None
         out.append(d)
+    # v0.12.119: attach the teacher list for each year (multi-teacher years are
+    # the norm in elementary - e.g. one teacher for ELA, another for Math).
+    if out:
+        async with _tenant_conn(pool, tenant_id) as conn2:
+            trows = await conn2.fetch(
+                "SELECT year_record_id::text AS year_record_id, id::text AS id, "
+                "teacher_id::text AS teacher_id, teacher_name, subject_taught, is_homeroom "
+                "FROM student_year_teachers "
+                "WHERE student_id=$1::uuid AND deleted_at IS NULL "
+                "ORDER BY is_homeroom DESC, subject_taught NULLS LAST", student_id)
+        by_year: dict = {}
+        for t in trows:
+            by_year.setdefault(t["year_record_id"], []).append({
+                "id": t["id"], "teacher_id": t["teacher_id"],
+                "teacher_name": t["teacher_name"],
+                "subject_taught": t["subject_taught"],
+                "is_homeroom": t["is_homeroom"]})
+        for d in out:
+            d["teachers"] = by_year.get(d["id"], [])
     return {"student_id": student_id, "years": out}
+
+
+async def _save_year_teachers(conn, tenant_id, student_id, user_id, year_record_id, teachers):
+    """v0.12.119: replace the teacher list for one grade year. Elementary years
+    routinely have two or more teachers (ELA/Social Studies + Math/Science), so
+    this is a child list rather than a single column. The teacher's NAME is
+    denormalized alongside the id, so the year still reads correctly if the
+    teacher is later removed from the registry."""
+    if teachers is None:
+        return
+    await conn.execute(
+        "UPDATE student_year_teachers SET deleted_at=now(), deleted_by=$3::uuid "
+        "WHERE year_record_id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+        year_record_id, student_id, user_id)
+    for t in teachers:
+        tid = (t.teacher_id or "").strip()
+        if tid:
+            try:
+                _uuid.UUID(tid)
+            except Exception:
+                tid = ""
+        name = (t.teacher_name or "").strip()
+        subject = (t.subject_taught or "").strip()
+        if not tid and not name:
+            continue
+        await conn.execute(
+            "INSERT INTO student_year_teachers (tenant_id, student_id, year_record_id, "
+            "teacher_id, teacher_name, subject_taught, is_homeroom, "
+            "source_system, created_by, updated_by) "
+            "VALUES ($1::uuid,$2::uuid,$3::uuid,NULLIF($4,'')::uuid,$5,$6,$7,"
+            "'parent_portal',$8::uuid,$8::uuid)",
+            tenant_id, student_id, year_record_id, tid, (name or None),
+            (subject or None), bool(t.is_homeroom), user_id)
 
 
 @router.post("/student/{student_id}/year-records")
@@ -6195,6 +6257,7 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
                         it.days_present, it.days_absent, it.days_tardy, it.notes,
                         it.public_description, user_id, _htid, it.homeroom_teacher_name)
                     if r and r.endswith(" 1"):
+                        await _save_year_teachers(conn, tenant_id, student_id, user_id, it.id, it.teachers)
                         if it.show_on_showcase is True:
                             await conn.execute(
                                 "UPDATE student_year_records SET visibility='public' "
@@ -6221,6 +6284,7 @@ async def post_year_records(request: Request, student_id: str, body: YearRecords
                         _at, it.gpa_unweighted, it.gpa_weighted,
                         it.days_present, it.days_absent, it.days_tardy, it.notes,
                         it.public_description, user_id, _htid, it.homeroom_teacher_name)
+                    await _save_year_teachers(conn, tenant_id, student_id, user_id, str(rid), it.teachers)
                     if it.show_on_showcase is True:
                         await conn.execute(
                             "UPDATE student_year_records SET visibility='public' "
