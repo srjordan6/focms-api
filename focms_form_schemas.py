@@ -5785,6 +5785,7 @@ class SchoolProfileItem(BaseModel):
     district_leaid: Optional[str] = None           # v0.12.122 (NCES district)
     district_name: Optional[str] = None            # v0.12.122
     student_school_id: Optional[str] = None        # v0.12.122 district-assigned student ID
+    state_student_id: Optional[str] = None         # v0.12.125 state ID (TX TSDS/STAAR). INTERNAL - never shown.
     school_ceeb_code: Optional[str] = None
     ceeb_code: Optional[str] = None
     school_type: Optional[str] = None
@@ -5983,6 +5984,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "district_leaid=COALESCE($32, district_leaid), "
                         "district_name=COALESCE($33, district_name), "
                         "student_school_id=COALESCE($34, student_school_id), "
+                        "state_student_id=COALESCE($35, state_student_id), "
                         "updated_at=now(), updated_by=$30::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, name, it.school_ceeb_code, it.ceeb_code,
@@ -5994,7 +5996,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         caf, it.courses_available_notes, it.graduating_class_size,
                         it.boarding_students, it.curriculum_notes, it.notes, user_id,
                         it.school_leaid, it.district_leaid, it.district_name,
-                        it.student_school_id)
+                        it.student_school_id, it.state_student_id)
                     if r and r.endswith(" 1"): updated += 1
                 else:
                     if it.is_current_school:
@@ -6005,6 +6007,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "INSERT INTO student_school_enrollments (tenant_id, student_id, "
                         "school_name, school_leaid, district_leaid, district_name, "
                         "student_school_id, "
+                        "state_student_id, "
                         "school_ceeb_code, ceeb_code, school_type, "
                         "street_address, city_town, state_province, zip_postal_code, "
                         "country, counselor_name, counselor_position, counselor_phone, "
@@ -6014,7 +6017,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "courses_available_flags, courses_available_notes, "
                         "graduating_class_size, boarding_students, curriculum_notes, notes, "
                         "visibility, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$31,$32,$33,$34,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,"
+                        "VALUES ($1::uuid,$2::uuid,$3,$31,$32,$33,$34,$35,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,"
                         "$15,$16,$17,$18::date,$19::date,$20,$21,$22,$23,$24::jsonb,$25,"
                         "$26,$27,$28,$29,'private','parent_portal',$30::uuid,$30::uuid)",
                         tenant_id, student_id, name, it.school_ceeb_code, it.ceeb_code,
@@ -6026,7 +6029,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         caf, it.courses_available_notes, it.graduating_class_size,
                         it.boarding_students, it.curriculum_notes, it.notes, user_id,
                         it.school_leaid, it.district_leaid, it.district_name,
-                        it.student_school_id)
+                        it.student_school_id, it.state_student_id)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
@@ -6483,10 +6486,12 @@ async def post_teachers(request: Request, student_id: str, body: TeachersRequest
             for did in body.delete_ids or []:
                 try: _uuid.UUID(did)
                 except Exception: continue
+                # v0.12.125 fix: $2 was bound but never referenced, so Postgres
+                # could not infer its type and every delete threw a 500.
                 r = await conn.execute(
-                    "UPDATE teachers SET deleted_at=now(), deleted_by=$3::uuid "
+                    "UPDATE teachers SET deleted_at=now(), deleted_by=$2::uuid "
                     "WHERE id=$1::uuid AND deleted_at IS NULL",
-                    did, student_id, user_id)
+                    did, user_id)
                 if r and r.endswith(" 1"): deleted += 1
             for it in body.items or []:
                 nm = (it.teacher_name or "").strip()
