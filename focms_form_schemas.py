@@ -5754,6 +5754,7 @@ async def get_current_school(request: Request, student_id: str):
 class SchoolProfileItem(BaseModel):
     id: Optional[str] = None
     school_name: str
+    school_leaid: Optional[str] = None
     school_ceeb_code: Optional[str] = None
     ceeb_code: Optional[str] = None
     school_type: Optional[str] = None
@@ -5793,7 +5794,7 @@ async def get_school_profiles(request: Request, student_id: str):
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
-            "SELECT id::text AS id, school_name, school_ceeb_code, ceeb_code, "
+            "SELECT id::text AS id, school_name, school_leaid, school_ceeb_code, ceeb_code, "
             "school_type, street_address, city_town, state_province, "
             "zip_postal_code, country, counselor_name, counselor_position, "
             "counselor_phone, counselor_email, counselor_fax, "
@@ -5841,6 +5842,11 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                 name = (it.school_name or "").strip()
                 if not name: continue
                 caf = _json.dumps(it.courses_available_flags) if it.courses_available_flags else None
+                # v0.12.118 fix: asyncpg infers $n::date as a date parameter, so a
+                # plain 'YYYY-MM-DD' string raises "'str' object has no attribute
+                # 'toordinal'" (500). Parse to real date objects before binding.
+                _sd = _pp_parse_date(it.start_date)
+                _ed = _pp_parse_date(it.end_date)
                 if it.id:
                     try: _uuid.UUID(it.id)
                     except Exception: continue
@@ -5861,16 +5867,18 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "courses_available_flags=$24::jsonb, courses_available_notes=$25, "
                         "graduating_class_size=$26, boarding_students=$27, "
                         "curriculum_notes=$28, notes=$29, "
+                        "school_leaid=COALESCE($31, school_leaid), "
                         "updated_at=now(), updated_by=$30::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, name, it.school_ceeb_code, it.ceeb_code,
                         it.school_type, it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.country, it.counselor_name, it.counselor_position,
                         it.counselor_phone, it.counselor_email, it.counselor_fax,
-                        (it.is_current_school or False), it.start_date, it.end_date, it.grade_levels_attended,
+                        (it.is_current_school or False), _sd, _ed, it.grade_levels_attended,
                         it.grading_scale, it.max_grade_offered, it.schedule_type,
                         caf, it.courses_available_notes, it.graduating_class_size,
-                        it.boarding_students, it.curriculum_notes, it.notes, user_id)
+                        it.boarding_students, it.curriculum_notes, it.notes, user_id,
+                        it.school_leaid)
                     if r and r.endswith(" 1"): updated += 1
                 else:
                     if it.is_current_school:
@@ -5879,7 +5887,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                             "WHERE student_id=$1::uuid AND deleted_at IS NULL", student_id)
                     await conn.execute(
                         "INSERT INTO student_school_enrollments (tenant_id, student_id, "
-                        "school_name, school_ceeb_code, ceeb_code, school_type, "
+                        "school_name, school_leaid, school_ceeb_code, ceeb_code, school_type, "
                         "street_address, city_town, state_province, zip_postal_code, "
                         "country, counselor_name, counselor_position, counselor_phone, "
                         "counselor_email, counselor_fax, is_current_school, "
@@ -5888,17 +5896,18 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "courses_available_flags, courses_available_notes, "
                         "graduating_class_size, boarding_students, curriculum_notes, notes, "
                         "visibility, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,"
+                        "VALUES ($1::uuid,$2::uuid,$3,$31,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,"
                         "$15,$16,$17,$18::date,$19::date,$20,$21,$22,$23,$24::jsonb,$25,"
                         "$26,$27,$28,$29,'private','parent_portal',$30::uuid,$30::uuid)",
                         tenant_id, student_id, name, it.school_ceeb_code, it.ceeb_code,
                         it.school_type, it.street_address, it.city_town, it.state_province,
                         it.zip_postal_code, it.country, it.counselor_name, it.counselor_position,
                         it.counselor_phone, it.counselor_email, it.counselor_fax,
-                        (it.is_current_school or False), it.start_date, it.end_date, it.grade_levels_attended,
+                        (it.is_current_school or False), _sd, _ed, it.grade_levels_attended,
                         it.grading_scale, it.max_grade_offered, it.schedule_type,
                         caf, it.courses_available_notes, it.graduating_class_size,
-                        it.boarding_students, it.curriculum_notes, it.notes, user_id)
+                        it.boarding_students, it.curriculum_notes, it.notes, user_id,
+                        it.school_leaid)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
