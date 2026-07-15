@@ -703,6 +703,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             }
             if not one_time:
                 form.update(_storage_item(0))
+        form["allow_promotion_codes"] = "true"  # v0.12.128 (2026-07-15): enables friend/beta invite codes at signup checkout
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.post("https://api.stripe.com/v1/checkout/sessions",
                                   headers={"Authorization": f"Bearer {api_key}"}, data=form)
@@ -1142,6 +1143,7 @@ async def billing_session(body: BillingSessionRequest, request: Request) -> dict
     if principal.get("stripe_customer_id"):
         form["customer"] = principal["stripe_customer_id"]
         form.pop("customer_email", None)
+    form["allow_promotion_codes"] = "true"  # v0.12.128 (2026-07-15): enables promo codes on storage add-on checkouts from within portal
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post("https://api.stripe.com/v1/checkout/sessions",
                               headers={"Authorization": f"Bearer {api_key}"}, data=form)
