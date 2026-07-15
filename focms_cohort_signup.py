@@ -1931,11 +1931,10 @@ async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
 
 
 async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
-    api_key = os.environ.get("RESEND_API_KEY")
-    if not api_key:
-        log.warning("RESEND_API_KEY not set; welcome email to %s skipped", to_email)
-        return
-    sender = os.environ.get("EMAIL_FROM", "outcomestar <onboarding@resend.dev>")
+    """v0.12.129 (2026-07-15): route through unified _send_email so Gmail SMTP
+    is used when configured (previously hard-coded Resend only, silently
+    skipping when RESEND_API_KEY was absent - the reason welcome emails were
+    missing while verification/reset emails worked fine)."""
     html = (
         '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
         '<h2 style="color:#201868">Welcome to outcomestar, ' + display_name + '</h2>'
@@ -1946,10 +1945,4 @@ async def _send_welcome_email(to_email: str, display_name: str, token: str) -> N
         'border-radius:8px;text-decoration:none;font-weight:bold">Open the parent portal</a></p>'
         '<p style="color:#7A8A9E;font-size:12px">Also confirm the verification emails we just sent.</p></div>'
     )
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post("https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {api_key}"},
-            json={"from": sender, "to": [to_email],
-                  "subject": "Welcome to outcomestar - your portal access", "html": html})
-        if r.status_code >= 300:
-            log.warning("welcome send failed %s: %s", r.status_code, r.text[:200])
+    await _send_email(to_email, "Welcome to outcomestar - your portal access", html)
