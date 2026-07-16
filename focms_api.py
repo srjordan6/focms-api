@@ -1,5 +1,17 @@
-﻿from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.3
+from fastapi.middleware.cors import CORSMiddleware
+"""focms_api.py - FOCMS Data Provider REST API v0.12.134
+
+v0.12.134 (2026-07-15):
+- New GET /focms/v1/student/{id}/computed/imx-imr: USA Swimming IMX (IM
+  Xtreme) and IMR (IM Ready) scores, computed on read for ANY competitive
+  swimmer from personal_records swim_best power points against the fixed
+  age-group event sets (authoritative per usaswimming.org/Times/IMX-IMR +
+  swimstandards.com/imx, verified 2026-07-15). Returns IMX + IMR, each SCY +
+  LCM, with per-event present/points/in_season, plus lifetime_total and
+  season_total (season = Sep 1-Aug 31; official IMX/IMR uses in-season bests).
+  Age group derived from birth_date (<=10 / 11-12 / 13-18). IMX 13-18 is the
+  6-event set (adds 400 IM). Settles the prior 11-12 discrepancy: 11-12 IMX
+  ends in 200 IM, NOT 400 IM.
 
 v0.12.3 (2026-07-05):
 - HOTFIX for v0.12.2: focms_form_schemas calls authenticate() directly and
@@ -195,6 +207,7 @@ Read endpoints:
     GET    /focms/v1/student/{student_id}/records?type=type
     GET    /focms/v1/student/{student_id}/target-universities
     GET    /focms/v1/student/{student_id}/computed/power-index
+    GET    /focms/v1/student/{student_id}/computed/imx-imr               [NEW v0.12.134]
     GET    /focms/v1/student/{student_id}/computed/swim-bests
     GET    /focms/v1/student/{student_id}/computed/swim-race-log
 
@@ -769,7 +782,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.12.3", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.134", lifespan=lifespan)
+
+
+@app.get("/focms/v1/livez")
+async def livez() -> dict[str, str]:
+    # Liveness probe for Render's health check. ZERO dependencies (no DB, no R2)
+    # so a contended DB pool or a slow R2 response can never push it past
+    # Render's 5s health-check timeout and trigger an instance recycle. The rich
+    # diagnostic check (crypto + storage) stays at /focms/v1/health for manual
+    # use. After deploy, set the Render service Health Check Path to
+    # /focms/v1/livez.
+    return {"status": "ok"}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -1297,6 +1323,167 @@ async def get_power_index(
             ),
             "computed_at": datetime.now(timezone.utc).isoformat(),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# IMX / IMR (USA Swimming IM Xtreme / IM Ready) - computed on read
+# ---------------------------------------------------------------------------
+# Authoritative event sets per usaswimming.org/Times/IMX-IMR and
+# swimstandards.com/imx (verified 2026-07-15). Each program scores a swimmer
+# against a fixed event set using USA Swimming Single-Age Power Points, summed
+# across the set, best time in the current season (Sep 1 - Aug 31), all in one
+# course (SCY or LCM). IMR (short distances) is the developmental program; IMX
+# (long distances) is the elite program. IMX 13-18 is a 6-event set (adds
+# 400 IM); all others are 5 events. Event labels match personal_records
+# swim_best title format ("<distance> <Stroke>", e.g. "200 IM", "500 Free").
+IMX_IMR_EVENT_SETS = {
+    "IMR": {
+        "10_under": {
+            "SCY": ["100 Free", "50 Back", "50 Breast", "50 Fly", "100 IM"],
+            "LCM": ["100 Free", "50 Back", "50 Breast", "50 Fly", "200 IM"],
+        },
+        "11_12": {
+            "SCY": ["200 Free", "50 Back", "50 Breast", "50 Fly", "100 IM"],
+            "LCM": ["200 Free", "50 Back", "50 Breast", "50 Fly", "200 IM"],
+        },
+        "13_18": {
+            "SCY": ["200 Free", "100 Back", "100 Breast", "100 Fly", "200 IM"],
+            "LCM": ["200 Free", "100 Back", "100 Breast", "100 Fly", "200 IM"],
+        },
+    },
+    "IMX": {
+        "10_under": {
+            "SCY": ["200 Free", "100 Back", "100 Breast", "100 Fly", "200 IM"],
+            "LCM": ["200 Free", "100 Back", "100 Breast", "100 Fly", "200 IM"],
+        },
+        "11_12": {
+            "SCY": ["500 Free", "100 Back", "100 Breast", "100 Fly", "200 IM"],
+            "LCM": ["400 Free", "100 Back", "100 Breast", "100 Fly", "200 IM"],
+        },
+        "13_18": {
+            "SCY": ["500 Free", "200 Back", "200 Breast", "200 Fly", "200 IM", "400 IM"],
+            "LCM": ["400 Free", "200 Back", "200 Breast", "200 Fly", "200 IM", "400 IM"],
+        },
+    },
+}
+
+
+def _imx_age_group(age: Optional[int]) -> str:
+    """USA Swimming IMX/IMR single-age groups collapse to three event sets."""
+    if age is None:
+        return "11_12"
+    if age <= 10:
+        return "10_under"
+    if age <= 12:
+        return "11_12"
+    return "13_18"
+
+
+def _current_swim_season_start(today: date) -> date:
+    """USA Swimming season runs Sep 1 - Aug 31."""
+    return date(today.year, 9, 1) if today.month >= 9 else date(today.year - 1, 9, 1)
+
+
+@app.get("/focms/v1/student/{student_id}/computed/imx-imr")
+async def get_imx_imr(
+    student_id: UUID, request: Request,
+    principal: dict = Depends(authenticate_any),
+) -> dict[str, Any]:
+    """USA Swimming IMX / IMR scores, computed on read for ANY competitive
+    swimmer. Sums stored USA Swimming power points from personal_records
+    swim_best over the age-group event set. Returns IMX + IMR, each SCY + LCM,
+    with per-event present/points/in_season, a lifetime_total (best-ever times)
+    and a season_total (current-season times only, which is what official
+    IMX/IMR uses). Age group is derived from birth_date.
+    """
+    async with tx(request, principal["tenant_id"]) as conn:
+        srow = await conn.fetchrow(
+            "SELECT EXTRACT(YEAR FROM age(birth_date))::int AS age_years "
+            "FROM students WHERE id = $1 AND deleted_at IS NULL", student_id)
+        if not srow:
+            raise HTTPException(404, "Student not found")
+        recs = await conn.fetch("""
+            SELECT title, achieved_date, details->>'power_points' AS power_points
+            FROM personal_records
+            WHERE student_id = $1 AND record_kind = 'swim_best'
+              AND deleted_at IS NULL
+        """, student_id)
+
+    age = srow["age_years"]
+    group = _imx_age_group(age)
+    season_start = _current_swim_season_start(date.today())
+
+    by_key: dict[tuple[str, str], dict] = {}
+    for r in recs:
+        event, course = _split_event_course(r["title"])
+        pts_raw = r["power_points"]
+        try:
+            pts = int(pts_raw) if pts_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            pts = None
+        ad = r["achieved_date"]
+        by_key[(event, course)] = {
+            "power_points": pts,
+            "achieved_date": ad.isoformat() if ad else None,
+            "in_season": bool(ad and ad >= season_start),
+        }
+
+    def _score(program: str, course: str) -> dict:
+        required = IMX_IMR_EVENT_SETS[program][group][course]
+        events_out = []
+        lifetime_total = 0
+        season_total = 0
+        present = 0
+        season_present = 0
+        for ev in required:
+            hit = by_key.get((ev, course))
+            pts = hit["power_points"] if hit else None
+            has = hit is not None and pts is not None
+            in_season = bool(has and hit["in_season"])
+            if has:
+                present += 1
+                lifetime_total += pts
+                if in_season:
+                    season_present += 1
+                    season_total += pts
+            events_out.append({
+                "event": ev,
+                "present": has,
+                "power_points": pts,
+                "achieved_date": hit["achieved_date"] if hit else None,
+                "in_season": in_season,
+            })
+        n = len(required)
+        return {
+            "course": course,
+            "age_group": group,
+            "required_events": required,
+            "events": events_out,
+            "events_scored": present,
+            "events_required": n,
+            "complete": present == n,
+            "lifetime_total": lifetime_total if present else None,
+            "season_events_scored": season_present,
+            "season_complete": season_present == n,
+            "season_total": season_total if season_present else None,
+        }
+
+    return {
+        "student_id": str(student_id),
+        "tenant_id": principal["tenant_id"],
+        "age_years": age,
+        "age_group": group,
+        "season_start": season_start.isoformat(),
+        "imx": {"SCY": _score("IMX", "SCY"), "LCM": _score("IMX", "LCM")},
+        "imr": {"SCY": _score("IMR", "SCY"), "LCM": _score("IMR", "LCM")},
+        "source": {
+            "event_sets": "usaswimming.org/Times/IMX-IMR + swimstandards.com/imx (verified 2026-07-15)",
+            "power_points": "personal_records.details.power_points (USA Swimming Single-Age Power Points)",
+            "season": "Sep 1 - Aug 31; official IMX/IMR uses in-season bests (see season_total / in_season)",
+            "note": "IMX 13-18 is a 6-event set (adds 400 IM). lifetime_total uses best-ever times; season_total uses current-season only.",
+        },
+        "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
