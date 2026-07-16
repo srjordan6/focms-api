@@ -1,14 +1,22 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.132 · harden: extra="forbid" on the academics write models (AcademicsSchool,
-         AcademicsGpa, AcademicsRank, AcademicsRequest). Verified the portal's
-         /academics payload matches each model field-for-field first, so this
-         cannot 422 a current save; it turns any FUTURE undeclared field into a
-         loud 422 instead of a silent drop (the class of bug that destroyed
-         report-card data in v0.12.124). Remaining unguarded write models
-         (MilestoneItem, RecLetterItem, VerifiedDocItem, TestItem, FamilyMember,
-         UcaFormItem, etc.) still need the same verify-then-harden treatment.
+v0.12.132 · harden: extra="forbid" added to 14 request models after verifying each
+         one's portal payload matches field-for-field (so none can 422 a current
+         save; each turns any FUTURE undeclared field into a loud 422 instead of
+         a silent drop — the class of bug that destroyed report-card data in
+         v0.12.124). Hardened: AcademicsSchool/Gpa/Rank/Request, FamilyMember
+         (encrypted PII — highest stakes) + FamilyRequest, MilestoneItem +
+         MilestonesRequest, TestItem + TestsRequest, RecLetterItem +
+         RecLettersRequest, UcaFormItem + UcaFormsRequest. SKIPPED VerifiedDocItem
+         (portal never calls /verified-documents — payload unverifiable). STILL
+         UNGUARDED (each needs verify-then-harden): AffiliationItem, AwardItem,
+         EcSessionItem, TargetSchoolItem, ApplicationItem, JobExperienceItem,
+         ReferenceItem, EssayItem, RecommenderItem, FinAidItem, ColTestItem,
+         YearRecordItem, TeacherItem, SchoolProfileItem, SkillItem,
+         IdentityDocItem, PracticeItem, PersonalDetailsRequest, ReligionRequest,
+         StudentAddressIn, plus the *Legacy course models and AI-passthrough
+         bodies (ReportComposeRequest, ResumeTailorRequest, EssaySampleRequest).
 
 v0.12.131 · fix: main post_student_courses ignored the show_on_showcase toggle.
          The CourseItem model accepted it (and its own comment claimed "handled
@@ -997,6 +1005,7 @@ async def _pp_current_school_name(conn, student_id: str):
 # ------------------------- Millstones & Milestones -------------------------
 
 class MilestoneItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     milestone_code: Optional[str] = None
     custom_title: Optional[str] = None
     custom_category: Optional[str] = None
@@ -1007,6 +1016,7 @@ class MilestoneItem(BaseModel):
 
 
 class MilestonesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: list[MilestoneItem] = Field(default_factory=list)
 
 
@@ -1316,6 +1326,7 @@ async def get_student_courses(request: Request, student_id: str, band: Optional[
 # --------------------- Recommendation letters + direct-submit ---------------------
 
 class RecLetterItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     id: Optional[str] = None
     recommender_id: Optional[str] = None
     letter_text: Optional[str] = None
@@ -1332,6 +1343,7 @@ class RecLetterItem(BaseModel):
 
 
 class RecLettersRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[RecLetterItem] = []
     delete_ids: List[str] = []
 
@@ -2323,6 +2335,7 @@ async def resume_tailor(request: Request, student_id: str, body: ResumeTailorReq
 
 
 class UcaFormItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     id: Optional[str] = None
     form_code: Optional[str] = None
     application_id: Optional[str] = None
@@ -2331,6 +2344,7 @@ class UcaFormItem(BaseModel):
 
 
 class UcaFormsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[UcaFormItem] = []
     delete_ids: List[str] = []
 
@@ -2862,6 +2876,7 @@ _TEST_NAMES = {"SAT": "SAT", "ACT": "ACT", "PSAT": "PSAT/NMSQT", "AP": "AP Exam"
 
 
 class TestItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     test_code: Optional[str] = None
     sitting_date: Optional[str] = None
     score_overall: Optional[float] = None
@@ -2872,6 +2887,7 @@ class TestItem(BaseModel):
 
 
 class TestsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: list[TestItem] = Field(default_factory=list)
 
 
@@ -2936,6 +2952,7 @@ _FAMILY_LOCKED = {"email", "phone", "date_of_birth", "legal_sex", "marital_relat
 
 
 class FamilyMember(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: PII model - unknown field -> loud 422, never silently drop family data. Verified portal readMember() payload matches field-for-field.
     prefix: Optional[str] = None
     first_name: Optional[str] = None
     middle_name: Optional[str] = None
@@ -2977,6 +2994,7 @@ class FamilyMember(BaseModel):
 
 
 class FamilyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     father: FamilyMember = Field(default_factory=FamilyMember)
     mother: FamilyMember = Field(default_factory=FamilyMember)
 
