@@ -1,6 +1,15 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.132 · harden: extra="forbid" on the academics write models (AcademicsSchool,
+         AcademicsGpa, AcademicsRank, AcademicsRequest). Verified the portal's
+         /academics payload matches each model field-for-field first, so this
+         cannot 422 a current save; it turns any FUTURE undeclared field into a
+         loud 422 instead of a silent drop (the class of bug that destroyed
+         report-card data in v0.12.124). Remaining unguarded write models
+         (MilestoneItem, RecLetterItem, VerifiedDocItem, TestItem, FamilyMember,
+         UcaFormItem, etc.) still need the same verify-then-harden treatment.
+
 v0.12.131 · fix: main post_student_courses ignored the show_on_showcase toggle.
          The CourseItem model accepted it (and its own comment claimed "handled
          by the visibility flag") but neither the UPDATE nor INSERT ever wrote
@@ -1068,6 +1077,7 @@ async def post_student_milestones(request: Request, student_id: str, body: Miles
 # ------------------------------- Academics ---------------------------------
 
 class AcademicsSchool(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: unknown field -> loud 422, never a silent drop
     school_name: Optional[str] = None
     school_ceeb_code: Optional[str] = None
     school_type: Optional[str] = None
@@ -1078,16 +1088,19 @@ class AcademicsSchool(BaseModel):
 
 
 class AcademicsGpa(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     unweighted: Optional[float] = None
     weighted: Optional[float] = None
 
 
 class AcademicsRank(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     position: Optional[int] = None
     size: Optional[int] = None
 
 
 class AcademicsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     school: AcademicsSchool = Field(default_factory=AcademicsSchool)
     gpa: AcademicsGpa = Field(default_factory=AcademicsGpa)
     rank: AcademicsRank = Field(default_factory=AcademicsRank)
