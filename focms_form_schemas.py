@@ -16,6 +16,12 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.145 · ec-sessions media: EcSessionItem gains media_ids (universal media
+         widget now on Log training / rank / performance / session forms -
+         portal v243). Stored in events.details.media_ids via the existing
+         jsonb merge; GET returns media_ids for prefill. Same pattern as
+         affiliations v0.12.142.
+
 v0.12.144 · cadet training catalog + training date ranges. (1) New platform
          reference table cadet_training_catalog (no tenant_id - shared across
          all tenants so a training entered by one cadet appears in the dropdown
@@ -5539,6 +5545,7 @@ class EcSessionItem(BaseModel):
     composer: Optional[str] = None        # v0.12.99: composer(s)
     milestone_kind: Optional[str] = None  # v0.12.100: rank | merit_badge | award | training
     event_end_date: Optional[str] = None  # v0.12.144: training end date (events.event_end_date)
+    media_ids: Optional[List[str]] = None  # v0.12.145: universal media widget
 
 
 class EcSessionsRequest(BaseModel):
@@ -5558,6 +5565,7 @@ async def get_ec_sessions(request: Request, student_id: str):
             "e.duration_minutes, e.location_name AS location, e.affiliation_id::text AS related_affiliation_id, "
             "e.details->>'instrument' AS instrument, e.details->>'music_played' AS music_played, "
             "e.details->>'composer' AS composer, e.details->>'milestone_kind' AS milestone_kind, "
+            "e.details->'media_ids' AS media_ids, "
             "e.notes, e.source_system, (e.visibility='public') AS show_on_showcase, "
             "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
             " FROM student_skills ss WHERE ss.source_activity = 'events:'||e.id::text "
@@ -5571,6 +5579,10 @@ async def get_ec_sessions(request: Request, student_id: str):
         d = dict(r)
         d["event_date"] = d["event_date"].isoformat() if d["event_date"] else None
         d["event_end_date"] = d["event_end_date"].isoformat() if d["event_end_date"] else None
+        try:
+            d["media_ids"] = json.loads(d["media_ids"]) if d.get("media_ids") else []
+        except Exception:
+            d["media_ids"] = []
         d["duration_hours"] = round(d["duration_minutes"]/60.0, 2) if d["duration_minutes"] is not None else None
         d.pop("duration_minutes", None)
         out.append(d)
@@ -5615,14 +5627,15 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "event_end_date=NULLIF($15,'')::date, "
                         "details = details || jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
-                        "'milestone_kind', $14::text)), "
+                        "'milestone_kind', $14::text)) || $16::jsonb, "
                         "updated_at=now(), updated_by=$10::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
                         it.instrument, it.music_played, it.composer, it.milestone_kind,
-                        it.event_end_date or '')
+                        it.event_end_date or '',
+                        json.dumps({"media_ids": it.media_ids} if it.media_ids is not None else {}))
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "events", it.id, it.skills_gained, it.show_on_showcase)
@@ -5637,13 +5650,14 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "NULLIF($8,'')::uuid,$9,NULLIF($15,'')::date,"
                         "jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
-                        "'milestone_kind', $14::text)),"
+                        "'milestone_kind', $14::text)) || $16::jsonb,"
                         "'private','parent_portal',$10::uuid,$10::uuid) RETURNING id",
                         tenant_id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
                         it.instrument, it.music_played, it.composer, it.milestone_kind,
-                        it.event_end_date or '')
+                        it.event_end_date or '',
+                        json.dumps({"media_ids": it.media_ids} if it.media_ids is not None else {}))
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
