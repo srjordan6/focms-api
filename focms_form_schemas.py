@@ -16,6 +16,18 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.144 · cadet training catalog + training date ranges. (1) New platform
+         reference table cadet_training_catalog (no tenant_id - shared across
+         all tenants so a training entered by one cadet appears in the dropdown
+         for the next). Seeded with Recruit Training + the 8 advanced trainings;
+         GET /catalogs/cadet-trainings returns active titles; post_ec_sessions
+         auto-learns: any milestone_kind='training' title is upserted into the
+         catalog (ON CONFLICT DO NOTHING). (2) EcSessionItem gains
+         event_end_date; UPDATE/INSERT write events.event_end_date (column
+         already existed); GET returns it. Portal v241 pairs with this
+         (training dropdown + start/end date pickers); portal must NOT ship
+         before this deploys (extra=forbid).
+
 v0.12.143 · fix: custom skills duplicated on every save. Both skill-attach
          helpers (_apply_skills_and_showcase and the courses variant) checked
          for an existing row only for CATALOG skills; the custom-title branch
@@ -5362,6 +5374,19 @@ async def get_affiliation_programs(request: Request):
     return {"programs": [dict(r) for r in rows]}
 
 
+@router.get("/catalogs/cadet-trainings")
+async def get_cadet_trainings(request: Request):
+    # v0.12.144: shared (cross-tenant) training list - seeds + every title any
+    # cadet has entered; feeds the training dropdown in the portal.
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT title FROM cadet_training_catalog WHERE is_active "
+            "ORDER BY is_seed DESC, title")
+    return {"trainings": [r["title"] for r in rows]}
+
+
 @router.get("/catalogs/named-awards")
 async def get_named_awards(request: Request):
     _ = await _resolve_context(request)
@@ -5513,6 +5538,7 @@ class EcSessionItem(BaseModel):
     music_played: Optional[str] = None    # v0.12.99: piece(s) performed
     composer: Optional[str] = None        # v0.12.99: composer(s)
     milestone_kind: Optional[str] = None  # v0.12.100: rank | merit_badge | award | training
+    event_end_date: Optional[str] = None  # v0.12.144: training end date (events.event_end_date)
 
 
 class EcSessionsRequest(BaseModel):
@@ -5528,6 +5554,7 @@ async def get_ec_sessions(request: Request, student_id: str):
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT e.id::text AS id, e.event_type::text AS event_type, e.title, e.event_date, "
+            "e.event_end_date, "
             "e.duration_minutes, e.location_name AS location, e.affiliation_id::text AS related_affiliation_id, "
             "e.details->>'instrument' AS instrument, e.details->>'music_played' AS music_played, "
             "e.details->>'composer' AS composer, e.details->>'milestone_kind' AS milestone_kind, "
@@ -5543,6 +5570,7 @@ async def get_ec_sessions(request: Request, student_id: str):
     for r in rows:
         d = dict(r)
         d["event_date"] = d["event_date"].isoformat() if d["event_date"] else None
+        d["event_end_date"] = d["event_end_date"].isoformat() if d["event_end_date"] else None
         d["duration_hours"] = round(d["duration_minutes"]/60.0, 2) if d["duration_minutes"] is not None else None
         d.pop("duration_minutes", None)
         out.append(d)
@@ -5571,6 +5599,12 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                 title = (it.title or "").strip()
                 edate = (it.event_date or "").strip()
                 if not title or not edate: continue
+                if (it.milestone_kind or "") == "training":
+                    # v0.12.144: shared training catalog learns every new title
+                    await conn.execute(
+                        "INSERT INTO cadet_training_catalog (title) "
+                        "SELECT initcap($1) WHERE NOT EXISTS "
+                        "(SELECT 1 FROM cadet_training_catalog WHERE lower(title)=lower($1))", title)
                 if it.id:
                     try: _uuid.UUID(it.id)
                     except Exception: continue
@@ -5578,6 +5612,7 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "UPDATE events SET event_type=$3::event_type_enum, title=$4, "
                         "event_date=NULLIF($5,'')::date, duration_minutes=$6, location_name=$7, "
                         "affiliation_id=NULLIF($8,'')::uuid, notes=$9, "
+                        "event_end_date=NULLIF($15,'')::date, "
                         "details = details || jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
                         "'milestone_kind', $14::text)), "
@@ -5586,7 +5621,8 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
-                        it.instrument, it.music_played, it.composer, it.milestone_kind)
+                        it.instrument, it.music_played, it.composer, it.milestone_kind,
+                        it.event_end_date or '')
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "events", it.id, it.skills_gained, it.show_on_showcase)
@@ -5595,9 +5631,10 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                     rid = await conn.fetchval(
                         "INSERT INTO events (tenant_id, student_id, event_type, title, "
                         "event_date, duration_minutes, location_name, affiliation_id, notes, "
+                        "event_end_date, "
                         "details, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,NULLIF($5,'')::date,$6,$7,"
-                        "NULLIF($8,'')::uuid,$9,"
+                        "NULLIF($8,'')::uuid,$9,NULLIF($15,'')::date,"
                         "jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
                         "'milestone_kind', $14::text)),"
@@ -5605,7 +5642,8 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         tenant_id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
-                        it.instrument, it.music_played, it.composer, it.milestone_kind)
+                        it.instrument, it.music_played, it.composer, it.milestone_kind,
+                        it.event_end_date or '')
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
