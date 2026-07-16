@@ -228,6 +228,7 @@ user_id, role) via FOCMS_API_TOKENS_JSON. Writes require role in
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator, Optional
@@ -3294,6 +3295,15 @@ def _format_time(seconds: float) -> str:
     return f"{seconds:.2f}"
 
 
+def _norm_std(v):
+    """v0.12.141: normalize a stored time-standard string: strip era prefixes
+    like '2020-2024 ' and map 'Slower than B' to 'C'. None-safe."""
+    if not v:
+        return v
+    s = re.sub(r"^\d{4}-\d{4}\s+", "", str(v)).strip()
+    return "C" if s.lower() == "slower than b" else s
+
+
 def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optional[str]:
     # "C" (slower than B) sits below the ladder: next tier up is the first real one.
     tier_order = ["B", "BB", "A", "AA", "AAA", "AAAA"]
@@ -3389,7 +3399,10 @@ async def get_swim_race_log_feed(
             "place": d.get("place"),
             # v0.12.140: slower-than-B individual swims are the C bracket, never
             # blank (relays carry no standard - leave those empty).
-            "time_standard": d.get("time_standard") or (None if is_relay else "C"),
+            # v0.12.141: normalize stored standards defensively on read - strip
+            # era prefixes ("2020-2024 B" -> "B") and map "Slower than B" -> "C"
+            # so a future scrape can never reintroduce the ugly forms.
+            "time_standard": _norm_std(d.get("time_standard")) or (None if is_relay else "C"),
             "source_system": r["source_system"],
             "visibility": r["visibility"],
         })
