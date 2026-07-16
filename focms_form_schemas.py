@@ -1,6 +1,15 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.131 · fix: main post_student_courses ignored the show_on_showcase toggle.
+         The CourseItem model accepted it (and its own comment claimed "handled
+         by the visibility flag") but neither the UPDATE nor INSERT ever wrote
+         visibility. A parent ticking "show on public site" for a course saved
+         with no error yet the row stayed visibility='private', so no course
+         ever reached the public stem_portfolio section. Both paths now flip
+         courses_taken.visibility public/private from show_on_showcase, matching
+         every other pillar POST (affiliations, awards, events, tests).
+
 v0.12.130 · fix: leadership_milestones/leadership_extracurricular public section
          was an untyped SELECT ... FROM events (no event_type filter), so it
          dumped swim_race, music_performance, and summer_experience rows (which
@@ -2776,6 +2785,14 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                     if it.skills:
                         await _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
                                                           _cid, it.skills)
+                    # v0.12.131: honor the "show on public site" toggle. It was
+                    # accepted by the model but never written, so a course marked
+                    # public in the portal stayed visibility='private' and never
+                    # reached the public stem_portfolio section.
+                    if it.show_on_showcase is True:
+                        await conn.execute("UPDATE courses_taken SET visibility='public' WHERE id=$1::uuid AND student_id=$2::uuid", _cid, student_id)
+                    elif it.show_on_showcase is False:
+                        await conn.execute("UPDATE courses_taken SET visibility='private' WHERE id=$1::uuid AND student_id=$2::uuid", _cid, student_id)
                     updated += 1
                     continue
                 await conn.execute(
@@ -2804,14 +2821,22 @@ async def post_student_courses(request: Request, student_id: str, body: CoursesR
                 # v0.12.116: universal skills-gained - mirror course skills into
                 # student_skills so EVERY course (academic or tutoring) feeds the
                 # skill inventory and the meta-skill inference engine.
-                if it.skills:
+                # v0.12.131: also honor show_on_showcase on insert (was ignored) -
+                # a parent could tick "show on public site" and it silently stayed
+                # private, so no newly-added course ever reached stem_portfolio.
+                if it.skills or it.show_on_showcase is not None:
                     _cid = await conn.fetchval(
                         "SELECT id FROM courses_taken WHERE tenant_id=$1::uuid AND student_id=$2::uuid "
                         "AND source_system='parent_portal' AND course_name=$3 "
                         "ORDER BY created_at DESC LIMIT 1", tenant_id, student_id, name)
                     if _cid:
-                        await _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
-                                                          str(_cid), it.skills)
+                        if it.skills:
+                            await _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
+                                                              str(_cid), it.skills)
+                        if it.show_on_showcase is True:
+                            await conn.execute("UPDATE courses_taken SET visibility='public' WHERE id=$1::uuid AND student_id=$2::uuid", _cid, student_id)
+                        elif it.show_on_showcase is False:
+                            await conn.execute("UPDATE courses_taken SET visibility='private' WHERE id=$1::uuid AND student_id=$2::uuid", _cid, student_id)
                 saved += 1
     except Exception as _e:
         raise HTTPException(status_code=400, detail="course_insert_error: " + str(_e)[:300])
