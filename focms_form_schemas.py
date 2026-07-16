@@ -1877,10 +1877,115 @@ SECTION_TITLES = {
 }
 
 
+async def _swim_metrics_item(tconn, student_id: str) -> Optional[dict]:
+    """v0.12.136: one 'Swim Metrics' item carrying IMX, IMR, and Power Index,
+    computed on read from PUBLIC swim_best records only (public surfaces must
+    respect the per-record visibility gate). Prepended to athlete_tracker and
+    recruitment_portal sections so every public page always shows the three
+    scores for any competitive swimmer. Lazy-imports the compute pieces from
+    focms_api (safe: focms_api imports this module first). Never raises - a
+    compute failure returns None and the section renders without the card."""
+    try:
+        from focms_api import (IMX_IMR_EVENT_SETS, _imx_age_group,
+                               _current_swim_season_start, _compute_pp,
+                               _split_event_course, PI_WEIGHTS)
+        srow = await tconn.fetchrow(
+            "SELECT EXTRACT(YEAR FROM age(birth_date))::int AS age "
+            "FROM students WHERE id=$1::uuid AND deleted_at IS NULL", student_id)
+        if not srow:
+            return None
+        recs = await tconn.fetch(
+            "SELECT title, achieved_date, value_numeric, "
+            "details->>'power_points' AS power_points "
+            "FROM personal_records "
+            "WHERE student_id=$1::uuid AND record_kind='swim_best' "
+            "AND visibility='public' AND deleted_at IS NULL", student_id)
+        if not recs:
+            return None
+        age = srow["age"]
+        group = _imx_age_group(age)
+        season_start = _current_swim_season_start(date.today())
+
+        by_key: dict = {}
+        for r in recs:
+            ev, co = _split_event_course(r["title"])
+            praw = r["power_points"]
+            try:
+                pts = int(praw) if praw not in (None, "") else None
+            except (TypeError, ValueError):
+                pts = None
+            ad = r["achieved_date"]
+            by_key[(ev, co)] = {"pts": pts,
+                                "in_season": bool(ad and ad >= season_start)}
+
+        def _score(program: str, course: str) -> dict:
+            req = IMX_IMR_EVENT_SETS[program][group][course]
+            total = season_total = present = season_present = 0
+            for ev in req:
+                hit = by_key.get((ev, course))
+                if hit and hit["pts"] is not None:
+                    present += 1
+                    total += hit["pts"]
+                    if hit["in_season"]:
+                        season_present += 1
+                        season_total += hit["pts"]
+            n = len(req)
+            return {"score": total if present else None,
+                    "season_score": season_total if season_present else None,
+                    "events_scored": present, "events_required": n,
+                    "complete": present == n}
+
+        # Power Index from public records (NCAA base times from archive_entries)
+        pi_value = None
+        pi_top4: list = []
+        base_row = await tconn.fetchrow(
+            "SELECT detail FROM archive_entries "
+            "WHERE archive_type='reference_data' "
+            "AND source_id='ncaa_d1_men_2026_qualifying_standards_scy' LIMIT 1")
+        if base_row and base_row["detail"]:
+            bp = json.loads(base_row["detail"])
+            base_scy, lcm_factor = bp["events"], bp["conversion_to_lcm_factor"]
+            pps = []
+            for r in recs:
+                if r["value_numeric"] is None:
+                    continue
+                ev, co = _split_event_course(r["title"])
+                pp = _compute_pp(float(r["value_numeric"]), ev, co, base_scy, lcm_factor)
+                if pp is not None:
+                    pps.append((r["title"], pp))
+            pps.sort(key=lambda x: x[1])
+            top4 = pps[:4]
+            if top4:
+                w = PI_WEIGHTS[: len(top4)]
+                pi_value = round(sum(top4[i][1] * w[i] for i in range(len(top4))) / sum(w), 1)
+                pi_top4 = [{"event_course": l, "pp": p} for l, p in top4]
+
+        group_label = {"10_under": "10&under", "11_12": "11-12", "13_18": "13-18"}.get(group, group)
+        return {
+            "title": "Swim Metrics",
+            "date": None,
+            "body": f"IMX / IMR / Power Index \u00b7 age group {group_label}",
+            "meta": {
+                "kind": "swim_metrics",
+                "age_group": group_label,
+                "season_start": season_start.isoformat(),
+                "imx": {"SCY": _score("IMX", "SCY"), "LCM": _score("IMX", "LCM")},
+                "imr": {"SCY": _score("IMR", "SCY"), "LCM": _score("IMR", "LCM")},
+                "power_index": {"value": pi_value, "top_4": pi_top4},
+                "source": "public records only \u00b7 computed on read",
+            },
+        }
+    except Exception:
+        return None
+
+
 async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
     """v0.12.95: return public rows for a section code across relevant tables."""
     items: list[dict] = []
     if code == "athlete_tracker":
+        m = await _swim_metrics_item(tconn, student_id)
+        if m:
+            items.append(m)
         prs = await tconn.fetch(
             "SELECT title, achieved_date, value_text, value_numeric, value_unit, details, "
             "record_kind::text AS record_kind FROM personal_records "
@@ -2014,6 +2119,10 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
         # empty for every teen tenant. Coach EMAIL is intentionally omitted from
         # the public payload (child-safety: no raw contact emails on a public,
         # link-shareable page); name/role/org only.
+        # v0.12.136: Swim Metrics card (IMX/IMR/Power Index) prepended.
+        m = await _swim_metrics_item(tconn, student_id)
+        if m:
+            items.append(m)
         gy = await tconn.fetchval(
             "SELECT expected_hs_graduation_year FROM students WHERE id=$1::uuid", student_id)
         if gy:
