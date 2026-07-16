@@ -16,6 +16,10 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.142 · affiliations: accept media_ids + details from portal v226+ (media
+         widget, USNSCC block); merge into details jsonb; GET returns details
+         for prefill. Fixes 422 on every EC save since portal v226.
+
 v0.12.132 · harden: extra="forbid" added to 31 item-level request models, each verified by
          enumerating its portal payload field-for-field so none can 422 a current
          save; each turns a FUTURE undeclared field into a loud 422 instead of a
@@ -5058,6 +5062,12 @@ class AffiliationItem(BaseModel):
     usa_zone: Optional[str] = None       # Eastern | Central | Southern | Western
     usa_lsc: Optional[str] = None        # e.g. "North Texas Swimming (NT)"
     usa_club_code: Optional[str] = None  # e.g. "IRON-NT"
+    # v0.12.142: portal v226+ sends media_ids (universal media widget) and a
+    # generic details dict (v228/v229 USNSCC keys). extra="forbid" was 422-ing
+    # every EC save since portal v226. media_ids folds into details; details
+    # merges into the row's jsonb (existing keys preserved, incoming wins).
+    media_ids: Optional[List[str]] = None
+    details: Optional[dict] = None
     affiliation_type: str
     organization_name: str
     organization_url: Optional[str] = None
@@ -5081,6 +5091,14 @@ class AffiliationsRequest(BaseModel):
     delete_ids: List[str] = []
 
 
+def _affil_extra(it: AffiliationItem) -> str:
+    # v0.12.142: one jsonb param merging generic details + media_ids
+    extra = dict(it.details or {})
+    if it.media_ids is not None:
+        extra["media_ids"] = it.media_ids
+    return json.dumps(extra)
+
+
 @router.get("/student/{student_id}/affiliations")
 async def get_student_affiliations(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
@@ -5089,6 +5107,7 @@ async def get_student_affiliations(request: Request, student_id: str):
         rows = await conn.fetch(
             "SELECT a.id, a.affiliation_type::text AS affiliation_type, a.organization_name, "
             "a.details->>'program_code' AS program_code, "
+            "a.details::text AS details, "  # v0.12.142: portal prefill (usnscc_*, media_ids)
             "a.details->'usa_swimming'->>'zone' AS usa_zone, "
             "a.details->'usa_swimming'->>'lsc' AS usa_lsc, "
             "a.details->'usa_swimming'->>'club_code' AS usa_club_code, "
@@ -5111,6 +5130,7 @@ async def get_student_affiliations(request: Request, student_id: str):
             d[k] = d[k].isoformat() if d[k] else None
         for k in ("weekly_hours", "total_hours"):
             d[k] = float(d[k]) if d[k] is not None else None
+        d["details"] = json.loads(d["details"]) if d.get("details") else {}  # v0.12.142
         out.append(d)
     return {"student_id": student_id, "affiliations": out}
 
@@ -5160,7 +5180,8 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
                         "'member', COALESCE($23::boolean, true), "
                         "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) "
-                        "ELSE '{}'::jsonb END, "
+                        "ELSE '{}'::jsonb END "
+                        "|| $24::jsonb, "
                         "updated_at=now(), updated_by=$18::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, atype, name, it.organization_url,
@@ -5168,7 +5189,8 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id, it.program_code,
-                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member)
+                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member,
+                        _affil_extra(it))
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "affiliations", it.id, it.skills_gained, it.show_on_showcase)
@@ -5188,7 +5210,7 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
                         "'member', COALESCE($23::boolean, true), "
                         "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) "
-                        "ELSE '{}'::jsonb END),"
+                        "ELSE '{}'::jsonb END || $24::jsonb),"
                         "'private','parent_portal',"
                         "$18::uuid,$18::uuid) RETURNING id",
                         tenant_id, student_id, atype, name, it.organization_url,
@@ -5196,7 +5218,8 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id, it.program_code,
-                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member)
+                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member,
+                        _affil_extra(it))
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "affiliations", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
