@@ -3275,16 +3275,11 @@ async def post_student_religion(request: Request, student_id: str, body: Religio
     async with _tenant_conn(pool, tenant_id) as conn:
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
-            # v0.12.83: legal name on students row (display_name kept in sync)
-            fn = (body.first_name or "").strip()
-            ln = (body.last_name or "").strip()
-            if fn and ln:
-                mn = (body.middle_name or "").strip() or None
-                await conn.execute(
-                    "UPDATE students SET first_name=$2, middle_name=$5, last_name=$3, "
-                    "display_name=$2||' '||$3, updated_by=$4::uuid, updated_at=now() "
-                    "WHERE id=$1::uuid AND deleted_at IS NULL",
-                    student_id, fn, ln, user_id, mn)
+            # v0.12.135 BUGFIX: a legal-name-sync block (v0.12.83) was pasted here
+            # from post_student_personal_details. ReligionRequest has no
+            # first_name/middle_name/last_name, so body.first_name raised
+            # AttributeError -> 500 on EVERY religion save in the personal
+            # pillar. Name sync lives (correctly) in post_student_personal_details.
             exists = await conn.fetchrow(
                 "SELECT 1 FROM student_personal_details WHERE student_id=$1::uuid AND deleted_at IS NULL",
                 student_id)
