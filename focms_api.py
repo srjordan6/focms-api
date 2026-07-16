@@ -3326,14 +3326,17 @@ async def get_swim_race_log_feed(
     races = []
     for r in rows:
         d = json.loads(r["details_json"]) if r["details_json"] else {}
-        time_str = d.get("swim_time") or ""
+        # v0.12.136: two detail-key generations coexist - WP-port rows use
+        # swim_time/points, scraper + portal rows use finals_time/power_points.
+        time_str = d.get("swim_time") or d.get("finals_time") or ""
         is_relay = isinstance(time_str, str) and time_str.endswith("r")
         time_clean = time_str.rstrip("r") if isinstance(time_str, str) else time_str
+        _points = d.get("points") if d.get("points") is not None else d.get("power_points")
         races.append({
             "source_id": r["source_id"],
             "date": r["event_date"].isoformat() if r["event_date"] else None,
             "title": r["title"],
-            "distance_m": d.get("distance_m"),
+            "distance_m": d.get("distance_m") if d.get("distance_m") is not None else d.get("distance"),
             "stroke": d.get("stroke"),
             "course": d.get("course"),
             "time": time_clean,
@@ -3342,7 +3345,8 @@ async def get_swim_race_log_feed(
             "team": d.get("team"),
             "lsc": d.get("lsc"),
             "age": d.get("age"),
-            "points": d.get("points"),
+            "points": _points,
+            "place": d.get("place"),
             "time_standard": d.get("time_standard"),
             "source_system": r["source_system"],
             "visibility": r["visibility"],
