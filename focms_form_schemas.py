@@ -1,6 +1,14 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.130 · fix: leadership_milestones/leadership_extracurricular public section
+         was an untyped SELECT ... FROM events (no event_type filter), so it
+         dumped swim_race, music_performance, and summer_experience rows (which
+         belong to athlete_tracker / fine_arts / stem_portfolio) into the
+         Leadership section. Now pulls public affiliations (role + org) plus
+         events explicitly typed 'leadership_milestone'/'service_session',
+         matching the catalog source "affiliations + milestones".
+
 v0.12.116 · Private Tutoring course_type (subject, school, teacher, teacher email,
          school year, notes, skills gained, course description, grade received OR
          award/certificate of completion) on courses_taken; universal course
@@ -1838,12 +1846,34 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
                 },
             })
     elif code in ("leadership_milestones", "leadership_extracurricular"):
-        rows = await tconn.fetch(
+        # v0.12.130 BUGFIX: this branch was an untyped `SELECT ... FROM events`
+        # with no event_type filter, so it dumped swim_race, music_performance,
+        # and summer_experience rows (which belong to athlete_tracker / fine_arts
+        # / stem_portfolio) into the Leadership section. Catalog source for this
+        # section is "affiliations + milestones": pull public affiliations (roles
+        # and organizations) plus events explicitly typed leadership/service.
+        af = await tconn.fetch(
+            "SELECT organization_name, role, role_start_date, public_description, notes "
+            "FROM affiliations "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "ORDER BY role_start_date DESC NULLS LAST LIMIT 50", student_id)
+        for r in af:
+            org = r["organization_name"]
+            role = r["role"]
+            if role and org:
+                title = f"{role} \u2014 {org}"
+            else:
+                title = role or org or "Affiliation"
+            items.append({"title": title,
+                          "date": r["role_start_date"].isoformat() if r["role_start_date"] else None,
+                          "body": r["public_description"] or r["notes"]})
+        ev = await tconn.fetch(
             "SELECT title, event_date, public_description FROM events "
             "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND event_type IN ('leadership_milestone','service_session') "
             "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
-        for r in rows:
-            items.append({"title": r["title"] or "Event",
+        for r in ev:
+            items.append({"title": r["title"] or "Milestone",
                           "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
     elif code in ("fine_arts", "highlight_reel"):
