@@ -5052,6 +5052,9 @@ class AffiliationItem(BaseModel):
     program_code: Optional[str] = None  # v0.12.98: catalog link (details->>'program_code')
     # v0.12.138: USA Swimming organizational structure (Zone > LSC > Club),
     # stored under details->'usa_swimming'. Generic: any swim-team affiliation.
+    # v0.12.139: usa_member checkbox - True writes member:true + fields (wholesale
+    # replace of the usa_swimming key), False removes the key entirely.
+    usa_member: Optional[bool] = None
     usa_zone: Optional[str] = None       # Eastern | Central | Southern | Western
     usa_lsc: Optional[str] = None        # e.g. "North Texas Swimming (NT)"
     usa_club_code: Optional[str] = None  # e.g. "IRON-NT"
@@ -5089,6 +5092,7 @@ async def get_student_affiliations(request: Request, student_id: str):
             "a.details->'usa_swimming'->>'zone' AS usa_zone, "
             "a.details->'usa_swimming'->>'lsc' AS usa_lsc, "
             "a.details->'usa_swimming'->>'club_code' AS usa_club_code, "
+            "COALESCE((a.details->'usa_swimming'->>'member')::boolean, a.details ? 'usa_swimming') AS usa_member, "
             "a.organization_url, a.organization_city, a.organization_state, a.role, "
             "a.role_start_date, a.role_end_date, a.weekly_hours, a.total_hours, "
             "a.coach_name, a.coach_email, a.coach_role, a.notes, a.public_description, "
@@ -5149,12 +5153,14 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "role_end_date=NULLIF($10,'')::date, weekly_hours=$11, total_hours=$12, "
                         "coach_name=$13, coach_email=$14, coach_role=$15, notes=$16, "
                         "public_description=$17, "
-                        "details = details "
+                        "details = (CASE WHEN $23::boolean IS FALSE THEN details - 'usa_swimming' ELSE details END) "
                         "|| CASE WHEN $19::text IS NULL THEN '{}'::jsonb "
                         "ELSE jsonb_build_object('program_code', $19::text) END "
-                        "|| CASE WHEN $20::text IS NULL AND $21::text IS NULL AND $22::text IS NULL THEN '{}'::jsonb "
-                        "ELSE jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
-                        "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) END, "
+                        "|| CASE WHEN $23::boolean IS TRUE OR $20::text IS NOT NULL OR $21::text IS NOT NULL OR $22::text IS NOT NULL THEN "
+                        "jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
+                        "'member', COALESCE($23::boolean, true), "
+                        "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) "
+                        "ELSE '{}'::jsonb END, "
                         "updated_at=now(), updated_by=$18::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, atype, name, it.organization_url,
@@ -5162,7 +5168,7 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id, it.program_code,
-                        it.usa_zone, it.usa_lsc, it.usa_club_code)
+                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member)
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "affiliations", it.id, it.skills_gained, it.show_on_showcase)
@@ -5178,9 +5184,11 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "NULLIF($9,'')::date,NULLIF($10,'')::date,$11,$12,$13,$14,$15,$16,$17,"
                         "(CASE WHEN $19::text IS NULL THEN '{}'::jsonb "
                         "ELSE jsonb_build_object('program_code', $19::text) END "
-                        "|| CASE WHEN $20::text IS NULL AND $21::text IS NULL AND $22::text IS NULL THEN '{}'::jsonb "
-                        "ELSE jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
-                        "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) END),"
+                        "|| CASE WHEN $23::boolean IS TRUE OR $20::text IS NOT NULL OR $21::text IS NOT NULL OR $22::text IS NOT NULL THEN "
+                        "jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
+                        "'member', COALESCE($23::boolean, true), "
+                        "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) "
+                        "ELSE '{}'::jsonb END),"
                         "'private','parent_portal',"
                         "$18::uuid,$18::uuid) RETURNING id",
                         tenant_id, student_id, atype, name, it.organization_url,
@@ -5188,7 +5196,7 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id, it.program_code,
-                        it.usa_zone, it.usa_lsc, it.usa_club_code)
+                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member)
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "affiliations", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
