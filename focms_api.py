@@ -3107,6 +3107,10 @@ def _next_standard(seconds: float, standards: dict[str, float]) -> tuple[Optiona
                 if next_std is None or std_time > (next_time or 0):
                     next_std = tier
                     next_time = std_time
+    # v0.12.140: USA Swimming convention - anything slower than B is the C
+    # bracket, never blank. Next cut for a C swim is the B time.
+    if achieved is None and standards:
+        achieved = "C"
     return achieved, next_time
 
 
@@ -3291,8 +3295,9 @@ def _format_time(seconds: float) -> str:
 
 
 def _tier_above(achieved: Optional[str], standards: dict[str, float]) -> Optional[str]:
+    # "C" (slower than B) sits below the ladder: next tier up is the first real one.
     tier_order = ["B", "BB", "A", "AA", "AAA", "AAAA"]
-    if not achieved:
+    if not achieved or achieved == "C":
         for t in tier_order:
             if standards.get(t):
                 return t
@@ -3382,7 +3387,9 @@ async def get_swim_race_log_feed(
             "age": d.get("age"),
             "points": _points,
             "place": d.get("place"),
-            "time_standard": d.get("time_standard"),
+            # v0.12.140: slower-than-B individual swims are the C bracket, never
+            # blank (relays carry no standard - leave those empty).
+            "time_standard": d.get("time_standard") or (None if is_relay else "C"),
             "source_system": r["source_system"],
             "visibility": r["visibility"],
         })
