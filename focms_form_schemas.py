@@ -16,6 +16,15 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.146 · ec-sessions location_parts: the standard address block on logger
+         forms composes into the single events.location string (portal v240),
+         which cannot be decomposed on re-edit - the block reopened empty.
+         EcSessionItem gains location_parts (dict of street_address/
+         street_address_line_2/city_town/county/state_province/
+         zip_postal_code/country); stored in events.details.location_parts via
+         the same $16 jsonb merge as media_ids; GET returns it for prefill.
+         Portal v245 pairs (block prefills from location_parts on edit).
+
 v0.12.145 · ec-sessions media: EcSessionItem gains media_ids (universal media
          widget now on Log training / rank / performance / session forms -
          portal v243). Stored in events.details.media_ids via the existing
@@ -5546,6 +5555,7 @@ class EcSessionItem(BaseModel):
     milestone_kind: Optional[str] = None  # v0.12.100: rank | merit_badge | award | training
     event_end_date: Optional[str] = None  # v0.12.144: training end date (events.event_end_date)
     media_ids: Optional[List[str]] = None  # v0.12.145: universal media widget
+    location_parts: Optional[dict] = None  # v0.12.146: address-block components for prefill
 
 
 class EcSessionsRequest(BaseModel):
@@ -5566,6 +5576,7 @@ async def get_ec_sessions(request: Request, student_id: str):
             "e.details->>'instrument' AS instrument, e.details->>'music_played' AS music_played, "
             "e.details->>'composer' AS composer, e.details->>'milestone_kind' AS milestone_kind, "
             "e.details->'media_ids' AS media_ids, "
+            "e.details->'location_parts' AS location_parts, "
             "e.notes, e.source_system, (e.visibility='public') AS show_on_showcase, "
             "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
             " FROM student_skills ss WHERE ss.source_activity = 'events:'||e.id::text "
@@ -5583,6 +5594,10 @@ async def get_ec_sessions(request: Request, student_id: str):
             d["media_ids"] = json.loads(d["media_ids"]) if d.get("media_ids") else []
         except Exception:
             d["media_ids"] = []
+        try:
+            d["location_parts"] = json.loads(d["location_parts"]) if d.get("location_parts") else None
+        except Exception:
+            d["location_parts"] = None
         d["duration_hours"] = round(d["duration_minutes"]/60.0, 2) if d["duration_minutes"] is not None else None
         d.pop("duration_minutes", None)
         out.append(d)
@@ -5635,7 +5650,9 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
                         it.instrument, it.music_played, it.composer, it.milestone_kind,
                         it.event_end_date or '',
-                        json.dumps({"media_ids": it.media_ids} if it.media_ids is not None else {}))
+                        json.dumps({k: v for k, v in (
+                            ("media_ids", it.media_ids),
+                            ("location_parts", it.location_parts)) if v is not None}))
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "events", it.id, it.skills_gained, it.show_on_showcase)
@@ -5657,7 +5674,9 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
                         it.instrument, it.music_played, it.composer, it.milestone_kind,
                         it.event_end_date or '',
-                        json.dumps({"media_ids": it.media_ids} if it.media_ids is not None else {}))
+                        json.dumps({k: v for k, v in (
+                            ("media_ids", it.media_ids),
+                            ("location_parts", it.location_parts)) if v is not None}))
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
