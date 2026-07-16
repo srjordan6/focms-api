@@ -1,22 +1,30 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
-v0.12.132 · harden: extra="forbid" added to 14 request models after verifying each
-         one's portal payload matches field-for-field (so none can 422 a current
-         save; each turns any FUTURE undeclared field into a loud 422 instead of
-         a silent drop — the class of bug that destroyed report-card data in
-         v0.12.124). Hardened: AcademicsSchool/Gpa/Rank/Request, FamilyMember
-         (encrypted PII — highest stakes) + FamilyRequest, MilestoneItem +
-         MilestonesRequest, TestItem + TestsRequest, RecLetterItem +
-         RecLettersRequest, UcaFormItem + UcaFormsRequest. SKIPPED VerifiedDocItem
-         (portal never calls /verified-documents — payload unverifiable). STILL
-         UNGUARDED (each needs verify-then-harden): AffiliationItem, AwardItem,
-         EcSessionItem, TargetSchoolItem, ApplicationItem, JobExperienceItem,
-         ReferenceItem, EssayItem, RecommenderItem, FinAidItem, ColTestItem,
-         YearRecordItem, TeacherItem, SchoolProfileItem, SkillItem,
-         IdentityDocItem, PracticeItem, PersonalDetailsRequest, ReligionRequest,
-         StudentAddressIn, plus the *Legacy course models and AI-passthrough
-         bodies (ReportComposeRequest, ResumeTailorRequest, EssaySampleRequest).
+v0.12.132 · harden: extra="forbid" added to 31 item-level request models, each verified by
+         enumerating its portal payload field-for-field so none can 422 a current
+         save; each turns a FUTURE undeclared field into a loud 422 instead of a
+         silent drop (the bug class that destroyed report-card data in v0.12.124).
+         Hardened: AcademicsSchool/Gpa/Rank/Request, FamilyMember (PII) +
+         FamilyRequest, MilestoneItem(+Req), TestItem(+Req), RecLetterItem(+Req),
+         UcaFormItem(+Req), AffiliationItem(+Req), AwardItem, EcSessionItem,
+         TargetsRequest, JobExperienceItem(+Req), ReferenceItem(+Req), EssayItem,
+         RecommenderItem, FinAidItem, ColTestItem, YearTeacherItem, YearRecordItem,
+         SkillItem, IdentityDocItem, ReligionRequest, StudentAddressIn.
+         DELIBERATELY NOT FORBIDDEN (would 422 real saves): TargetSchoolItem,
+         TeacherItem, SchoolProfileItem (all three use schoolPickerField/Legacy,
+         which emits a hidden '{key}_country' <select> scraped into the payload
+         but absent from the model) and PersonalDetailsRequest (pdBody sends
+         residence_country, not in the model). extra=ignore silently drops these
+         scratch keys, which is correct. VerifiedDocItem + PracticeItem skipped
+         (portal never calls those endpoints). All safe {items}/{delete_ids}
+         request wrappers are also forbidden now (CoursesRequest, SkillsRequest,
+         IdentityDocsRequest, AwardsRequest, EcSessionsRequest, SchoolProfiles/
+         YearRecords/Teachers/Essays/Recommenders/FinAid/ColTest Requests,
+         StudentAddressesRequest). STILL extra=ignore by design: *Legacy course
+         models, AI-passthrough bodies (ReportCompose/ResumeTailor/EssaySample —
+         freeform LLM input), and Applications/MetaSkills (POST unverified /
+         internal). Watch for the _country leak on any schoolPickerField form.
 
 v0.12.131 · fix: main post_student_courses ignored the show_on_showcase toggle.
          The CourseItem model accepted it (and its own comment claimed "handled
@@ -1259,6 +1267,7 @@ class CourseItem(BaseModel):
 
 
 class CoursesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: list[CourseItem] = Field(default_factory=list)
     delete_ids: list[str] = Field(default_factory=list)   # v0.12.116
     mode: Optional[str] = None                            # v0.12.116 'replace' (default) | 'upsert'
@@ -3159,6 +3168,7 @@ async def post_student_family(request: Request, student_id: str, body: FamilyReq
 # must honor the per-field map rather than the row flag.
 
 class ReligionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: relBody sends exactly these 6 keys
     affiliation: Optional[str] = None
     affiliation_other: Optional[str] = None
     attendance: Optional[str] = None
@@ -3453,6 +3463,7 @@ _ADDR_DETAIL_FIELDS = ("county",)
 
 
 class StudentAddressIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: readAddr sends 7 keys, all map; phone_at_address optional/unsent
     county: Optional[str] = None
     street_address: Optional[str] = None
     street_address_line_2: Optional[str] = None
@@ -3464,6 +3475,7 @@ class StudentAddressIn(BaseModel):
 
 
 class StudentAddressesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: portal sends exactly physical/mailing_same_as_physical/mailing
     physical: StudentAddressIn = Field(default_factory=StudentAddressIn)
     mailing_same_as_physical: bool = True
     mailing: StudentAddressIn = Field(default_factory=StudentAddressIn)
@@ -3583,6 +3595,7 @@ async def get_skills_catalog(request: Request):
 
 
 class SkillItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: static skills payload, all keys map
     skill_code: Optional[str] = None
     custom_title: Optional[str] = None
     custom_domain: Optional[str] = None
@@ -3594,6 +3607,7 @@ class SkillItem(BaseModel):
 
 
 class SkillsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: list[SkillItem] = Field(default_factory=list)
 
 
@@ -3698,12 +3712,14 @@ _DOC_TYPES = _AGE_PROOF | {"ss_card"}
 
 
 class IdentityDocItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: static {doc_type, artifact_id} payload
     doc_type: str
     artifact_id: Optional[str] = None
     notes: Optional[str] = None
 
 
 class IdentityDocsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: list[IdentityDocItem] = Field(default_factory=list)
 
 
@@ -4860,6 +4876,7 @@ _AFFIL_TYPES = {"program", "activity", "service_org", "coach_relationship"}
 
 
 class AffiliationItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: enumerated the full ecEdit form data-k set; all 19 keys map to model fields, scratch keys (organization_name_other deleted, skills_gained_custom transformed) never sent
     id: Optional[str] = None
     skills_gained: List[str] = []
     show_on_showcase: Optional[bool] = None
@@ -4882,6 +4899,7 @@ class AffiliationItem(BaseModel):
 
 
 class AffiliationsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[AffiliationItem] = []
     delete_ids: List[str] = []
 
@@ -5115,6 +5133,7 @@ async def get_ec_milestones(request: Request):
 
 
 class AwardItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: full award form data-k set enumerated (14 keys), all map to model
     id: Optional[str] = None
     skills_gained: List[str] = []
     show_on_showcase: Optional[bool] = None
@@ -5133,6 +5152,7 @@ class AwardItem(BaseModel):
 
 
 class AwardsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[AwardItem] = []
     delete_ids: List[str] = []
 
@@ -5225,6 +5245,7 @@ _EC_EVENT_TYPES = {"service_session", "summer_experience", "leadership_milestone
 
 
 class EcSessionItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: all 3 callers enumerated (lmSave, perfSave, sessionSave) - every sent key maps to model
     id: Optional[str] = None
     skills_gained: List[str] = []
     show_on_showcase: Optional[bool] = None
@@ -5242,6 +5263,7 @@ class EcSessionItem(BaseModel):
 
 
 class EcSessionsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[EcSessionItem] = []
     delete_ids: List[str] = []
 
@@ -5369,6 +5391,12 @@ async def get_universities_catalog(request: Request, q: Optional[str] = None, li
 
 
 class TargetSchoolItem(BaseModel):
+    # v0.12.132 NOTE: intentionally NOT extra="forbid". The target form's college
+    # picker (schoolPickerFieldLegacy, key='university_search') emits a hidden
+    # 'university_search_country' select that always has a value; targetSave()
+    # deletes item.university_search but NOT item.university_search_country, so
+    # that scratch key reaches the wire. extra=ignore silently drops it (correct).
+    # To forbid this model, first delete university_search_country in targetSave.
     id: Optional[str] = None
     university_leaid: str
     priority: Optional[int] = None
@@ -5385,6 +5413,7 @@ class TargetSchoolItem(BaseModel):
 
 
 class TargetsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[TargetSchoolItem] = []
     delete_ids: List[str] = []
 
@@ -5929,6 +5958,7 @@ class SchoolProfileItem(BaseModel):
 
 
 class SchoolProfilesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: wrapper-only; SchoolProfileItem stays extra=ignore (school_name_country leak)
     items: List[SchoolProfileItem] = []
     delete_ids: List[str] = []
 
@@ -6330,6 +6360,7 @@ async def post_report_cards(request: Request, student_id: str, body: ReportCards
 
 
 class YearTeacherItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: yrReadTeachers emits exactly these 4 keys
     """v0.12.119: a teacher for one grade year. Elementary students commonly have
     two or more (e.g. one for ELA/Social Studies, one for Math/Science)."""
     teacher_id: Optional[str] = None
@@ -6339,6 +6370,7 @@ class YearTeacherItem(BaseModel):
 
 
 class YearRecordItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: full form enumerated (schoolChoiceField, not the _country-emitting schoolPickerField); all keys map
     id: Optional[str] = None
     grade_level: int
     school_year: str
@@ -6361,6 +6393,7 @@ class YearRecordItem(BaseModel):
 
 
 class YearRecordsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[YearRecordItem] = []
     delete_ids: List[str] = []
 
@@ -6571,6 +6604,7 @@ class TeacherItem(BaseModel):
 
 
 class TeachersRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: wrapper-only; TeacherItem stays extra=ignore (school_name_country leak)
     items: List[TeacherItem] = []
     delete_ids: List[str] = []
 
@@ -6958,6 +6992,7 @@ async def post_career_profile(request: Request, student_id: str, body: CareerPro
 
 
 class JobExperienceItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: form data-k set enumerated (24 wire keys, skills_gained_csv transformed pre-send), all map to model
     id: Optional[str] = None
     job_title: Optional[str] = None
     company_name: Optional[str] = None
@@ -6988,6 +7023,7 @@ class JobExperienceItem(BaseModel):
 
 
 class JobExperiencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[JobExperienceItem] = []
     delete_ids: List[str] = []
 
@@ -7090,6 +7126,7 @@ async def post_job_experiences(request: Request, student_id: str, body: JobExper
 
 
 class ReferenceItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: form data-k set enumerated (11 wire keys), all map to model
     id: Optional[str] = None
     ref_name: str
     relationship: Optional[str] = None
@@ -7105,6 +7142,7 @@ class ReferenceItem(BaseModel):
 
 
 class ReferencesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[ReferenceItem] = []
     delete_ids: List[str] = []
 
@@ -7176,6 +7214,7 @@ async def post_references(request: Request, student_id: str, body: ReferencesReq
 
 
 class EssayItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: static esCollectHead payload, all keys map to model
     id: Optional[str] = None
     essay_title: Optional[str] = None
     prompt_text: Optional[str] = None
@@ -7191,6 +7230,7 @@ class EssayItem(BaseModel):
 
 
 class EssaysRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[EssayItem] = []
     delete_ids: List[str] = []
 
@@ -7275,6 +7315,7 @@ async def post_essays(request: Request, student_id: str, body: EssaysRequest):
 
 
 class RecommenderItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: recSaveHE form data-k enumerated, no school picker, all map to model
     id: Optional[str] = None
     recommender_name: str
     recommender_role: Optional[str] = None
@@ -7289,6 +7330,7 @@ class RecommenderItem(BaseModel):
 
 
 class RecommendersRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[RecommenderItem] = []
     delete_ids: List[str] = []
 
@@ -7362,6 +7404,7 @@ async def post_recommenders(request: Request, student_id: str, body: Recommender
 
 
 class FinAidItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: finaidSave form data-k enumerated (school_name is plain ecField, no picker), all map to model
     id: Optional[str] = None
     aid_type: str
     school_name: Optional[str] = None
@@ -7383,6 +7426,7 @@ class FinAidItem(BaseModel):
 
 
 class FinAidRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[FinAidItem] = []
     delete_ids: List[str] = []
 
@@ -7463,6 +7507,7 @@ async def post_financial_aid(request: Request, student_id: str, body: FinAidRequ
 
 
 class ColTestItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132: sec_* keys transformed to section_scores dict pre-send; all wire keys map to model
     id: Optional[str] = None
     test_type: str
     test_date: Optional[str] = None
@@ -7480,6 +7525,7 @@ class ColTestItem(BaseModel):
 
 
 class ColTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")  # v0.12.132
     items: List[ColTestItem] = []
     delete_ids: List[str] = []
 
