@@ -3118,12 +3118,15 @@ async def get_swim_bests_feed(
     async with tx(request, principal["tenant_id"]) as conn:
         records = await conn.fetch("""
             SELECT title, value_numeric, achieved_date,
-                   prior_value_numeric, total_drop_numeric, details
+                   prior_value_numeric, total_drop_numeric, details,
+                   visibility, source_system, source_id
             FROM personal_records
             WHERE student_id = $1 AND record_kind = 'swim_best'
               AND deleted_at IS NULL AND value_numeric IS NOT NULL
             ORDER BY title
         """, student_id)
+        _bday = await conn.fetchval(
+            "SELECT birth_date FROM students WHERE id = $1", student_id)
 
     standards_scy = USA_SWIMMING_TIERS_2024_2028_BOYS_11_12["SCY"]
     standards_lcm = USA_SWIMMING_TIERS_2024_2028_BOYS_11_12["LCM"]
@@ -3140,6 +3143,18 @@ async def get_swim_bests_feed(
             continue
         std_for_event = std_table.get(event, {})
         achieved_std, next_time = _next_standard(seconds, std_for_event)
+        d = r["details"] if isinstance(r["details"], dict) else (json.loads(r["details"]) if r["details"] else {})
+        praw = d.get("power_points")
+        try:
+            _pts = int(float(praw)) if praw not in (None, "") else None
+        except (TypeError, ValueError):
+            _pts = None
+        drop = float(r["total_drop_numeric"]) if r["total_drop_numeric"] is not None else None
+        # v0.12.136: full best-times table fields (Pts/Drop/%/Age/Meet + edit keys)
+        _age_at = None
+        if _bday and r["achieved_date"]:
+            ad = r["achieved_date"]
+            _age_at = ad.year - _bday.year - ((ad.month, ad.day) < (_bday.month, _bday.day))
         bests[title] = {
             "time": _format_time(seconds),
             "seconds": seconds,
@@ -3147,6 +3162,17 @@ async def get_swim_bests_feed(
             "usa_standard": achieved_std,
             "next_std": _tier_above(achieved_std, std_for_event),
             "next_time_seconds": next_time,
+            "time_needed": round(seconds - next_time, 2) if next_time is not None else None,
+            "power_points": _pts,
+            "drop": drop,
+            "drop_pct": round(drop / (seconds + drop) * 100, 1) if drop and drop > 0 else None,
+            "age_at_swim": _age_at,
+            "meet": d.get("meet"),
+            "visibility": r["visibility"],
+            "source_system": r["source_system"],
+            "source_id": r["source_id"],
+            "prior_seconds": float(r["prior_value_numeric"]) if r["prior_value_numeric"] is not None else None,
+            "details": d,
         }
 
     pi_payload: Optional[dict] = None
