@@ -16,6 +16,18 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.143 · fix: custom skills duplicated on every save. Both skill-attach
+         helpers (_apply_skills_and_showcase and the courses variant) checked
+         for an existing row only for CATALOG skills; the custom-title branch
+         blind-INSERTed a new student_skills row on each save. Since the portal
+         sends the full chip list every save, each save re-inserted every
+         custom skill (John's Recruit Training record accumulated 37 rows for
+         13 skills). Custom branch now checks for an existing non-deleted row
+         by (student_id, custom_title, source_activity) and UPDATEs it instead.
+         Data repaired same session: 37 duplicate rows soft-deleted keeping the
+         earliest per (source_activity, title). Applies to every form with the
+         skills widget: affiliations, awards, ec-sessions, courses.
+
 v0.12.142 · affiliations: accept media_ids + details from portal v226+ (media
          widget, USNSCC block); merge into details jsonb; GET returns details
          for prefill. Fixes 422 on every EC save since portal v226.
@@ -5259,11 +5271,23 @@ async def _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
                     "VALUES ($1::uuid,$2::uuid,$3,true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
                     tenant_id, student_id, code, src, user_id)
         else:
-            await conn.execute(
-                "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
-                "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
-                "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
-                tenant_id, student_id, code, src, user_id)
+            # v0.12.143: dedupe custom skills - portal resends the full chip
+            # list on every save; without this check each save re-inserted
+            # every custom skill as a new row.
+            existing = await conn.fetchval(
+                "SELECT id FROM student_skills WHERE student_id=$1::uuid AND custom_title=$2 "
+                "AND source_activity=$3 AND deleted_at IS NULL LIMIT 1", student_id, code, src)
+            if existing:
+                await conn.execute(
+                    "UPDATE student_skills SET acquired=true, updated_at=now(), "
+                    "updated_by=$3::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
+                    existing, student_id, user_id)
+            else:
+                await conn.execute(
+                    "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
+                    "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                    tenant_id, student_id, code, src, user_id)
 
 
 # v0.12.25: universal activity helpers
@@ -5303,11 +5327,23 @@ async def _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                     "VALUES ($1::uuid,$2::uuid,$3,true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
                     tenant_id, student_id, code, src, user_id)
         else:
-            await conn.execute(
-                "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
-                "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
-                "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
-                tenant_id, student_id, code, src, user_id)
+            # v0.12.143: dedupe custom skills - portal resends the full chip
+            # list on every save; without this check each save re-inserted
+            # every custom skill as a new row.
+            existing = await conn.fetchval(
+                "SELECT id FROM student_skills WHERE student_id=$1::uuid AND custom_title=$2 "
+                "AND source_activity=$3 AND deleted_at IS NULL LIMIT 1", student_id, code, src)
+            if existing:
+                await conn.execute(
+                    "UPDATE student_skills SET acquired=true, updated_at=now(), "
+                    "updated_by=$3::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
+                    existing, student_id, user_id)
+            else:
+                await conn.execute(
+                    "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
+                    "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
+                    "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                    tenant_id, student_id, code, src, user_id)
 
 # ======================================================================
 # v0.12.24 - Extracurricular expansion
