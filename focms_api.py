@@ -3127,6 +3127,39 @@ async def get_swim_bests_feed(
         """, student_id)
         _bday = await conn.fetchval(
             "SELECT birth_date FROM students WHERE id = $1", student_id)
+        _race_rows = await conn.fetch("""
+            SELECT event_date, details::text AS dj FROM events
+            WHERE student_id = $1 AND event_type = 'swim_race' AND deleted_at IS NULL
+        """, student_id)
+
+    # v0.12.137: derive the MEET for each best time by matching it back to the
+    # race it was swum in (personal_records rarely carry a meet key). Primary
+    # key: (achieved_date, event, course); fallback: (event, course, seconds).
+    _CODE2NAME = {"FR": "Free", "BK": "Back", "BR": "Breast", "FL": "Fly", "IM": "IM"}
+    _meet_by_date: dict = {}
+    _meet_by_secs: dict = {}
+    for _rr in _race_rows:
+        try:
+            _rd = json.loads(_rr["dj"]) if _rr["dj"] else {}
+        except Exception:
+            continue
+        _m = _rd.get("meet")
+        if not _m:
+            continue
+        _dist = _rd.get("distance_m") if _rd.get("distance_m") is not None else _rd.get("distance")
+        _sname = _CODE2NAME.get(str(_rd.get("stroke") or "").upper())
+        _rcourse = _rd.get("course")
+        if not (_dist and _sname and _rcourse):
+            continue
+        _rev = f"{_dist} {_sname}"
+        if _rr["event_date"]:
+            _meet_by_date[(_rr["event_date"].isoformat(), _rev, _rcourse)] = _m
+        _rsecs = _rd.get("finals_time_seconds")
+        if _rsecs is not None:
+            try:
+                _meet_by_secs[(_rev, _rcourse, round(float(_rsecs), 2))] = _m
+            except (TypeError, ValueError):
+                pass
 
     standards_scy = USA_SWIMMING_TIERS_2024_2028_BOYS_11_12["SCY"]
     standards_lcm = USA_SWIMMING_TIERS_2024_2028_BOYS_11_12["LCM"]
@@ -3167,7 +3200,9 @@ async def get_swim_bests_feed(
             "drop": drop,
             "drop_pct": round(drop / (seconds + drop) * 100, 1) if drop and drop > 0 else None,
             "age_at_swim": _age_at,
-            "meet": d.get("meet"),
+            "meet": d.get("meet")
+                    or _meet_by_date.get((r["achieved_date"].isoformat() if r["achieved_date"] else "", event, course))
+                    or _meet_by_secs.get((event, course, round(seconds, 2))),
             "visibility": r["visibility"],
             "source_system": r["source_system"],
             "source_id": r["source_id"],
