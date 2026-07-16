@@ -1,6 +1,21 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
+         showcase sections, so they rendered empty for every teen tenant:
+         recruitment_portal/athletics_recruitment (the Athletics Recruitment
+         Profile — the centerpiece of a D1 recruit's page), branding/
+         professional_branding, and leadership_impact (a code-name mismatch —
+         the catalog uses leadership_impact while the builder only knew
+         leadership_milestones/leadership_extracurricular). Added recruitment
+         (swim bests + power points + coach name/role/org + grad year; coach
+         email deliberately NOT surfaced publicly) and branding (public
+         digital_presence) builders, each handling both the catalog code and the
+         SECTION_TITLES code, and aliased leadership_impact onto the leadership
+         branch. John is currently band_6_12 (all five of his sections already
+         had builders and render fine); this fixes the tier he ages into and
+         every teen tenant on the commercial product.
+
 v0.12.132 · harden: extra="forbid" added to 31 item-level request models, each verified by
          enumerating its portal payload field-for-field so none can 422 a current
          save; each turns a FUTURE undeclared field into a loud 422 instead of a
@@ -1888,7 +1903,7 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
                     "usa_standard": d.get("usa_standard"),
                 },
             })
-    elif code in ("leadership_milestones", "leadership_extracurricular"):
+    elif code in ("leadership_milestones", "leadership_extracurricular", "leadership_impact"):
         # v0.12.130 BUGFIX: this branch was an untyped `SELECT ... FROM events`
         # with no event_type filter, so it dumped swim_race, music_performance,
         # and summer_experience rows (which belong to athlete_tracker / fine_arts
@@ -1992,6 +2007,56 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
             items.append({"title": r["title"] or "Event",
                           "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
+    elif code in ("recruitment_portal", "athletics_recruitment"):
+        # v0.12.133: Athletics Recruitment Profile (band_13_18). Source per
+        # _WEBSITE_BANDS catalog: swim bests (+ power points) + coach contacts +
+        # expected graduation year. Previously NO builder -> section rendered
+        # empty for every teen tenant. Coach EMAIL is intentionally omitted from
+        # the public payload (child-safety: no raw contact emails on a public,
+        # link-shareable page); name/role/org only.
+        gy = await tconn.fetchval(
+            "SELECT expected_hs_graduation_year FROM students WHERE id=$1::uuid", student_id)
+        if gy:
+            items.append({"title": f"Class of {gy}", "date": None,
+                          "body": "Expected high school graduation",
+                          "meta": {"grad_year": gy}})
+        prs = await tconn.fetch(
+            "SELECT title, achieved_date, value_text, details FROM personal_records "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND record_kind = 'swim_best' ORDER BY achieved_date DESC NULLS LAST", student_id)
+        for r in prs:
+            d = r["details"] if isinstance(r["details"], dict) else (json.loads(r["details"]) if r["details"] else {})
+            items.append({"title": r["title"],
+                          "date": r["achieved_date"].isoformat() if r["achieved_date"] else None,
+                          "body": r["value_text"],
+                          "meta": {"stroke": d.get("stroke"), "course": d.get("course"),
+                                   "event": d.get("event"), "best_time": r["value_text"],
+                                   "power_points": d.get("power_points"),
+                                   "usa_standard": d.get("usa_standard")}})
+        co = await tconn.fetch(
+            "SELECT coach_name, coach_role, organization_name FROM affiliations "
+            "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
+            "AND affiliation_type = 'coach_relationship' "
+            "ORDER BY role_start_date DESC NULLS LAST LIMIT 20", student_id)
+        for r in co:
+            items.append({"title": (f"Coach {r['coach_name']}" if r["coach_name"] else "Coaching contact"),
+                          "date": None,
+                          "body": r["coach_role"] or r["organization_name"],
+                          "meta": {"organization": r["organization_name"]}})
+    elif code in ("branding", "professional_branding"):
+        # v0.12.133: Professional Branding (band_13_18). Source per catalog:
+        # public digital_presence (domain, LinkedIn, handles). Previously NO
+        # builder -> section rendered empty.
+        rows = await tconn.fetch(
+            "SELECT platform, handle, profile_url, display_name, public_description, follower_count "
+            "FROM digital_presence WHERE student_id=$1::uuid AND visibility='public' "
+            "AND deleted_at IS NULL ORDER BY is_primary DESC, platform ASC LIMIT 50", student_id)
+        for r in rows:
+            items.append({"title": r["display_name"] or r["platform"] or "Profile",
+                          "date": None,
+                          "body": r["public_description"] or r["handle"],
+                          "meta": {"platform": r["platform"], "handle": r["handle"],
+                                   "url": r["profile_url"], "followers": r["follower_count"]}})
     return items
 
 
