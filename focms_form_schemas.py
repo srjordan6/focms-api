@@ -16,6 +16,17 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.148 · AI resume paywall (operator decision 2026-07-16): every
+         AI-enhanced resume (academic + career) costs $1.00 + tax, charged
+         off-session to the tenant's card on file BEFORE the record reaches
+         the LLM, inside /resume-tailor. Universal - free plans and cohort/
+         promo signups included; the non-AI structured resume stays free.
+         Stripe Tax calculation applied when active (graceful base-only
+         fallback), PaymentIntent off_session+confirm on the saved card,
+         charge logged to new resume_ai_charges table (RLS, MCP-created),
+         402 payment_failed on decline, automatic refund when the LLM step
+         fails after a successful charge. Portal v257 discloses the price.
+
 v0.12.147 · per-training skill options: cadet_training_catalog gains
          skill_options jsonb (nullable; set per title, e.g. Navy League
          Orientation's 13 skills). GET /catalogs/cadet-trainings now returns
@@ -2512,6 +2523,86 @@ class ResumeTailorRequest(BaseModel):
     sections: List[dict] = []                  # [{title, rows:[[label, detail],...]}]
 
 
+RESUME_AI_PRICE_CENTS = 100  # $1.00 base; tax added via Stripe Tax when active
+
+async def _resume_ai_charge(request: Request, student_id: str, resume_kind: str) -> dict:
+    """v0.12.148: charge $1.00 + tax to the tenant's card on file before AI
+    resume refinement. Universal - no plan or cohort exemptions. Returns
+    {payment_intent_id, amount, tax} for refund-on-LLM-failure. Raises 402 on
+    any payment problem so the portal can fall back to the free resume."""
+    api_key = _es_os.environ.get("STRIPE_SECRET_KEY")
+    if not api_key:
+        raise HTTPException(status_code=402, detail="payment_unavailable: billing not configured")
+    if _es_httpx is None:
+        raise HTTPException(status_code=402, detail="payment_unavailable: httpx missing")
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        trow = await conn.fetchrow(
+            "SELECT stripe_customer_id FROM tenants WHERE id=$1::uuid", tenant_id)
+    cust = trow["stripe_customer_id"] if trow else None
+    if not cust:
+        raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
+    hdr = {"Authorization": "Bearer " + api_key}
+    async with _es_httpx.AsyncClient(timeout=30) as client:
+        pmr = await client.get("https://api.stripe.com/v1/payment_methods",
+                               headers=hdr, params={"customer": cust, "type": "card", "limit": 1})
+        pms = (pmr.json().get("data") or []) if pmr.status_code == 200 else []
+        if not pms:
+            raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
+        pm_id = pms[0]["id"]
+        amount = RESUME_AI_PRICE_CENTS
+        tax_cents = 0
+        # Best-effort Stripe Tax: calculation succeeds only when Stripe Tax is
+        # active and the customer has a tax address; otherwise charge base only.
+        try:
+            tc = await client.post("https://api.stripe.com/v1/tax/calculations", headers=hdr, data={
+                "currency": "usd", "customer": cust,
+                "line_items[0][amount]": str(RESUME_AI_PRICE_CENTS),
+                "line_items[0][tax_behavior]": "exclusive",
+                "line_items[0][reference]": "ai_resume"})
+            if tc.status_code == 200:
+                tj = tc.json()
+                amount = int(tj.get("amount_total") or RESUME_AI_PRICE_CENTS)
+                tax_cents = max(0, amount - RESUME_AI_PRICE_CENTS)
+        except Exception:
+            pass
+        pi = await client.post("https://api.stripe.com/v1/payment_intents", headers=hdr, data={
+            "amount": str(amount), "currency": "usd", "customer": cust,
+            "payment_method": pm_id, "confirm": "true", "off_session": "true",
+            "description": "OutcomeStar AI resume enhancement",
+            "metadata[tenant_id]": tenant_id, "metadata[student_id]": student_id,
+            "metadata[resume_kind]": resume_kind})
+    if pi.status_code != 200 or (pi.json().get("status") not in ("succeeded", "processing")):
+        err = ""
+        try:
+            err = (pi.json().get("error") or {}).get("message") or pi.json().get("status") or ""
+        except Exception:
+            pass
+        raise HTTPException(status_code=402, detail="payment_failed: " + (err or "card charge declined")[:180])
+    pj = pi.json()
+    async with _tenant_conn(pool, tenant_id) as conn:
+        await conn.execute(
+            "INSERT INTO resume_ai_charges (tenant_id, student_id, resume_kind, "
+            "stripe_payment_intent_id, amount_cents, tax_cents, currency, status) "
+            "VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, 'usd', 'succeeded')",
+            tenant_id, student_id, resume_kind, pj.get("id"), amount, tax_cents)
+    return {"payment_intent_id": pj.get("id"), "amount": amount, "tax": tax_cents,
+            "tenant_id": tenant_id, "student_id": student_id}
+
+async def _resume_ai_refund(charge: dict) -> None:
+    """Refund an AI-resume charge when the LLM step fails after payment."""
+    try:
+        api_key = _es_os.environ.get("STRIPE_SECRET_KEY")
+        if not (api_key and charge and charge.get("payment_intent_id") and _es_httpx):
+            return
+        async with _es_httpx.AsyncClient(timeout=30) as client:
+            await client.post("https://api.stripe.com/v1/refunds",
+                              headers={"Authorization": "Bearer " + api_key},
+                              data={"payment_intent": charge["payment_intent_id"]})
+    except Exception:
+        pass
+
 @router.post("/student/{student_id}/resume-tailor")
 async def resume_tailor(request: Request, student_id: str, body: ResumeTailorRequest):
     await _pp_context(request, student_id)
@@ -2545,12 +2636,22 @@ async def resume_tailor(request: Request, student_id: str, body: ResumeTailorReq
         "Keep total content sized for a 1-page resume. " + ("Frame for " + audience + ".")
     )
     user = "TARGET DESCRIPTION:\n" + jd + "\n\nSTUDENT RECORD (JSON):\n" + src
+    # v0.12.148: AI resume paywall (operator decision 2026-07-16). Every
+    # AI-enhanced resume (academic or career) costs $1.00 + tax, charged to the
+    # card on file BEFORE the record reaches the LLM. Applies to ALL tenants -
+    # free plans and cohort/promo signups included. The non-AI structured
+    # resume remains free (it never calls this endpoint). Charge failure -> 402
+    # (portal falls back to the free standard resume). LLM failure after a
+    # successful charge -> automatic refund, then the usual 5xx.
+    charge = await _resume_ai_charge(request, student_id, kind)
     res = await _llm_complete(system, user, max_tokens=2200, want_json=True)
     if res.get("unavailable"):
+        await _resume_ai_refund(charge)
         raise HTTPException(status_code=503, detail=res.get("reason", "LLM unavailable"))
     obj = _extract_json(res.get("text", "")) or {}
     secs = obj.get("sections")
     if not isinstance(secs, list) or not secs:
+        await _resume_ai_refund(charge)
         raise HTTPException(status_code=502, detail="tailoring failed; use the standard resume")
     clean = []
     for sec in secs[:12]:
