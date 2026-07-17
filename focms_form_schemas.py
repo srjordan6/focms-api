@@ -16,6 +16,14 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.147 · per-training skill options: cadet_training_catalog gains
+         skill_options jsonb (nullable; set per title, e.g. Navy League
+         Orientation's 13 skills). GET /catalogs/cadet-trainings now returns
+         items: [{title, skill_options}] alongside the legacy trainings
+         title list. Portal v249 restricts the skills dropdown to a
+         training's skill_options when present. Column added live via MCP
+         (focms_app owns the table); learned titles have null options.
+
 v0.12.146 · ec-sessions location_parts: the standard address block on logger
          forms composes into the single events.location string (portal v240),
          which cannot be decomposed on re-edit - the block reopened empty.
@@ -5397,9 +5405,18 @@ async def get_cadet_trainings(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT title FROM cadet_training_catalog WHERE is_active "
-            "ORDER BY is_seed DESC, title")
-    return {"trainings": [r["title"] for r in rows]}
+            "SELECT title, skill_options FROM cadet_training_catalog "
+            "WHERE is_active ORDER BY is_seed DESC, title")
+    items = []
+    for r in rows:
+        so = r["skill_options"]
+        try:
+            so = json.loads(so) if isinstance(so, str) else so
+        except Exception:
+            so = None
+        items.append({"title": r["title"], "skill_options": so})
+    # legacy shape kept so an older portal keeps working
+    return {"trainings": [i["title"] for i in items], "items": items}
 
 
 @router.get("/catalogs/named-awards")
