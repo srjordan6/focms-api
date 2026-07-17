@@ -16,6 +16,15 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
+v0.12.149 · Age gate on college applications + essays (operator decision
+         2026-07-16): creating or updating an application or essay requires
+         the student to be at least 17 (high-school junior/senior window).
+         Enforced server-side in POST /applications and POST /essays via
+         _age_gate_17 (students.birth_date, age(birth_date) >= 17); under-17
+         creates/saves 403 age_restricted with a clear message. Deletes and
+         reads remain allowed at any age. Portal v258 hides the create paths
+         and explains the age requirement.
+
 v0.12.148 · AI resume paywall (operator decision 2026-07-16): every
          AI-enhanced resume (academic + career) costs $1.00 + tax, charged
          off-session to the tenant's card on file BEFORE the record reaches
@@ -6038,12 +6047,29 @@ async def get_student_applications(request: Request, student_id: str):
     return {"student_id": student_id, "applications": out}
 
 
+async def _age_gate_17(conn, student_id: str, what: str) -> None:
+    """v0.12.149: college applications and essays are for students aged 17+
+    (operator decision 2026-07-16). Blocks creates/updates; deletes and reads
+    are unaffected. Missing birth_date fails closed (403) - every provisioned
+    student has one from signup."""
+    row = await conn.fetchrow(
+        "SELECT EXTRACT(YEAR FROM age(birth_date))::int AS age "
+        "FROM students WHERE id=$1::uuid AND deleted_at IS NULL", student_id)
+    age = row["age"] if row and row["age"] is not None else None
+    if age is None or age < 17:
+        raise HTTPException(status_code=403,
+            detail="age_restricted: " + what + " open at age 17 - this student is "
+                   + (str(age) if age is not None else "of unknown age")
+                   + ". The record keeps building until then.")
+
 @router.post("/student/{student_id}/applications")
 async def post_student_applications(request: Request, student_id: str, body: ApplicationsRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = updated = deleted = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
+        if body.items:
+            await _age_gate_17(conn, student_id, "college applications")
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for did in body.delete_ids or []:
@@ -7707,6 +7733,8 @@ async def post_essays(request: Request, student_id: str, body: EssaysRequest):
     saved = updated = deleted = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
+        if body.items:
+            await _age_gate_17(conn, student_id, "college essays")
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for did in body.delete_ids or []:
