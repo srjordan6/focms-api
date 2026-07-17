@@ -5,6 +5,16 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.18 (2026-07-16):
+- Demo account reset-on-login: when the login email matches DEMO_ACCOUNT_EMAIL
+  (env, default demo@outcomestar.app), _demo_restore wipes the demo tenant's
+  data tables and re-inserts the pristine rows stored in demo_snapshot
+  (jsonb per table, MCP-captured) before the portal token is minted. Every
+  demo login therefore starts from the exact same seeded state - edits made
+  while demonstrating vanish on the next login. Identity tables (users,
+  user_credentials, tenants, roles, api_tokens) are never reset. Restore
+  failures log and never block login.
+
 v0.11.17 (2026-07-06):
 - Cloudflare Turnstile on cohort-signup, /auth/login, /auth/forgot-password.
 
@@ -1420,6 +1430,35 @@ async def set_password(body: SetPasswordRequest, request: Request) -> dict[str, 
     return {"ok": True}
 
 
+DEMO_ACCOUNT_EMAIL = os.environ.get("DEMO_ACCOUNT_EMAIL", "demo@outcomestar.app").strip().lower()
+
+# v0.11.18: delete order children-first; insert order is the reverse.
+_DEMO_TABLES = [
+    "uca_form_instances", "applications", "essays", "student_life_milestones",
+    "personal_records", "events", "affiliations", "standardized_test_scores",
+    "class_rank_history", "gpa_history", "courses_taken",
+    "student_school_enrollments", "family_members",
+    "student_personal_details", "students",
+]
+
+
+async def _demo_restore(conn, tenant_id: str) -> None:
+    """v0.11.18: restore the demo tenant to its pristine snapshot. Deletes all
+    demo-tenant rows in _DEMO_TABLES (children first) and re-inserts the rows
+    stored in demo_snapshot (parents first). Runs inside one transaction with
+    tenant RLS context. Table names come from the literal list above - never
+    from input."""
+    tid = str(UUID(str(tenant_id)))  # validate before f-string (playbook)
+    async with conn.transaction():
+        await conn.execute(f"SET LOCAL app.current_tenant_id = '{tid}'")
+        for t in _DEMO_TABLES:
+            await conn.execute(f"DELETE FROM {t} WHERE tenant_id=$1::uuid", tid)
+        for t in reversed(_DEMO_TABLES):
+            await conn.execute(
+                f"INSERT INTO {t} SELECT * FROM jsonb_populate_recordset(null::{t}, "
+                f"(SELECT rows FROM demo_snapshot WHERE table_name=$1))", t)
+
+
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str = Field(..., min_length=1, max_length=200)
@@ -1465,6 +1504,11 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
         if not role:
             raise generic
         tenant_id = role["tenant_id"]
+        if email == DEMO_ACCOUNT_EMAIL:
+            try:
+                await _demo_restore(conn, str(tenant_id))
+            except Exception as exc:  # never block a demo login on restore
+                log.warning("demo restore failed: %s", exc)
         students = await conn.fetch(
             "SELECT id FROM students WHERE tenant_id=$1 AND deleted_at IS NULL ORDER BY created_at",
             tenant_id)
