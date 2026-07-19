@@ -8624,3 +8624,50 @@ async def get_org_ranks(request: Request, program: str = ""):
     return {"program": program, "ranks": [
         {"title": r["title"], "description": r["description"],
          "sort_order": r["sort_order"]} for r in rows]}
+
+
+# v0.12.153: org member profile. The Sea Cadets Unit Information pattern for
+# every organization: whitelisted per-org identity keys (troop/patrol/member
+# id/council/district and equivalents) merged into affiliations.details via a
+# dedicated append-only endpoint - AffiliationItem and the main POST stay
+# untouched. The affiliations GET already returns details, so stored keys
+# flow to the portal with zero read-path changes.
+_ORG_PROFILE_KEYS = {
+    "bsa_troop", "bsa_patrol", "bsa_member_id", "bsa_council", "bsa_district",
+    "gsa_troop", "gsa_member_id", "gsa_council",
+    "cap_squadron", "cap_wing", "cap_cap_id",
+    "jrotc_branch", "jrotc_unit", "jrotc_company",
+}
+
+
+class OrgProfileBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    fields: dict = {}
+
+
+@router.post("/student/{student_id}/affiliations/{affil_id}/org-profile")
+async def post_affiliation_org_profile(request: Request, student_id: str, affil_id: str,
+                                       body: OrgProfileBody):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    try:
+        _ = _uuid.UUID(affil_id)
+    except Exception:
+        raise HTTPException(400, {"error": "bad_affiliation_id"})
+    clean = {}
+    for k, val in (body.fields or {}).items():
+        if k not in _ORG_PROFILE_KEYS:
+            continue
+        sval = ("" if val is None else str(val)).strip()[:200]
+        clean[k] = sval  # empty string clears the key's value
+    if not clean:
+        return {"affiliation_id": affil_id, "updated": 0}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        r = await conn.execute(
+            "UPDATE affiliations SET details = details || $3::jsonb, "
+            "updated_at=now(), updated_by=$4::uuid "
+            "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
+            affil_id, student_id, json.dumps(clean), user_id)
+    return {"affiliation_id": affil_id,
+            "updated": 1 if (r and r.endswith(" 1")) else 0,
+            "keys": sorted(clean.keys())}
