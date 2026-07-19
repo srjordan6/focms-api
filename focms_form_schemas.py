@@ -16,77 +16,6 @@ v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          had builders and render fine); this fixes the tier he ages into and
          every teen tenant on the commercial product.
 
-v0.12.149 · Age gate on college applications + essays (operator decision
-         2026-07-16): creating or updating an application or essay requires
-         the student to be at least 17 (high-school junior/senior window).
-         Enforced server-side in POST /applications and POST /essays via
-         _age_gate_17 (students.birth_date, age(birth_date) >= 17); under-17
-         creates/saves 403 age_restricted with a clear message. Deletes and
-         reads remain allowed at any age. Portal v258 hides the create paths
-         and explains the age requirement.
-
-v0.12.148 · AI resume paywall (operator decision 2026-07-16): every
-         AI-enhanced resume (academic + career) costs $1.00 + tax, charged
-         off-session to the tenant's card on file BEFORE the record reaches
-         the LLM, inside /resume-tailor. Universal - free plans and cohort/
-         promo signups included; the non-AI structured resume stays free.
-         Stripe Tax calculation applied when active (graceful base-only
-         fallback), PaymentIntent off_session+confirm on the saved card,
-         charge logged to new resume_ai_charges table (RLS, MCP-created),
-         402 payment_failed on decline, automatic refund when the LLM step
-         fails after a successful charge. Portal v257 discloses the price.
-
-v0.12.147 · per-training skill options: cadet_training_catalog gains
-         skill_options jsonb (nullable; set per title, e.g. Navy League
-         Orientation's 13 skills). GET /catalogs/cadet-trainings now returns
-         items: [{title, skill_options}] alongside the legacy trainings
-         title list. Portal v249 restricts the skills dropdown to a
-         training's skill_options when present. Column added live via MCP
-         (focms_app owns the table); learned titles have null options.
-
-v0.12.146 · ec-sessions location_parts: the standard address block on logger
-         forms composes into the single events.location string (portal v240),
-         which cannot be decomposed on re-edit - the block reopened empty.
-         EcSessionItem gains location_parts (dict of street_address/
-         street_address_line_2/city_town/county/state_province/
-         zip_postal_code/country); stored in events.details.location_parts via
-         the same $16 jsonb merge as media_ids; GET returns it for prefill.
-         Portal v245 pairs (block prefills from location_parts on edit).
-
-v0.12.145 · ec-sessions media: EcSessionItem gains media_ids (universal media
-         widget now on Log training / rank / performance / session forms -
-         portal v243). Stored in events.details.media_ids via the existing
-         jsonb merge; GET returns media_ids for prefill. Same pattern as
-         affiliations v0.12.142.
-
-v0.12.144 · cadet training catalog + training date ranges. (1) New platform
-         reference table cadet_training_catalog (no tenant_id - shared across
-         all tenants so a training entered by one cadet appears in the dropdown
-         for the next). Seeded with Recruit Training + the 8 advanced trainings;
-         GET /catalogs/cadet-trainings returns active titles; post_ec_sessions
-         auto-learns: any milestone_kind='training' title is upserted into the
-         catalog (ON CONFLICT DO NOTHING). (2) EcSessionItem gains
-         event_end_date; UPDATE/INSERT write events.event_end_date (column
-         already existed); GET returns it. Portal v241 pairs with this
-         (training dropdown + start/end date pickers); portal must NOT ship
-         before this deploys (extra=forbid).
-
-v0.12.143 · fix: custom skills duplicated on every save. Both skill-attach
-         helpers (_apply_skills_and_showcase and the courses variant) checked
-         for an existing row only for CATALOG skills; the custom-title branch
-         blind-INSERTed a new student_skills row on each save. Since the portal
-         sends the full chip list every save, each save re-inserted every
-         custom skill (John's Recruit Training record accumulated 37 rows for
-         13 skills). Custom branch now checks for an existing non-deleted row
-         by (student_id, custom_title, source_activity) and UPDATEs it instead.
-         Data repaired same session: 37 duplicate rows soft-deleted keeping the
-         earliest per (source_activity, title). Applies to every form with the
-         skills widget: affiliations, awards, ec-sessions, courses.
-
-v0.12.142 · affiliations: accept media_ids + details from portal v226+ (media
-         widget, USNSCC block); merge into details jsonb; GET returns details
-         for prefill. Fixes 422 on every EC save since portal v226.
-
 v0.12.132 · harden: extra="forbid" added to 31 item-level request models, each verified by
          enumerating its portal payload field-for-field so none can 422 a current
          save; each turns a FUTURE undeclared field into a loud 422 instead of a
@@ -2532,86 +2461,6 @@ class ResumeTailorRequest(BaseModel):
     sections: List[dict] = []                  # [{title, rows:[[label, detail],...]}]
 
 
-RESUME_AI_PRICE_CENTS = 100  # $1.00 base; tax added via Stripe Tax when active
-
-async def _resume_ai_charge(request: Request, student_id: str, resume_kind: str) -> dict:
-    """v0.12.148: charge $1.00 + tax to the tenant's card on file before AI
-    resume refinement. Universal - no plan or cohort exemptions. Returns
-    {payment_intent_id, amount, tax} for refund-on-LLM-failure. Raises 402 on
-    any payment problem so the portal can fall back to the free resume."""
-    api_key = _es_os.environ.get("STRIPE_SECRET_KEY")
-    if not api_key:
-        raise HTTPException(status_code=402, detail="payment_unavailable: billing not configured")
-    if _es_httpx is None:
-        raise HTTPException(status_code=402, detail="payment_unavailable: httpx missing")
-    tenant_id, _uid = await _pp_context(request, student_id)
-    pool: asyncpg.Pool = request.app.state.pool
-    async with _tenant_conn(pool, tenant_id) as conn:
-        trow = await conn.fetchrow(
-            "SELECT stripe_customer_id FROM tenants WHERE id=$1::uuid", tenant_id)
-    cust = trow["stripe_customer_id"] if trow else None
-    if not cust:
-        raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
-    hdr = {"Authorization": "Bearer " + api_key}
-    async with _es_httpx.AsyncClient(timeout=30) as client:
-        pmr = await client.get("https://api.stripe.com/v1/payment_methods",
-                               headers=hdr, params={"customer": cust, "type": "card", "limit": 1})
-        pms = (pmr.json().get("data") or []) if pmr.status_code == 200 else []
-        if not pms:
-            raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
-        pm_id = pms[0]["id"]
-        amount = RESUME_AI_PRICE_CENTS
-        tax_cents = 0
-        # Best-effort Stripe Tax: calculation succeeds only when Stripe Tax is
-        # active and the customer has a tax address; otherwise charge base only.
-        try:
-            tc = await client.post("https://api.stripe.com/v1/tax/calculations", headers=hdr, data={
-                "currency": "usd", "customer": cust,
-                "line_items[0][amount]": str(RESUME_AI_PRICE_CENTS),
-                "line_items[0][tax_behavior]": "exclusive",
-                "line_items[0][reference]": "ai_resume"})
-            if tc.status_code == 200:
-                tj = tc.json()
-                amount = int(tj.get("amount_total") or RESUME_AI_PRICE_CENTS)
-                tax_cents = max(0, amount - RESUME_AI_PRICE_CENTS)
-        except Exception:
-            pass
-        pi = await client.post("https://api.stripe.com/v1/payment_intents", headers=hdr, data={
-            "amount": str(amount), "currency": "usd", "customer": cust,
-            "payment_method": pm_id, "confirm": "true", "off_session": "true",
-            "description": "OutcomeStar AI resume enhancement",
-            "metadata[tenant_id]": tenant_id, "metadata[student_id]": student_id,
-            "metadata[resume_kind]": resume_kind})
-    if pi.status_code != 200 or (pi.json().get("status") not in ("succeeded", "processing")):
-        err = ""
-        try:
-            err = (pi.json().get("error") or {}).get("message") or pi.json().get("status") or ""
-        except Exception:
-            pass
-        raise HTTPException(status_code=402, detail="payment_failed: " + (err or "card charge declined")[:180])
-    pj = pi.json()
-    async with _tenant_conn(pool, tenant_id) as conn:
-        await conn.execute(
-            "INSERT INTO resume_ai_charges (tenant_id, student_id, resume_kind, "
-            "stripe_payment_intent_id, amount_cents, tax_cents, currency, status) "
-            "VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, 'usd', 'succeeded')",
-            tenant_id, student_id, resume_kind, pj.get("id"), amount, tax_cents)
-    return {"payment_intent_id": pj.get("id"), "amount": amount, "tax": tax_cents,
-            "tenant_id": tenant_id, "student_id": student_id}
-
-async def _resume_ai_refund(charge: dict) -> None:
-    """Refund an AI-resume charge when the LLM step fails after payment."""
-    try:
-        api_key = _es_os.environ.get("STRIPE_SECRET_KEY")
-        if not (api_key and charge and charge.get("payment_intent_id") and _es_httpx):
-            return
-        async with _es_httpx.AsyncClient(timeout=30) as client:
-            await client.post("https://api.stripe.com/v1/refunds",
-                              headers={"Authorization": "Bearer " + api_key},
-                              data={"payment_intent": charge["payment_intent_id"]})
-    except Exception:
-        pass
-
 @router.post("/student/{student_id}/resume-tailor")
 async def resume_tailor(request: Request, student_id: str, body: ResumeTailorRequest):
     await _pp_context(request, student_id)
@@ -2645,22 +2494,12 @@ async def resume_tailor(request: Request, student_id: str, body: ResumeTailorReq
         "Keep total content sized for a 1-page resume. " + ("Frame for " + audience + ".")
     )
     user = "TARGET DESCRIPTION:\n" + jd + "\n\nSTUDENT RECORD (JSON):\n" + src
-    # v0.12.148: AI resume paywall (operator decision 2026-07-16). Every
-    # AI-enhanced resume (academic or career) costs $1.00 + tax, charged to the
-    # card on file BEFORE the record reaches the LLM. Applies to ALL tenants -
-    # free plans and cohort/promo signups included. The non-AI structured
-    # resume remains free (it never calls this endpoint). Charge failure -> 402
-    # (portal falls back to the free standard resume). LLM failure after a
-    # successful charge -> automatic refund, then the usual 5xx.
-    charge = await _resume_ai_charge(request, student_id, kind)
     res = await _llm_complete(system, user, max_tokens=2200, want_json=True)
     if res.get("unavailable"):
-        await _resume_ai_refund(charge)
         raise HTTPException(status_code=503, detail=res.get("reason", "LLM unavailable"))
     obj = _extract_json(res.get("text", "")) or {}
     secs = obj.get("sections")
     if not isinstance(secs, list) or not secs:
-        await _resume_ai_refund(charge)
         raise HTTPException(status_code=502, detail="tailoring failed; use the standard resume")
     clean = []
     for sec in secs[:12]:
@@ -5219,12 +5058,13 @@ class AffiliationItem(BaseModel):
     usa_zone: Optional[str] = None       # Eastern | Central | Southern | Western
     usa_lsc: Optional[str] = None        # e.g. "North Texas Swimming (NT)"
     usa_club_code: Optional[str] = None  # e.g. "IRON-NT"
-    # v0.12.142: portal v226+ sends media_ids (universal media widget) and a
-    # generic details dict (v228/v229 USNSCC keys). extra="forbid" was 422-ing
-    # every EC save since portal v226. media_ids folds into details; details
-    # merges into the row's jsonb (existing keys preserved, incoming wins).
+    # v0.12.142: per-record media attachments (photos, video, documents).
+    # UUIDs of media_files rows (uploaded via POST /focms/v1/media), stored on
+    # the OWNING record as details->'media_ids' (jsonb array). media_files has
+    # no related_* columns and focms_app cannot ALTER, so linkage lives on the
+    # record - the same pattern generalizes to every details-bearing table.
+    # None = leave unchanged; [] = clear all attachments.
     media_ids: Optional[List[str]] = None
-    details: Optional[dict] = None
     affiliation_type: str
     organization_name: str
     organization_url: Optional[str] = None
@@ -5248,14 +5088,6 @@ class AffiliationsRequest(BaseModel):
     delete_ids: List[str] = []
 
 
-def _affil_extra(it: AffiliationItem) -> str:
-    # v0.12.142: one jsonb param merging generic details + media_ids
-    extra = dict(it.details or {})
-    if it.media_ids is not None:
-        extra["media_ids"] = it.media_ids
-    return json.dumps(extra)
-
-
 @router.get("/student/{student_id}/affiliations")
 async def get_student_affiliations(request: Request, student_id: str):
     tenant_id, _ = await _pp_context(request, student_id)
@@ -5264,11 +5096,11 @@ async def get_student_affiliations(request: Request, student_id: str):
         rows = await conn.fetch(
             "SELECT a.id, a.affiliation_type::text AS affiliation_type, a.organization_name, "
             "a.details->>'program_code' AS program_code, "
-            "a.details::text AS details, "  # v0.12.142: portal prefill (usnscc_*, media_ids)
             "a.details->'usa_swimming'->>'zone' AS usa_zone, "
             "a.details->'usa_swimming'->>'lsc' AS usa_lsc, "
             "a.details->'usa_swimming'->>'club_code' AS usa_club_code, "
             "COALESCE((a.details->'usa_swimming'->>'member')::boolean, a.details ? 'usa_swimming') AS usa_member, "
+            "(a.details->'media_ids')::text AS media_ids, "
             "a.organization_url, a.organization_city, a.organization_state, a.role, "
             "a.role_start_date, a.role_end_date, a.weekly_hours, a.total_hours, "
             "a.coach_name, a.coach_email, a.coach_role, a.notes, a.public_description, "
@@ -5287,7 +5119,10 @@ async def get_student_affiliations(request: Request, student_id: str):
             d[k] = d[k].isoformat() if d[k] else None
         for k in ("weekly_hours", "total_hours"):
             d[k] = float(d[k]) if d[k] is not None else None
-        d["details"] = json.loads(d["details"]) if d.get("details") else {}  # v0.12.142
+        try:  # v0.12.142: jsonb array -> python list
+            d["media_ids"] = json.loads(d["media_ids"]) if d["media_ids"] else []
+        except Exception:
+            d["media_ids"] = []
         out.append(d)
     return {"student_id": student_id, "affiliations": out}
 
@@ -5318,6 +5153,17 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                 name = (it.organization_name or "").strip()
                 if not name:
                     continue
+                # v0.12.142: media attachments - keep only valid UUIDs.
+                # None = untouched; [] (or all-invalid) = clear.
+                if it.media_ids is None:
+                    _mids = None
+                else:
+                    _mids = []
+                    for _m in it.media_ids:
+                        try:
+                            _mids.append(str(_uuid.UUID(str(_m))))
+                        except Exception:
+                            continue
                 if it.id:
                     try:
                         _ = _uuid.UUID(it.id)
@@ -5338,7 +5184,8 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "'member', COALESCE($23::boolean, true), "
                         "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) "
                         "ELSE '{}'::jsonb END "
-                        "|| $24::jsonb, "
+                        "|| CASE WHEN $24::text[] IS NULL THEN '{}'::jsonb "
+                        "ELSE jsonb_build_object('media_ids', to_jsonb($24::text[])) END, "
                         "updated_at=now(), updated_by=$18::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, atype, name, it.organization_url,
@@ -5346,8 +5193,7 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id, it.program_code,
-                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member,
-                        _affil_extra(it))
+                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member, _mids)
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "affiliations", it.id, it.skills_gained, it.show_on_showcase)
@@ -5367,7 +5213,9 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         "jsonb_build_object('usa_swimming', jsonb_strip_nulls(jsonb_build_object("
                         "'member', COALESCE($23::boolean, true), "
                         "'zone', $20::text, 'lsc', $21::text, 'club_code', $22::text))) "
-                        "ELSE '{}'::jsonb END || $24::jsonb),"
+                        "ELSE '{}'::jsonb END "
+                        "|| CASE WHEN $24::text[] IS NULL THEN '{}'::jsonb "
+                        "ELSE jsonb_build_object('media_ids', to_jsonb($24::text[])) END),"
                         "'private','parent_portal',"
                         "$18::uuid,$18::uuid) RETURNING id",
                         tenant_id, student_id, atype, name, it.organization_url,
@@ -5375,12 +5223,64 @@ async def post_student_affiliations(request: Request, student_id: str, body: Aff
                         it.role_start_date, it.role_end_date, it.weekly_hours,
                         it.total_hours, it.coach_name, it.coach_email, it.coach_role,
                         it.notes, it.public_description, user_id, it.program_code,
-                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member,
-                        _affil_extra(it))
+                        it.usa_zone, it.usa_lsc, it.usa_club_code, it.usa_member, _mids)
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "affiliations", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+# v0.12.142: batch media metadata for attachment chips. The portal stores
+# media_files UUIDs on owning records (details->'media_ids'); this returns
+# filename/mime/kind for a comma-separated id list so chips can show real
+# names without N binary GETs. RLS scopes rows to the tenant.
+@router.get("/student/{student_id}/media-meta")
+async def get_student_media_meta(request: Request, student_id: str, ids: str = ""):
+    tenant_id, _ = await _pp_context(request, student_id)
+    id_list = []
+    for part in (ids or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            id_list.append(str(_uuid.UUID(part)))
+        except Exception:
+            continue
+    if not id_list:
+        return {"student_id": student_id, "media": []}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        rows = await conn.fetch(
+            "SELECT id, original_filename, mime_type, kind, byte_size "
+            "FROM media_files WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL",
+            id_list)
+    return {"student_id": student_id, "media": [
+        {"id": str(r["id"]), "filename": r["original_filename"],
+         "mime_type": r["mime_type"], "kind": r["kind"],
+         "byte_size": r["byte_size"]} for r in rows]}
+
+
+# v0.12.143: purpose-keyed media lookup. media_files.kind is free-form, so UI
+# surfaces persist "which photo goes where" as media itself with a purpose
+# kind (e.g. 'ui_photo:ec:sports'); newest non-deleted row wins. No student
+# details column exists and focms_app cannot ALTER - this keeps the mapping
+# in the media layer with zero schema change.
+@router.get("/student/{student_id}/media-by-kind")
+async def get_student_media_by_kind(request: Request, student_id: str, kind: str = ""):
+    tenant_id, _ = await _pp_context(request, student_id)
+    kind = (kind or "").strip()
+    if not kind or len(kind) > 128:
+        return {"student_id": student_id, "id": None}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT id, mime_type, original_filename FROM media_files "
+            "WHERE student_id=$1::uuid AND kind=$2 AND deleted_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 1", student_id, kind)
+    if not row:
+        return {"student_id": student_id, "id": None}
+    return {"student_id": student_id, "id": str(row["id"]),
+            "mime_type": row["mime_type"], "filename": row["original_filename"]}
 
 
 
@@ -5416,23 +5316,11 @@ async def _course_skills_to_inventory(conn, tenant_id, student_id, user_id,
                     "VALUES ($1::uuid,$2::uuid,$3,true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
                     tenant_id, student_id, code, src, user_id)
         else:
-            # v0.12.143: dedupe custom skills - portal resends the full chip
-            # list on every save; without this check each save re-inserted
-            # every custom skill as a new row.
-            existing = await conn.fetchval(
-                "SELECT id FROM student_skills WHERE student_id=$1::uuid AND custom_title=$2 "
-                "AND source_activity=$3 AND deleted_at IS NULL LIMIT 1", student_id, code, src)
-            if existing:
-                await conn.execute(
-                    "UPDATE student_skills SET acquired=true, updated_at=now(), "
-                    "updated_by=$3::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
-                    existing, student_id, user_id)
-            else:
-                await conn.execute(
-                    "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
-                    "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
-                    tenant_id, student_id, code, src, user_id)
+            await conn.execute(
+                "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
+                "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
+                "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                tenant_id, student_id, code, src, user_id)
 
 
 # v0.12.25: universal activity helpers
@@ -5472,23 +5360,11 @@ async def _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                     "VALUES ($1::uuid,$2::uuid,$3,true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
                     tenant_id, student_id, code, src, user_id)
         else:
-            # v0.12.143: dedupe custom skills - portal resends the full chip
-            # list on every save; without this check each save re-inserted
-            # every custom skill as a new row.
-            existing = await conn.fetchval(
-                "SELECT id FROM student_skills WHERE student_id=$1::uuid AND custom_title=$2 "
-                "AND source_activity=$3 AND deleted_at IS NULL LIMIT 1", student_id, code, src)
-            if existing:
-                await conn.execute(
-                    "UPDATE student_skills SET acquired=true, updated_at=now(), "
-                    "updated_by=$3::uuid WHERE id=$1::uuid AND student_id=$2::uuid",
-                    existing, student_id, user_id)
-            else:
-                await conn.execute(
-                    "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
-                    "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
-                    "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
-                    tenant_id, student_id, code, src, user_id)
+            await conn.execute(
+                "INSERT INTO student_skills (tenant_id, student_id, custom_title, custom_domain, "
+                "acquired, acquired_date, source_activity, source_system, created_by, updated_by) "
+                "VALUES ($1::uuid,$2::uuid,$3,'custom',true,now()::date,$4,'parent_portal',$5::uuid,$5::uuid)",
+                tenant_id, student_id, code, src, user_id)
 
 # ======================================================================
 # v0.12.24 - Extracurricular expansion
@@ -5505,28 +5381,6 @@ async def get_affiliation_programs(request: Request):
             "SELECT code, title, category, capstone_award FROM affiliation_programs_catalog "
             "WHERE is_active ORDER BY sort_order, title")
     return {"programs": [dict(r) for r in rows]}
-
-
-@router.get("/catalogs/cadet-trainings")
-async def get_cadet_trainings(request: Request):
-    # v0.12.144: shared (cross-tenant) training list - seeds + every title any
-    # cadet has entered; feeds the training dropdown in the portal.
-    _ = await _resolve_context(request)
-    pool: asyncpg.Pool = request.app.state.pool
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT title, skill_options FROM cadet_training_catalog "
-            "WHERE is_active ORDER BY is_seed DESC, title")
-    items = []
-    for r in rows:
-        so = r["skill_options"]
-        try:
-            so = json.loads(so) if isinstance(so, str) else so
-        except Exception:
-            so = None
-        items.append({"title": r["title"], "skill_options": so})
-    # legacy shape kept so an older portal keeps working
-    return {"trainings": [i["title"] for i in items], "items": items}
 
 
 @router.get("/catalogs/named-awards")
@@ -5680,9 +5534,6 @@ class EcSessionItem(BaseModel):
     music_played: Optional[str] = None    # v0.12.99: piece(s) performed
     composer: Optional[str] = None        # v0.12.99: composer(s)
     milestone_kind: Optional[str] = None  # v0.12.100: rank | merit_badge | award | training
-    event_end_date: Optional[str] = None  # v0.12.144: training end date (events.event_end_date)
-    media_ids: Optional[List[str]] = None  # v0.12.145: universal media widget
-    location_parts: Optional[dict] = None  # v0.12.146: address-block components for prefill
 
 
 class EcSessionsRequest(BaseModel):
@@ -5698,12 +5549,9 @@ async def get_ec_sessions(request: Request, student_id: str):
     async with _tenant_conn(pool, tenant_id) as conn:
         rows = await conn.fetch(
             "SELECT e.id::text AS id, e.event_type::text AS event_type, e.title, e.event_date, "
-            "e.event_end_date, "
             "e.duration_minutes, e.location_name AS location, e.affiliation_id::text AS related_affiliation_id, "
             "e.details->>'instrument' AS instrument, e.details->>'music_played' AS music_played, "
             "e.details->>'composer' AS composer, e.details->>'milestone_kind' AS milestone_kind, "
-            "e.details->'media_ids' AS media_ids, "
-            "e.details->'location_parts' AS location_parts, "
             "e.notes, e.source_system, (e.visibility='public') AS show_on_showcase, "
             "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
             " FROM student_skills ss WHERE ss.source_activity = 'events:'||e.id::text "
@@ -5716,15 +5564,6 @@ async def get_ec_sessions(request: Request, student_id: str):
     for r in rows:
         d = dict(r)
         d["event_date"] = d["event_date"].isoformat() if d["event_date"] else None
-        d["event_end_date"] = d["event_end_date"].isoformat() if d["event_end_date"] else None
-        try:
-            d["media_ids"] = json.loads(d["media_ids"]) if d.get("media_ids") else []
-        except Exception:
-            d["media_ids"] = []
-        try:
-            d["location_parts"] = json.loads(d["location_parts"]) if d.get("location_parts") else None
-        except Exception:
-            d["location_parts"] = None
         d["duration_hours"] = round(d["duration_minutes"]/60.0, 2) if d["duration_minutes"] is not None else None
         d.pop("duration_minutes", None)
         out.append(d)
@@ -5753,12 +5592,6 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                 title = (it.title or "").strip()
                 edate = (it.event_date or "").strip()
                 if not title or not edate: continue
-                if (it.milestone_kind or "") == "training":
-                    # v0.12.144: shared training catalog learns every new title
-                    await conn.execute(
-                        "INSERT INTO cadet_training_catalog (title) "
-                        "SELECT initcap($1) WHERE NOT EXISTS "
-                        "(SELECT 1 FROM cadet_training_catalog WHERE lower(title)=lower($1))", title)
                 if it.id:
                     try: _uuid.UUID(it.id)
                     except Exception: continue
@@ -5766,20 +5599,15 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         "UPDATE events SET event_type=$3::event_type_enum, title=$4, "
                         "event_date=NULLIF($5,'')::date, duration_minutes=$6, location_name=$7, "
                         "affiliation_id=NULLIF($8,'')::uuid, notes=$9, "
-                        "event_end_date=NULLIF($15,'')::date, "
                         "details = details || jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
-                        "'milestone_kind', $14::text)) || $16::jsonb, "
+                        "'milestone_kind', $14::text)), "
                         "updated_at=now(), updated_by=$10::uuid "
                         "WHERE id=$1::uuid AND student_id=$2::uuid AND deleted_at IS NULL",
                         it.id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
-                        it.instrument, it.music_played, it.composer, it.milestone_kind,
-                        it.event_end_date or '',
-                        json.dumps({k: v for k, v in (
-                            ("media_ids", it.media_ids),
-                            ("location_parts", it.location_parts)) if v is not None}))
+                        it.instrument, it.music_played, it.composer, it.milestone_kind)
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                             "events", it.id, it.skills_gained, it.show_on_showcase)
@@ -5788,22 +5616,17 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                     rid = await conn.fetchval(
                         "INSERT INTO events (tenant_id, student_id, event_type, title, "
                         "event_date, duration_minutes, location_name, affiliation_id, notes, "
-                        "event_end_date, "
                         "details, visibility, source_system, created_by, updated_by) "
                         "VALUES ($1::uuid,$2::uuid,$3::event_type_enum,$4,NULLIF($5,'')::date,$6,$7,"
-                        "NULLIF($8,'')::uuid,$9,NULLIF($15,'')::date,"
+                        "NULLIF($8,'')::uuid,$9,"
                         "jsonb_strip_nulls(jsonb_build_object("
                         "'instrument', $11::text, 'music_played', $12::text, 'composer', $13::text, "
-                        "'milestone_kind', $14::text)) || $16::jsonb,"
+                        "'milestone_kind', $14::text)),"
                         "'private','parent_portal',$10::uuid,$10::uuid) RETURNING id",
                         tenant_id, student_id, etype, title, edate,
                         int(it.duration_hours*60) if it.duration_hours is not None else None,
                         it.location, it.related_affiliation_id or '', it.notes, user_id,
-                        it.instrument, it.music_played, it.composer, it.milestone_kind,
-                        it.event_end_date or '',
-                        json.dumps({k: v for k, v in (
-                            ("media_ids", it.media_ids),
-                            ("location_parts", it.location_parts)) if v is not None}))
+                        it.instrument, it.music_played, it.composer, it.milestone_kind)
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
                     saved += 1
@@ -6047,29 +5870,12 @@ async def get_student_applications(request: Request, student_id: str):
     return {"student_id": student_id, "applications": out}
 
 
-async def _age_gate_17(conn, student_id: str, what: str) -> None:
-    """v0.12.149: college applications and essays are for students aged 17+
-    (operator decision 2026-07-16). Blocks creates/updates; deletes and reads
-    are unaffected. Missing birth_date fails closed (403) - every provisioned
-    student has one from signup."""
-    row = await conn.fetchrow(
-        "SELECT EXTRACT(YEAR FROM age(birth_date))::int AS age "
-        "FROM students WHERE id=$1::uuid AND deleted_at IS NULL", student_id)
-    age = row["age"] if row and row["age"] is not None else None
-    if age is None or age < 17:
-        raise HTTPException(status_code=403,
-            detail="age_restricted: " + what + " open at age 17 - this student is "
-                   + (str(age) if age is not None else "of unknown age")
-                   + ". The record keeps building until then.")
-
 @router.post("/student/{student_id}/applications")
 async def post_student_applications(request: Request, student_id: str, body: ApplicationsRequest):
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = updated = deleted = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
-        if body.items:
-            await _age_gate_17(conn, student_id, "college applications")
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for did in body.delete_ids or []:
@@ -7733,8 +7539,6 @@ async def post_essays(request: Request, student_id: str, body: EssaysRequest):
     saved = updated = deleted = 0
     pool: asyncpg.Pool = request.app.state.pool
     async with _tenant_conn(pool, tenant_id) as conn:
-        if body.items:
-            await _age_gate_17(conn, student_id, "college essays")
         async with conn.transaction():
             await conn.execute(f"SET LOCAL app.current_tenant_id = '{tenant_id}'")
             for did in body.delete_ids or []:

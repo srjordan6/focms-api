@@ -783,7 +783,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.12.134", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.143", lifespan=lifespan)
 
 
 @app.get("/focms/v1/livez")
