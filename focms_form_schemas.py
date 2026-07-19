@@ -8569,3 +8569,37 @@ async def get_student_media_by_kind(request: Request, student_id: str, kind: str
         return {"student_id": student_id, "id": None}
     return {"student_id": student_id, "id": str(row["id"]),
             "mime_type": row["mime_type"], "filename": row["original_filename"]}
+
+
+# v0.12.151: org-scoped training catalog. cadet_training_catalog gained
+# program_code (MCP ALTER; focms_app owns the table) and per-org seed rows so
+# Boy Scouts (bsa), Girl Scouts (gsa), Civil Air Patrol (cap), and Junior
+# ROTC (jrotc) are organized the same way as Sea Cadets (usnscc): a training/
+# advancement catalog behind each program's Log-training form. The unique
+# constraint moved from (title) to (program_code, title) so orgs can share
+# titles like Summer Camp or CyberPatriot. Legacy rows were backfilled to
+# usnscc; rows learned by the legacy writer land with NULL program_code and
+# map to usnscc here. New-org seed rows are is_active=false so the legacy
+# /catalogs/cadet-trainings response stays Sea-Cadets-only; this endpoint
+# serves seeds regardless (is_seed OR is_active).
+@router.get("/catalogs/org-trainings")
+async def get_org_trainings(request: Request, program: str = "usnscc"):
+    program = (program or "").strip().lower()
+    if program not in ("usnscc", "bsa", "gsa", "cap", "jrotc"):
+        return {"program": program, "items": []}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT title, skill_options FROM cadet_training_catalog "
+            "WHERE (program_code = $1 OR (program_code IS NULL AND $1 = 'usnscc')) "
+            "AND (is_seed OR is_active) ORDER BY title", program)
+    items = []
+    for r in rows:
+        opts = r["skill_options"]
+        if isinstance(opts, str):
+            try:
+                opts = json.loads(opts)
+            except Exception:
+                opts = None
+        items.append({"title": r["title"], "skill_options": opts})
+    return {"program": program, "trainings": [i["title"] for i in items], "items": items}
