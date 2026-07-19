@@ -8545,3 +8545,27 @@ async def add_essay_exemplar(request: Request, body: ExemplarIn):
                 json.dumps(strengths), json.dumps(techniques), why, body.source_note, uid)
     return {"id": str(rid), "word_count": wc, "strengths": strengths,
             "techniques": techniques, "why_it_worked": why}
+
+
+# v0.12.150: purpose-keyed media lookup. media_files.kind is free-form, so UI
+# surfaces persist "which photo goes where" as media itself with a purpose
+# kind (e.g. 'ui_photo:ec:sports' for the Extracurricular section student
+# photo, portal v259); newest non-deleted row wins, replace = upload again.
+# No student details column exists and focms_app cannot ALTER - this keeps
+# the mapping in the media layer with zero schema change.
+@router.get("/student/{student_id}/media-by-kind")
+async def get_student_media_by_kind(request: Request, student_id: str, kind: str = ""):
+    tenant_id, _ = await _pp_context(request, student_id)
+    kind = (kind or "").strip()
+    if not kind or len(kind) > 128:
+        return {"student_id": student_id, "id": None}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        row = await conn.fetchrow(
+            "SELECT id, mime_type, original_filename FROM media_files "
+            "WHERE student_id=$1::uuid AND kind=$2 AND deleted_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 1", student_id, kind)
+    if not row:
+        return {"student_id": student_id, "id": None}
+    return {"student_id": student_id, "id": str(row["id"]),
+            "mime_type": row["mime_type"], "filename": row["original_filename"]}
