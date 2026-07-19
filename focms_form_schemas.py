@@ -8635,6 +8635,8 @@ async def get_org_ranks(request: Request, program: str = ""):
 _ORG_PROFILE_KEYS = {
     "bsa_troop", "bsa_patrol", "bsa_member_id", "bsa_council", "bsa_district",
     "bsa_unit_type", "bsa_position", "bsa_chartered_org", "bsa_territory",
+    "bsa_scoutmaster", "bsa_scoutmaster_phone", "bsa_scoutmaster_email",
+    "bsa_unit_phone", "bsa_unit_email", "bsa_unit_website",
     "gsa_troop", "gsa_member_id", "gsa_council",
     "cap_squadron", "cap_wing", "cap_cap_id",
     "jrotc_branch", "jrotc_unit", "jrotc_company",
