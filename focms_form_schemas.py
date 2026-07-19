@@ -8603,3 +8603,24 @@ async def get_org_trainings(request: Request, program: str = "usnscc"):
                 opts = None
         items.append({"title": r["title"], "skill_options": opts})
     return {"program": program, "trainings": [i["title"] for i in items], "items": items}
+
+
+# v0.12.152: org rank ladders. New platform reference table org_rank_catalog
+# (MCP-created, focms_app-owned, no tenant scope) holds each organization's
+# advancement ladder in order: bsa 7 (Scout -> Eagle), usnscc 7 (SR E-1 ->
+# CPO E-7), gsa 6 (Daisy -> Ambassador), cap 14 (C/Amn -> C/Col with
+# achievement names). jrotc intentionally unseeded - ladders differ by branch
+# (Army/Navy/AF/Marine); seed once the program captures which branch.
+@router.get("/catalogs/org-ranks")
+async def get_org_ranks(request: Request, program: str = ""):
+    program = (program or "").strip().lower()
+    if program not in ("usnscc", "bsa", "gsa", "cap", "jrotc"):
+        return {"program": program, "ranks": []}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT title, description, sort_order FROM org_rank_catalog "
+            "WHERE program_code=$1 AND is_active ORDER BY sort_order", program)
+    return {"program": program, "ranks": [
+        {"title": r["title"], "description": r["description"],
+         "sort_order": r["sort_order"]} for r in rows]}
