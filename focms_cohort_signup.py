@@ -5,6 +5,18 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.19a (2026-07-19, same session):
+- ROOT CAUSE OF THE PAID-SIGNUP 500 (Stripe delivery log): the birth-cert
+  document INSERT hit student_identity_documents RLS with no tenant context -
+  sid_tenant_isolation was the only policy in the provisioning chain without
+  the platform (current_tenant_id() IS NULL) allowance. Policy recreated via
+  MCP to match students/media_files; Stripe retry provisions the account.
+- tenant_settings RLS also lacks the platform allowance (table owned by
+  focms_user - not fixable via MCP): the webhook's three tenant_settings
+  writes (birthday_billing hold-clear, age_verification verified/failed) now
+  run inside SET LOCAL app.current_tenant_id transactions so the flags
+  actually persist (birthday branch was unwrapped and would have 500d).
+
 v0.11.19 (2026-07-19) - FOUR LIVE SIGNUP FAILURES FIXED (operator paid test):
 - EMAIL: _send_verification_email and _send_reset_email referenced an
   undefined `html` variable -> NameError on every call, swallowed by the
@@ -1263,8 +1275,11 @@ async def stripe_webhook(request: Request) -> dict[str, Any]:
         if pmeta.get("birthday_billing") == "1" and pmeta.get("tenant_id"):
             _now = datetime.now(timezone.utc)
             pool: asyncpg.Pool = request.app.state.pool
+            _tid = str(UUID(str(pmeta["tenant_id"])))  # validate before f-string (playbook)
             async with pool.acquire() as conn:
-                await conn.execute(
+                async with conn.transaction():  # v0.11.19a: tenant context - tenant_settings RLS has no platform allowance
+                    await conn.execute(f"SET LOCAL app.current_tenant_id = '{_tid}'")
+                    await conn.execute(
                     """INSERT INTO tenant_settings (tenant_id, feature_flags)
                        VALUES ($1::uuid, jsonb_build_object('billing_hold', false, 'membership', $2::jsonb))
                        ON CONFLICT (tenant_id) DO UPDATE SET
@@ -1922,13 +1937,16 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                      and bool(verdict.get("registrar_seal_visible")) \
                      and not bool(verdict.get("tamper_signs")) \
                      and (verdict.get("confidence") or "").lower() == "high"
+                _tid19 = str(UUID(str(family_tenant_id)))  # v0.11.19a: validate for SET LOCAL literal
                 async with pool.acquire() as conn:
                     if ok:
                         await conn.execute(
                             "UPDATE student_identity_documents SET status='verified', verified_at=now(), "
                             "notes=$2, updated_at=now() WHERE id=$1::uuid",
                             _bc_doc_id, "Automated document check passed: " + json.dumps(verdict)[:1500])
-                        await conn.execute(
+                        async with conn.transaction():  # tenant context: tenant_settings RLS has no platform allowance
+                            await conn.execute(f"SET LOCAL app.current_tenant_id = '{_tid19}'")
+                            await conn.execute(
                             """INSERT INTO tenant_settings (tenant_id, feature_flags)
                                VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
                                ON CONFLICT (tenant_id) DO UPDATE SET
@@ -1951,7 +1969,9 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                         # in an email. Age stays as entered pending re-upload;
                         # the tenant carries age_verification=failed until a
                         # passing document clears it.
-                        await conn.execute(
+                        async with conn.transaction():  # tenant context: tenant_settings RLS has no platform allowance
+                            await conn.execute(f"SET LOCAL app.current_tenant_id = '{_tid19}'")
+                            await conn.execute(
                             """INSERT INTO tenant_settings (tenant_id, feature_flags)
                                VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
                                ON CONFLICT (tenant_id) DO UPDATE SET
