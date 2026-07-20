@@ -1,6 +1,85 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.158 · Security hardening (full-stack audit 2026-07-19). (1) CheckoutBody
+         inputs bounded: plan_code Field(min_length=1, max_length=64);
+         resume_kind Optional[str] max_length=64 + field_validator whitelisting
+         {standard, resume_academic, resume_career} while still accepting
+         None/"" (the portal sends ""). Previously free text flowing into
+         Stripe metadata and resume_ai_charges. NOTE: field_validator added to
+         the pydantic import — it was missing and would have raised NameError
+         at import, taking the whole API down. (2) Webhook PII retention cut:
+         billing_events.payload now stores a curated 16-field _audit dict
+         (ids, mode, status, amounts, metadata, period end) capped at 20k
+         instead of the entire Stripe event (which carries customer email,
+         billing address, card metadata). Stripe stays system of record.
+         (3) _billing_rate_limit(tenant, bucket, limit, window) — in-process
+         sliding window, 429 rate_limited, self-pruning above 5000 keys;
+         applied 10-per-5-min to checkout-session and portal-session-v2 (the
+         endpoints that create Stripe objects). Per-worker spam brake, not a
+         distributed limiter; Cloudflare handles volumetric abuse.
+         Companion DB change: RLS enabled + tenant_isolation policies added on
+         subscriptions and student_access_consents, platform_only on
+         billing_events (they had none — any endpoint missing its WHERE
+         tenant_id= would have read across tenants).
+
+v0.12.157 · On-demand Stripe customer, so card management works BEFORE any
+         purchase. _get_or_create_stripe_customer resolves newest
+         subscriptions.stripe_customer_id -> tenants.stripe_customer_id ->
+         creates at Stripe (email/name from the tenant row, metadata
+         tenant_id) and persists to tenants. New POST /student/{id}/billing/
+         portal-session-v2 uses it (Stripe's portal accepts an empty customer,
+         so a tenant with zero purchases can still add or change a card).
+         checkout-session now attaches params[customer] via the same helper —
+         one customer identity per tenant, so a card saved in the portal is
+         the card used at checkout. v1 portal-session retained for compat.
+
+v0.12.156 · Storage quota entitlement sync. upload_media has enforced
+         tenants.storage_quota_bytes since v0.9.0 (413 storage_quota_exceeded)
+         but nothing ever wrote plan entitlements into it, so paid storage was
+         unenforceable. _sync_tenant_storage_quota computes effective quota =
+         max non-addon plan storage_gb (1 GB free floor) + sum of active addon
+         storage_gb and writes storage_quota_bytes/_gb/storage_plan. Called
+         from the webhook after every subscription create/update/delete
+         (wrapped so a sync failure can never fail the webhook ack) and
+         exposed as POST /student/{id}/billing/sync-quota for support. Tenants
+         with no subscription rows are left untouched — founder/legacy tenants
+         with NULL quota stay unlimited by design.
+
+v0.12.155 · Stripe billing rail (the product had none: signup copy promised
+         Stripe with nothing behind it; resume_ai_charges was Stripe-shaped
+         but unfed). Stdlib-only Stripe client (urllib form-encoded in
+         asyncio.to_thread — zero new dependencies), Stripe-style form
+         flattener for nested dicts and line_items, and HMAC-SHA256 webhook
+         signature verification (t/v1 scheme, 300s tolerance, compare_digest).
+         Endpoints: POST /student/{id}/billing/checkout-session (mode from
+         plan.kind, client_reference_id=tenant, 503 billing_not_configured
+         when keys/prices absent); GET /billing/status (current plan, all
+         subs, plan catalog, configured flag); POST /billing/portal-session;
+         POST /billing/webhook (unauthenticated but signature-gated,
+         idempotent insert-first on billing_events.stripe_event_id) handling
+         checkout.session.completed (subscription upsert / resume_ai charge)
+         and customer.subscription.updated|deleted (status, period end,
+         cancel flag, plan-by-price-id). Account-first-then-checkout ordering
+         links Stripe to the tenant via client_reference_id, which avoids
+         touching the parallel line's provisioning code. Supporting tables:
+         billing_plans (10 seeded plans + stripe_product_id/price_id),
+         subscriptions (tenant entitlement), billing_events (idempotency).
+
+v0.12.154 · Age-tiered student access (operator directive; AMENDS the standing
+         no-student-login rule). GET /student/{id}/access-tier computes the
+         tier from students.birth_date on every request (calendar-exact, so
+         birthdays flip access with no cron) and returns the rights matrix +
+         parent-access state. Policy lives in data, not code:
+         portal_access_policy holds none <10 / supervised 10-12 (COPPA-bound:
+         may create and edit only their OWN records, never parent-entered
+         ones; no publish, visibility, sharing or messaging) / standard 13-17
+         (COPPA lifts: adds sharing + messaging, publish/visibility become
+         proposals; parent records still immutable) / owner 18+ (full control;
+         parent access becomes a revocable consent in student_access_consents).
+         Enforcement inside write endpoints ships with the student-login build
+         — ownership via created_by is the never-override guarantee.
+
 v0.12.133 · fix: _section_items had no builder for three band_13_18 (teen)
          showcase sections, so they rendered empty for every teen tenant:
          recruitment_portal/athletics_recruitment (the Athletics Recruitment
