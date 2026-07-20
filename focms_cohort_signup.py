@@ -612,6 +612,17 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                        "Check the grade and birth date and try again.",
         })
 
+    # v0.11.20 HARD GATE part 2 (operator decision): both the parent email and
+    # the student email must be verified after the certificate validates. The
+    # student email is therefore REQUIRED at signup from age 13 (COPPA boundary;
+    # younger children are covered by the parent verification alone).
+    if age >= 13 and not body.student_email:
+        raise HTTPException(400, {
+            "error": "student_email_required",
+            "message": "For students 13 and older, enter the student's email - "
+                       "both the parent and student addresses are verified after signup.",
+        })
+
     # v0.12.105: ages 0-10 require a birth certificate upload for age validation.
     # v0.11.19: EXTENDED TO ALL MINORS (age < 18). The age drives COPPA handling,
     # membership pricing, and student access tiers - an unverified self-attested
@@ -1698,6 +1709,27 @@ async def claim_signup(body: ClaimSignupRequest, request: Request) -> dict[str, 
     log.info("signup_claimed session=%s tenant=%s", sid[:20], role["tenant_id"])
     return {"status": "ready", "api_token": raw_token,
             "portal_url": f"https://outcomestar.app/portal#t={raw_token}"}
+
+
+@router.get("/email-verification-status")
+async def email_verification_status(request: Request) -> dict[str, Any]:
+    """v0.11.20: portal gate support - bearer token -> verification state of
+    every address on the tenant. The portal blocks the wizard/experience
+    until all required addresses are verified."""
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        principal = await _tenant_from_bearer(request, conn)
+        rows = await conn.fetch(
+            "SELECT subject_role, email, verified_at, needs_review, expires_at "
+            "FROM email_verifications WHERE tenant_id = $1::uuid ORDER BY created_at",
+            str(principal["tenant_id"]))
+    emails = [{"role": r["subject_role"], "email": r["email"],
+               "verified": r["verified_at"] is not None,
+               "needs_review": r["needs_review"],
+               "expired": r["expires_at"] is not None and r["expires_at"] < datetime.now(timezone.utc) and r["verified_at"] is None}
+              for r in rows]
+    all_verified = bool(emails) and all(e["verified"] for e in emails)
+    return {"emails": emails, "all_verified": all_verified}
 
 
 @router.post("/request-email-verification")
