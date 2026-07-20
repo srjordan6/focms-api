@@ -8934,6 +8934,7 @@ async def post_billing_webhook(request: Request):
     ev_type = event.get("type") or ""
     obj = (event.get("data") or {}).get("object") or {}
     pool: asyncpg.Pool = request.app.state.pool
+    sync_tenant = None
     async with pool.acquire() as conn:
         dup = await conn.fetchrow(
             "INSERT INTO billing_events (stripe_event_id, event_type, payload) "
@@ -8952,6 +8953,7 @@ async def post_billing_webhook(request: Request):
                     "ON CONFLICT (stripe_subscription_id) DO UPDATE SET "
                     "status='active', updated_at=now()",
                     tenant_id, plan_code, obj.get("customer"), obj.get("subscription"))
+                sync_tenant = tenant_id
             elif obj.get("mode") == "payment" and tenant_id and plan_code == "resume_ai":
                 await conn.execute(
                     "INSERT INTO resume_ai_charges (tenant_id, student_id, resume_kind, "
@@ -8982,4 +8984,66 @@ async def post_billing_webhook(request: Request):
                 "plan_code = COALESCE($5, plan_code), updated_at=now() "
                 "WHERE stripe_subscription_id=$1",
                 sub_id, status, period_end, bool(obj.get("cancel_at_period_end")), plan_code)
+            trow = await conn.fetchrow(
+                "SELECT tenant_id FROM subscriptions WHERE stripe_subscription_id=$1", sub_id)
+            if trow:
+                sync_tenant = str(trow["tenant_id"])
+    if sync_tenant:
+        try:
+            await _sync_tenant_storage_quota(pool, sync_tenant)
+        except Exception:
+            pass  # quota sync must never fail the webhook ack
     return {"received": True}
+
+
+# ============================================================================
+# v0.12.156: STORAGE QUOTA SYNC. The upload endpoint has enforced
+# tenants.storage_quota_bytes since v0.9.0 (413 storage_quota_exceeded);
+# nothing wrote plan entitlements into it. This closes the loop: effective
+# quota = base plan storage_gb (active/trialing non-addon sub, else the
+# free 1 GB) + sum of active add-on storage_gb, written to the tenant row
+# whenever the webhook changes a subscription. Founder/legacy tenants with
+# NULL quota and no subscription are left untouched (unlimited by design).
+# ============================================================================
+
+async def _sync_tenant_storage_quota(pool, tenant_id: str):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT s.plan_code, p.storage_gb FROM subscriptions s "
+            "JOIN billing_plans p ON p.plan_code = s.plan_code "
+            "WHERE s.tenant_id=$1::uuid AND s.status IN ('active','trialing')",
+            tenant_id)
+    if not rows:
+        return None  # no entitlements -> leave the tenant's existing quota alone
+    base_gb = 1
+    base_plan = "free"
+    addon_gb = 0
+    for r in rows:
+        gb = r["storage_gb"] or 0
+        if r["plan_code"].startswith("addon_"):
+            addon_gb += gb
+        else:
+            base_gb = max(base_gb, gb)
+            base_plan = r["plan_code"]
+    total_gb = base_gb + addon_gb
+    async with _tenant_conn(pool, tenant_id) as conn:
+        await conn.execute(
+            "UPDATE tenants SET storage_quota_bytes=$2, storage_quota_gb=$3, "
+            "storage_plan=$4, updated_at=now() WHERE id=$1::uuid",
+            tenant_id, total_gb * 1024 * 1024 * 1024, str(total_gb), base_plan)
+    return {"total_gb": total_gb, "base_plan": base_plan, "addon_gb": addon_gb}
+
+
+@router.post("/student/{student_id}/billing/sync-quota")
+async def post_billing_sync_quota(request: Request, student_id: str):
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    result = await _sync_tenant_storage_quota(pool, tenant_id)
+    async with _tenant_conn(pool, tenant_id) as conn:
+        trow = await conn.fetchrow(
+            "SELECT storage_used_bytes, storage_quota_bytes, storage_plan "
+            "FROM tenants WHERE id=$1::uuid", tenant_id)
+    return {"tenant_id": tenant_id, "synced": result,
+            "storage_used_bytes": trow["storage_used_bytes"] if trow else None,
+            "storage_quota_bytes": trow["storage_quota_bytes"] if trow else None,
+            "storage_plan": trow["storage_plan"] if trow else None}
