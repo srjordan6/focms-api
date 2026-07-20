@@ -8638,6 +8638,8 @@ _ORG_PROFILE_KEYS = {
     "bsa_scoutmaster", "bsa_scoutmaster_phone", "bsa_scoutmaster_email",
     "bsa_unit_phone", "bsa_unit_email", "bsa_unit_website",
     "gsa_troop", "gsa_member_id", "gsa_council",
+    "gsa_level", "gsa_service_unit", "gsa_leader", "gsa_leader_phone",
+    "gsa_leader_email", "gsa_troop_phone", "gsa_troop_email", "gsa_troop_website",
     "cap_squadron", "cap_wing", "cap_cap_id",
     "jrotc_branch", "jrotc_unit", "jrotc_company",
 }
