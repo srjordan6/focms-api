@@ -8682,3 +8682,50 @@ async def post_affiliation_org_profile(request: Request, student_id: str, affil_
     return {"affiliation_id": affil_id,
             "updated": 1 if (r and r.endswith(" 1")) else 0,
             "keys": sorted(clean.keys())}
+
+
+# v0.12.154: age-tiered student access. Policy lives in portal_access_policy
+# (platform reference): none <10 / supervised 10-12 (COPPA-bound, cannot
+# touch parent records) / standard 13-17 (COPPA lifted, parent records still
+# immutable) / owner 18+ (full control; parent access becomes a revocable
+# consent in student_access_consents). This endpoint computes the student's
+# current tier from birth_date and returns the rights matrix + parent-access
+# state. Enforcement inside write endpoints arrives with the student-login
+# build; the policy and consent state are authoritative here.
+@router.get("/student/{student_id}/access-tier")
+async def get_student_access_tier(request: Request, student_id: str):
+    tenant_id, _user_id = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with _tenant_conn(pool, tenant_id) as conn:
+        srow = await conn.fetchrow(
+            "SELECT birth_date FROM students WHERE id=$1::uuid AND deleted_at IS NULL",
+            student_id)
+        if not srow:
+            raise HTTPException(404, {"error": "student_not_found"})
+        crow = await conn.fetchrow(
+            "SELECT parent_access_allowed, consent_updated_at FROM student_access_consents "
+            "WHERE tenant_id=$1::uuid AND student_id=$2::uuid", tenant_id, student_id)
+    bd = srow["birth_date"]
+    age = None
+    if bd:
+        from datetime import date as _date
+        today = _date.today()
+        age = today.year - bd.year - ((today.month, today.day) < (bd.month, bd.day))
+    async with pool.acquire() as conn2:
+        prow = await conn2.fetchrow(
+            "SELECT tier_code, title, rights, legal_basis FROM portal_access_policy "
+            "WHERE $1 >= min_age AND (max_age IS NULL OR $1 <= max_age) "
+            "ORDER BY sort_order LIMIT 1", age if age is not None else 0)
+    rights = prow["rights"]
+    if isinstance(rights, str):
+        try:
+            rights = json.loads(rights)
+        except Exception:
+            rights = {}
+    parent_allowed = True
+    if prow["tier_code"] == "owner":
+        parent_allowed = bool(crow["parent_access_allowed"]) if crow else True
+    return {"student_id": student_id, "age": age,
+            "tier": prow["tier_code"], "tier_title": prow["title"],
+            "rights": rights, "legal_basis": prow["legal_basis"],
+            "parent_access_allowed": parent_allowed}
