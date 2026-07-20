@@ -8585,7 +8585,7 @@ async def get_student_media_by_kind(request: Request, student_id: str, kind: str
 @router.get("/catalogs/org-trainings")
 async def get_org_trainings(request: Request, program: str = "usnscc"):
     program = (program or "").strip().lower()
-    if program not in ("usnscc", "bsa", "gsa", "cap", "jrotc"):
+    if program not in ("usnscc", "bsa", "gsa", "cap", "jrotc", "ym"):
         return {"program": program, "items": []}
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -8614,7 +8614,7 @@ async def get_org_trainings(request: Request, program: str = "usnscc"):
 @router.get("/catalogs/org-ranks")
 async def get_org_ranks(request: Request, program: str = ""):
     program = (program or "").strip().lower()
-    if program not in ("usnscc", "bsa", "gsa", "cap", "jrotc"):
+    if program not in ("usnscc", "bsa", "gsa", "cap", "jrotc", "ym"):
         return {"program": program, "ranks": []}
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
@@ -8645,6 +8645,9 @@ _ORG_PROFILE_KEYS = {
     "jrotc_branch", "jrotc_unit", "jrotc_company", "jrotc_period",
     "jrotc_instructor", "jrotc_instructor_phone", "jrotc_instructor_email",
     "jrotc_unit_phone", "jrotc_unit_email",
+    "ym_division", "ym_regiment", "ym_battalion", "ym_unit", "ym_member_id",
+    "ym_unit_commander", "ym_commander_phone", "ym_commander_email",
+    "ym_unit_phone", "ym_unit_email", "ym_drill_schedule",
 }
 
 
