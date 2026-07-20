@@ -1908,6 +1908,54 @@ async def admin_test_email(request: Request) -> dict[str, Any]:
         return {"transport": transport, "ok": False, "error": f"{type(exc).__name__}: {exc}"[:300]}
 
 
+@router.post("/admin/test-vision")
+async def admin_test_vision(request: Request) -> dict[str, Any]:
+    """v0.11.20a: diagnose the birth-certificate vision check. Runs a minimal
+    call through the SAME env resolution as _ai_verify_birth_certificate and
+    returns which env names were found, the provider/model/base used, and the
+    upstream HTTP status + body snippet. Mirrors admin/test-email."""
+    auth = request.headers.get("authorization", "")
+    try:
+        registry = json.loads(os.environ.get("FOCMS_API_TOKENS_JSON", "{}"))
+    except Exception:
+        registry = {}
+    if not auth.lower().startswith("bearer ") or auth[7:].strip() not in registry:
+        raise HTTPException(401, {"error": "admin_token_required"})
+    env_found = [n for n in ("FOCMS_VISION_PROVIDER", "FOCMS_VISION_API_KEY", "FOCMS_VISION_MODEL",
+                             "FOCMS_VISION_BASE_URL", "FOCMS_LLM_PROVIDER", "FOCMS_LLM_API_KEY",
+                             "FOCMS_LLM_MODEL", "FOCMS_LLM_BASE_URL", "ANTHROPIC_API_KEY")
+                 if os.environ.get(n)]
+    provider = (os.environ.get("FOCMS_VISION_PROVIDER")
+                or os.environ.get("FOCMS_LLM_PROVIDER", "anthropic")).lower()
+    api_key = (os.environ.get("FOCMS_VISION_API_KEY")
+               or os.environ.get("FOCMS_LLM_API_KEY")
+               or os.environ.get("ANTHROPIC_API_KEY"))
+    model = (os.environ.get("FOCMS_VISION_MODEL")
+             or os.environ.get("FOCMS_LLM_MODEL", "claude-sonnet-4-6"))
+    base = (os.environ.get("FOCMS_VISION_BASE_URL")
+            or os.environ.get("FOCMS_LLM_BASE_URL", "https://api.anthropic.com")).rstrip("/")
+    out: dict[str, Any] = {"env_found": env_found, "provider": provider, "model": model,
+                           "base": base, "key_present": bool(api_key),
+                           "key_length": len(api_key) if api_key else 0}
+    if not api_key:
+        out["verdict"] = "NO KEY - this is the 503 cause"
+        return out
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(base + "/v1/messages",
+                headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": model, "max_tokens": 20,
+                      "messages": [{"role": "user", "content": "Reply with the word OK"}]})
+        out["upstream_status"] = r.status_code
+        out["upstream_body"] = r.text[:400]
+        out["verdict"] = "OK - vision check should work" if r.status_code == 200 else \
+            "UPSTREAM ERROR - this is the 503 cause (see upstream_body)"
+    except Exception as exc:
+        out["verdict"] = f"REQUEST FAILED: {type(exc).__name__}: {exc}"[:300]
+    return out
+
+
 @router.post("/admin/complete-pending/{pending_id}")
 async def admin_complete_pending(pending_id: str, request: Request) -> dict[str, Any]:
     """v0.11.11: manual recovery for paid-but-unprovisioned under-13 signups."""
