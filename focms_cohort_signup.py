@@ -5,6 +5,26 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.19 (2026-07-19) - FOUR LIVE SIGNUP FAILURES FIXED (operator paid test):
+- EMAIL: _send_verification_email and _send_reset_email referenced an
+  undefined `html` variable -> NameError on every call, swallowed by the
+  non-fatal wrappers. NO verification or password-reset email was ever sent.
+  Both now build branded HTML bodies (verify link 7-day, reset link 1-hour).
+- POST-PAYMENT HANDOFF: success_url now carries &sid={CHECKOUT_SESSION_ID}
+  (all three checkout forms). New anonymous POST /auth/claim-signup
+  {session_id}: single-use (pending_signups.claimed_at, MCP-added column),
+  30-minute window after provisioning, returns status=pending while the
+  webhook runs, then mints a fresh parent-portal token and returns
+  portal_url. The signup page polls it and lands the parent in the portal
+  authenticated - the setup wizard finally opens after payment.
+- AGE VERIFICATION: birth certificate now required for ALL minors (age < 18,
+  was <= 10). Self-attested age for 11-17 drove pricing/COPPA/student access
+  unchecked. needs_idv ($3 automated review charge) unchanged, ages 0-10 only.
+- LIED-AGE FLAG: a failed AI birth-certificate check now also writes
+  tenant_settings.feature_flags.age_verification={status:'failed',
+  dob_on_document, dob_entered, reasons} - durable and queryable, not
+  email-only. Cleared to 'verified' by a passing re-upload (portal path).
+
 v0.11.18 (2026-07-16):
 - Demo account reset-on-login: when the login email matches DEMO_ACCOUNT_EMAIL
   (env, default demo@outcomestar.app), _demo_restore wipes the demo tenant's
@@ -471,7 +491,22 @@ async def _send_email(to_email: str, subject: str, html: str) -> None:
 
 
 async def _send_verification_email(to_email: str, role: str, student_name: str, token: str) -> None:
-    await _send_email(to_email, "Confirm your email — outcomestar", html)
+    # v0.11.19 FIX: this function referenced an undefined `html` variable since
+    # its introduction - NameError on EVERY call, silently swallowed by the
+    # callers' non-fatal try/except. No verification email was ever sent.
+    link = f"https://focms-api.onrender.com/focms/v1/auth/verify-email?token={token}"
+    who = "your" if role == "parent" else f"{student_name}'s"
+    html = (
+        "<div style='font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e'>"
+        "<h2 style='color:#201868'>Confirm " + who + " email</h2>"
+        "<div style='width:80px;border-bottom:3px solid #F07800;margin:10px 0 18px'></div>"
+        f"<p>This address was entered during outcomestar signup for {student_name}.</p>"
+        f"<p style='margin:24px 0'><a href='{link}' style='background:#F07800;color:#fff;"
+        "padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:bold'>Confirm this email</a></p>"
+        f"<p style='font-size:13px;color:#4A5563'>Or paste this link into your browser:<br>{link}</p>"
+        "<p style='font-size:13px;color:#4A5563'>The link works for 7 days. If you didn't sign up, ignore this message.</p>"
+        "<p style='font-size:12px;color:#7A8A9E;margin-top:26px'>outcomestar.app &middot; SRJ Consulting &amp; Services LLC</p></div>")
+    await _send_email(to_email, "Confirm your email \u2014 outcomestar", html)
 
 
 async def _seed_portal_rows(conn: asyncpg.Connection, tenant_id, student_id, parent_user_id, p: dict) -> None:
@@ -552,14 +587,20 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
         })
 
     # v0.12.105: ages 0-10 require a birth certificate upload for age validation.
+    # v0.11.19: EXTENDED TO ALL MINORS (age < 18). The age drives COPPA handling,
+    # membership pricing, and student access tiers - an unverified self-attested
+    # age for 11-17 was the hole that let a wrong age straight through (operator
+    # live test 2026-07-19). The AI check still runs post-payment in the webhook;
+    # a mismatch rejects the document, emails the parent, and flags the tenant.
     _ALLOWED_DOC_MIMES = {"image/jpeg", "image/png", "image/webp", "application/pdf"}
     doc_bytes = None
-    if age <= 10:
+    if age < 18:
         if not body.birth_certificate_b64:
             raise HTTPException(400, {
                 "error": "birth_certificate_required",
-                "message": "For students aged 0-10, upload the student's birth certificate "
-                           "(JPG, PNG, or PDF) so we can validate the birth date for free access.",
+                "message": "Upload the student's birth certificate (JPG, PNG, or PDF) so "
+                           "we can verify the birth date - it sets pricing, privacy "
+                           "protections, and student access.",
             })
         if (body.birth_certificate_mime or "").lower() not in _ALLOWED_DOC_MIMES:
             raise HTTPException(400, {
@@ -672,7 +713,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "line_items[0][price_data][product_data][name]":
                     f"outcomestar {mem['display_name']}",
                 "line_items[0][quantity]": "1",
-                "success_url": "https://outcomestar.app/signup?vpc=complete",
+                "success_url": "https://outcomestar.app/signup?vpc=complete&sid={CHECKOUT_SESSION_ID}",
                 "cancel_url": "https://outcomestar.app/signup?vpc=cancelled",
                 "customer_email": body.parent_email,
                 "metadata[pending_signup_id]": str(pending_id),
@@ -684,7 +725,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
         elif needs_idv and idv:
             form = {
                 "mode": "payment" if one_time else "subscription",
-                "success_url": "https://outcomestar.app/signup?vpc=complete",
+                "success_url": "https://outcomestar.app/signup?vpc=complete&sid={CHECKOUT_SESSION_ID}",
                 "cancel_url": "https://outcomestar.app/signup?vpc=cancelled",
                 "customer_email": body.parent_email,
                 "metadata[pending_signup_id]": str(pending_id),
@@ -704,7 +745,7 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "mode": "payment" if one_time else "subscription",
                 **({"customer_creation": "always",
                     "payment_intent_data[setup_future_usage]": "off_session"} if one_time else {}),
-                "success_url": "https://outcomestar.app/signup?vpc=complete",
+                "success_url": "https://outcomestar.app/signup?vpc=complete&sid={CHECKOUT_SESSION_ID}",
                 "cancel_url": "https://outcomestar.app/signup?vpc=cancelled",
                 "customer_email": body.parent_email,
                 "metadata[pending_signup_id]": str(pending_id),
@@ -1340,6 +1381,20 @@ class EmailVerifyRequest(BaseModel):
 
 
 async def _send_reset_email(to_email: str, token: str) -> None:
+    # v0.11.19 FIX: same undefined-`html` NameError as _send_verification_email -
+    # password reset emails never sent either.
+    link = f"https://outcomestar.app/reset-password?token={token}"
+    html = (
+        "<div style='font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e'>"
+        "<h2 style='color:#201868'>Reset your password</h2>"
+        "<div style='width:80px;border-bottom:3px solid #F07800;margin:10px 0 18px'></div>"
+        "<p>A password reset was requested for your outcomestar account.</p>"
+        f"<p style='margin:24px 0'><a href='{link}' style='background:#F07800;color:#fff;"
+        "padding:12px 22px;border-radius:6px;text-decoration:none;font-weight:bold'>Choose a new password</a></p>"
+        f"<p style='font-size:13px;color:#4A5563'>Or paste this link into your browser:<br>{link}</p>"
+        "<p style='font-size:13px;color:#4A5563'>The link works once and expires in 1 hour. "
+        "If you didn't request this, you can ignore it - your password is unchanged.</p>"
+        "<p style='font-size:12px;color:#7A8A9E;margin-top:26px'>outcomestar.app &middot; SRJ Consulting &amp; Services LLC</p></div>")
     await _send_email(to_email, "Reset your password - outcomestar", html)
 
 
@@ -1519,6 +1574,67 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
             tenant_id, token_hash, [r["id"] for r in students], user["id"])
     return {"api_token": raw_token, "tenant_id": str(tenant_id),
             "display_name": user["display_name"],
+            "portal_url": f"https://outcomestar.app/portal#t={raw_token}"}
+
+
+class ClaimSignupRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str = Field(..., min_length=10, max_length=200)
+
+
+@router.post("/claim-signup")
+async def claim_signup(body: ClaimSignupRequest, request: Request) -> dict[str, Any]:
+    """v0.11.19: post-payment session handoff - THE fix for 'paid but never
+    reached the portal'. Stripe redirects the payer to
+    /signup?vpc=complete&sid={CHECKOUT_SESSION_ID}; the page posts the sid
+    here. The checkout session id is a high-entropy secret known only to the
+    payer's browser (Stripe's documented client-retrieval pattern), and the
+    claim is single-use (claimed_at) with a 30-minute window after
+    provisioning. While the webhook is still provisioning, returns
+    status=pending so the page can poll. On success mints a fresh
+    parent-portal token exactly like /auth/login and returns the portal URL -
+    the browser lands authenticated and the setup wizard opens."""
+    sid = body.session_id.strip()
+    if not sid.startswith("cs_"):
+        raise HTTPException(400, {"error": "bad_session", "message": "Not a checkout session id."})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        pend = await conn.fetchrow(
+            "SELECT id, payload, consumed_at, claimed_at FROM pending_signups "
+            "WHERE checkout_session_id = $1", sid)
+        if not pend:
+            raise HTTPException(404, {"error": "unknown_session",
+                                      "message": "No signup found for this payment."})
+        if pend["claimed_at"]:
+            raise HTTPException(409, {"error": "already_claimed",
+                                      "message": "This signup was already opened. Sign in with your email and password."})
+        if not pend["consumed_at"]:
+            return {"status": "pending"}  # webhook still provisioning - page polls
+        if datetime.now(timezone.utc) - pend["consumed_at"] > timedelta(minutes=30):
+            raise HTTPException(410, {"error": "claim_expired",
+                                      "message": "This link has expired. Sign in with your email and password."})
+        p = json.loads(pend["payload"])
+        user = await conn.fetchrow(
+            "SELECT id FROM users WHERE email = $1 AND deactivated_at IS NULL", p["parent_email"])
+        if not user:
+            raise HTTPException(404, {"error": "account_missing",
+                                      "message": "Account not found - contact support via the chat bubble."})
+        role = await conn.fetchrow(
+            "SELECT tenant_id FROM user_tenant_roles WHERE user_id=$1 ORDER BY granted_at LIMIT 1",
+            user["id"])
+        if not role:
+            raise HTTPException(404, {"error": "account_missing"})
+        students = await conn.fetch(
+            "SELECT id FROM students WHERE tenant_id=$1 AND deleted_at IS NULL ORDER BY created_at",
+            role["tenant_id"])
+        raw_token, token_hash = generate_api_token()
+        await conn.execute(
+            """INSERT INTO api_tokens (tenant_id, token_hash, student_ids, name, scope, created_by)
+               VALUES ($1,$2,$3::uuid[],'post-payment-claim','parent_portal',$4)""",
+            role["tenant_id"], token_hash, [r["id"] for r in students], user["id"])
+        await conn.execute("UPDATE pending_signups SET claimed_at = now() WHERE id = $1", pend["id"])
+    log.info("signup_claimed session=%s tenant=%s", sid[:20], role["tenant_id"])
+    return {"status": "ready", "api_token": raw_token,
             "portal_url": f"https://outcomestar.app/portal#t={raw_token}"}
 
 
@@ -1830,6 +1946,24 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                             "UPDATE student_identity_documents SET status='rejected', "
                             "notes=$2, updated_at=now() WHERE id=$1::uuid",
                             _bc_doc_id, "Automated document check failed: " + json.dumps(verdict)[:1500])
+                        # v0.11.19: durable, queryable failure flag - a DOB
+                        # mismatch is the lied-age case and must not live only
+                        # in an email. Age stays as entered pending re-upload;
+                        # the tenant carries age_verification=failed until a
+                        # passing document clears it.
+                        await conn.execute(
+                            """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                               VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
+                               ON CONFLICT (tenant_id) DO UPDATE SET
+                               feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                               || jsonb_build_object('age_verification', $2::jsonb),
+                               updated_at = now()""",
+                            family_tenant_id,
+                            json.dumps({"status": "failed", "method": "ai_birth_certificate",
+                                        "failed_at": _now.isoformat(),
+                                        "dob_on_document": verdict.get("birth_date_on_document"),
+                                        "dob_entered": p.get("student_birth_date"),
+                                        "reasons": _reasons[:4]}))
                         try:
                             await _send_email(
                                 p["parent_email"],
