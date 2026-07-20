@@ -2130,17 +2130,19 @@ async def _ai_verify_birth_certificate(doc_bytes: bytes, doc_mime: str,
 
 async def _send_welcome_email(to_email: str, display_name: str, token: str) -> None:
     """v0.12.129 (2026-07-15): route through unified _send_email so Gmail SMTP
-    is used when configured (previously hard-coded Resend only, silently
-    skipping when RESEND_API_KEY was absent - the reason welcome emails were
-    missing while verification/reset emails worked fine)."""
+    is used when configured.
+    v0.11.19a: raw portal token REMOVED from the email (operator decision
+    2026-07-19) - the post-payment claim flow lands the parent in the portal
+    directly, and every signup sets a password, so the email now points to
+    sign-in. A bearer token at rest in an inbox was the weakest link."""
     html = (
         '<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e">'
         '<h2 style="color:#201868">Welcome to outcomestar, ' + display_name + '</h2>'
         '<p>Your payment confirmed parental consent and your family account is ready.</p>'
-        '<p>Your parent portal access token (keep it private):</p>'
-        '<p style="background:#F4F4F0;padding:12px;border-radius:8px;font-family:monospace;word-break:break-all">' + token + '</p>'
+        '<p>Sign in any time with your email and the password you chose at signup.</p>'
         '<p><a href="https://outcomestar.app/portal" style="background:#F07800;color:#fff;padding:12px 26px;'
         'border-radius:8px;text-decoration:none;font-weight:bold">Open the parent portal</a></p>'
+        '<p style="color:#4A5563;font-size:13px">Forgot the password? Use "Forgot password" on the sign-in page.</p>'
         '<p style="color:#7A8A9E;font-size:12px">Also confirm the verification emails we just sent.</p></div>'
     )
     await _send_email(to_email, "Welcome to outcomestar - your portal access", html)
