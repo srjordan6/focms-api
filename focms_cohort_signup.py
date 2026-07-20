@@ -5,6 +5,20 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.20 (2026-07-19) - HARD VERIFICATION GATE (operator decision):
+- The birth certificate must PASS automated verification (is a certificate,
+  name matches, birth date matches, registrar seal, no tamper signs, high
+  confidence) BEFORE Stripe checkout is created. A failing document -> 400
+  birth_certificate_rejected with parent-facing reasons; checker unavailable
+  -> 503 fail-closed. No payment, no provisioning, no email of any kind
+  until the document verifies. REQUIRES FOCMS_VISION_*/FOCMS_LLM_*/
+  ANTHROPIC_API_KEY on Render - without a key ALL minor signups 503.
+- The passing verdict is parked in the payload (bc_verified_at, bc_verdict);
+  the webhook stores the document status='verified' with the verdict in
+  notes, writes the tenant age_verification=verified flag (10-year validity,
+  SET LOCAL savepoint), and skips the post-provision AI check (now a
+  fallback for legacy pending rows only).
+
 v0.11.19a (2026-07-19, same session):
 - ROOT CAUSE OF THE PAID-SIGNUP 500 (Stripe delivery log): the birth-cert
   document INSERT hit student_identity_documents RLS with no tenant context -
@@ -630,6 +644,31 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
                 "error": "birth_certificate_invalid",
                 "message": "Birth certificate file must be between 10 KB and 8 MB.",
             })
+        # v0.11.20 HARD GATE (operator decision 2026-07-19): the birth
+        # certificate must VERIFY - name and birth date matching the form -
+        # BEFORE checkout. No payment, no provisioning, no email until the
+        # document passes. Fail-closed when the checker is unavailable.
+        _bc_verdict = await _ai_verify_birth_certificate(
+            doc_bytes, (body.birth_certificate_mime or "image/jpeg").lower(),
+            body.student_first_name, body.student_last_name, bdate.isoformat())
+        if not _bc_verdict:
+            raise HTTPException(503, {
+                "error": "birth_certificate_check_unavailable",
+                "message": "Birth-certificate verification is temporarily unavailable - "
+                           "nothing was charged. Please try again shortly.",
+            })
+        _bc_ok = bool(_bc_verdict.get("is_birth_certificate")) \
+                 and bool(_bc_verdict.get("name_matches")) \
+                 and bool(_bc_verdict.get("birth_date_matches")) \
+                 and bool(_bc_verdict.get("registrar_seal_visible")) \
+                 and not bool(_bc_verdict.get("tamper_signs")) \
+                 and (_bc_verdict.get("confidence") or "").lower() == "high"
+        if not _bc_ok:
+            raise HTTPException(400, {
+                "error": "birth_certificate_rejected",
+                "message": "The birth certificate could not be verified - nothing was "
+                           "charged. " + " ".join(_bc_rejection_reasons(_bc_verdict)),
+            })
 
     pool: asyncpg.Pool = request.app.state.pool
 
@@ -685,6 +724,14 @@ async def cohort_signup(body: CohortSignupRequest, request: Request) -> dict[str
             # v0.11.13: never park a plaintext password - hash before storing
             _pend = json.loads(body.model_dump_json())
             _pend.pop("birth_certificate_b64", None)  # v0.12.105: bytes go to columns, not payload
+            if doc_bytes is not None:
+                # v0.11.20: pre-checkout verification passed - park the verdict so
+                # the webhook stores the document verified without a second check.
+                _pend["bc_verified_at"] = datetime.now(timezone.utc).isoformat()
+                _pend["bc_verdict"] = {k: _bc_verdict.get(k) for k in (
+                    "is_birth_certificate", "name_matches", "birth_date_matches",
+                    "registrar_seal_visible", "tamper_signs", "confidence",
+                    "child_name_on_document", "birth_date_on_document")}
             if _pend.get("password"):
                 _pend["password_hash"] = _pend.pop("password")
                 _pend["password_hash"] = _hash_password(_pend["password_hash"])
@@ -1836,7 +1883,10 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                 approx_birth_date, p["student_grade"], hs_grad, parent_user_id)
 
             # v0.12.105: attach the signup-staged birth certificate for age validation.
+            # v0.11.20: the certificate was VERIFIED before checkout (hard gate) -
+            # store it verified and write the tenant age_verification flag here.
             _bc_doc_id = None
+            _bc_preverified = bool(p.get("bc_verified_at"))
             if pend["doc_bytes"]:
                 _doc_kind = "document" if (pend["doc_mime"] or "").endswith("pdf") else "image"
                 _art_id = await conn.fetchval(
@@ -1848,11 +1898,33 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
                     pend["doc_bytes"], hashlib.sha256(pend["doc_bytes"]).hexdigest(), parent_user_id)
                 _bc_doc_id = await conn.fetchval(
                     """INSERT INTO student_identity_documents (tenant_id, student_id, doc_type, artifact_id,
-                       status, notes, source_system, created_by, updated_by)
-                       VALUES ($1,$2,'birth_certificate',$3,'pending',
-                               'Uploaded at signup for age 0-10 free-tier age validation.',
-                               'signup',$4,$4) RETURNING id""",
-                    family_tenant_id, student_id, _art_id, parent_user_id)
+                       status, verified_at, notes, source_system, created_by, updated_by)
+                       VALUES ($1,$2,'birth_certificate',$3,$4,$5,$6,'signup',$7,$7) RETURNING id""",
+                    family_tenant_id, student_id, _art_id,
+                    "verified" if _bc_preverified else "pending",
+                    datetime.now(timezone.utc) if _bc_preverified else None,
+                    ("Verified before checkout (v0.11.20 hard gate): " + json.dumps(p.get("bc_verdict") or {})[:1200])
+                    if _bc_preverified else
+                    "Uploaded at signup; automated verification pending.",
+                    parent_user_id)
+                if _bc_preverified:
+                    _tid20 = str(UUID(str(family_tenant_id)))
+                    try:
+                        async with conn.transaction():  # SAVEPOINT: tenant_settings RLS needs tenant context
+                            await conn.execute(f"SET LOCAL app.current_tenant_id = '{_tid20}'")
+                            await conn.execute(
+                                """INSERT INTO tenant_settings (tenant_id, feature_flags)
+                                   VALUES ($1::uuid, jsonb_build_object('age_verification', $2::jsonb))
+                                   ON CONFLICT (tenant_id) DO UPDATE SET
+                                   feature_flags = coalesce(tenant_settings.feature_flags,'{}'::jsonb)
+                                                   || jsonb_build_object('age_verification', $2::jsonb),
+                                   updated_at = now()""",
+                                family_tenant_id,
+                                json.dumps({"status": "verified", "method": "ai_birth_certificate",
+                                            "verified_at": p.get("bc_verified_at"),
+                                            "valid_until": (datetime.now(timezone.utc) + timedelta(days=3653)).isoformat()}))
+                    except Exception as exc:
+                        log.warning("age_verification flag write failed (non-fatal): %r", exc)
                 await conn.execute("UPDATE pending_signups SET doc_bytes=NULL WHERE id=$1::uuid", pending_id)
 
             await conn.execute(
@@ -1918,12 +1990,9 @@ async def _complete_pending_signup(request: Request, pending_id: str, sess: dict
     except Exception as exc:
         log.warning("welcome email failed (non-fatal): %r", exc)
 
-    # v0.12.108: AI birth-certificate verification (replaces Stripe Identity -
-    # the parent is already verified by the card payment; what we verify is the
-    # CHILD's birth certificate). Vision LLM extracts the name/DOB/registrar
-    # features and compares to the signup data. Full match -> verified with a
-    # 10-year validity; anything else stays pending for manual review.
-    if pend["doc_bytes"] and _bc_doc_id:
+    # v0.12.108/v0.11.20: post-provision AI check is now a FALLBACK only - the
+    # hard gate verifies before checkout, so bc_verified_at short-circuits this.
+    if pend["doc_bytes"] and _bc_doc_id and not _bc_preverified:
         try:
             verdict = await _ai_verify_birth_certificate(
                 bytes(pend["doc_bytes"]), pend["doc_mime"] or "image/jpeg",
