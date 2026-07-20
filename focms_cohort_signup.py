@@ -18,6 +18,15 @@ v0.11.20 (2026-07-19) - HARD VERIFICATION GATE (operator decision):
   notes, writes the tenant age_verification=verified flag (10-year validity,
   SET LOCAL savepoint), and skips the post-provision AI check (now a
   fallback for legacy pending rows only).
+- Student email REQUIRED at signup from age 13 (COPPA boundary); GET
+  /auth/email-verification-status (bearer) backs the portal's blocking
+  verification gate (portal v282).
+- EMAIL CHANGES are verify-then-swap: POST /auth/request-email-change
+  {subject_role, new_email} emails the NEW address a verification link and
+  the OLD address stays the address of record everywhere (login, tenant
+  primary_email, student email_primary) until the link is clicked; the swap
+  happens inside verify-email (purpose='email_change' + applied_at columns,
+  MCP-added). In-flight changes never re-lock the portal gate.
 
 v0.11.19a (2026-07-19, same session):
 - ROOT CAUSE OF THE PAID-SIGNUP 500 (Stripe delivery log): the birth-cert
@@ -1423,7 +1432,7 @@ async def verify_email(token: str, request: Request) -> HTMLResponse:
             UPDATE email_verifications
             SET verified_at = COALESCE(verified_at, now())
             WHERE token_hash = $1 AND expires_at > now()
-            RETURNING tenant_id, subject_role, email, needs_review, verified_at
+            RETURNING tenant_id, subject_role, email, needs_review, verified_at, purpose, applied_at
             """,
             token_hash,
         )
@@ -1431,6 +1440,41 @@ async def verify_email(token: str, request: Request) -> HTMLResponse:
             return HTMLResponse(_VERIFY_PAGE.format(
                 title="Link expired or invalid",
                 msg="This confirmation link is no longer valid. Sign up again or contact support via the chat bubble."), status_code=404)
+        # v0.11.20: verify-then-swap for email CHANGES. The old address stays
+        # canonical everywhere until this click; only now does the new address
+        # become the address of record. Old unverified rows for the role are
+        # expired so the portal gate reflects one truth.
+        if row["purpose"] == "email_change" and row["applied_at"] is None:
+            try:
+                if row["subject_role"] == "parent":
+                    owner_id = await conn.fetchval(
+                        "SELECT user_id FROM user_tenant_roles WHERE tenant_id=$1 "
+                        "AND role='tenant_owner' ORDER BY granted_at LIMIT 1", row["tenant_id"])
+                    if owner_id:
+                        await conn.execute(
+                            "UPDATE users SET email=$2, email_verified_at=now() WHERE id=$1",
+                            owner_id, row["email"])
+                        _tidp = str(UUID(str(row["tenant_id"])))
+                        async with conn.transaction():  # tenants write policy requires tenant context
+                            await conn.execute(f"SET LOCAL app.current_tenant_id = '{_tidp}'")
+                            await conn.execute(
+                                "UPDATE tenants SET primary_email=$2 WHERE id=$1",
+                                row["tenant_id"], row["email"])
+                else:
+                    _tid = str(UUID(str(row["tenant_id"])))
+                    async with conn.transaction():  # SPD FORCE RLS needs tenant context
+                        await conn.execute(f"SET LOCAL app.current_tenant_id = '{_tid}'")
+                        await conn.execute(
+                            "UPDATE student_personal_details SET email_primary=$2, updated_at=now() "
+                            "WHERE tenant_id=$1", row["tenant_id"], row["email"])
+                await conn.execute(
+                    "UPDATE email_verifications SET applied_at=now() WHERE token_hash=$1", token_hash)
+                await conn.execute(
+                    "UPDATE email_verifications SET expires_at=now() WHERE tenant_id=$1 "
+                    "AND subject_role=$2 AND email <> $3 AND verified_at IS NULL",
+                    row["tenant_id"], row["subject_role"], row["email"])
+            except Exception as exc:
+                log.warning("email change apply failed (verification stands): %r", exc)
         remaining = await conn.fetchval(
             """
             SELECT count(*) FROM email_verifications
@@ -1721,7 +1765,9 @@ async def email_verification_status(request: Request) -> dict[str, Any]:
         principal = await _tenant_from_bearer(request, conn)
         rows = await conn.fetch(
             "SELECT subject_role, email, verified_at, needs_review, expires_at "
-            "FROM email_verifications WHERE tenant_id = $1::uuid ORDER BY created_at",
+            "FROM email_verifications WHERE tenant_id = $1::uuid "
+            "AND (purpose = 'signup' OR verified_at IS NOT NULL) "  # v0.11.20: in-flight email CHANGES never re-lock the gate
+            "ORDER BY created_at",
             str(principal["tenant_id"]))
     emails = [{"role": r["subject_role"], "email": r["email"],
                "verified": r["verified_at"] is not None,
@@ -1730,6 +1776,57 @@ async def email_verification_status(request: Request) -> dict[str, Any]:
               for r in rows]
     all_verified = bool(emails) and all(e["verified"] for e in emails)
     return {"emails": emails, "all_verified": all_verified}
+
+
+class EmailChangeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    subject_role: str = "parent"   # parent | student
+    new_email: EmailStr
+
+
+@router.post("/request-email-change")
+async def request_email_change(body: EmailChangeRequest, request: Request) -> dict[str, Any]:
+    """v0.11.20 (operator decision): verify-then-swap email change. Creates an
+    email_change verification row and emails the NEW address; the OLD address
+    stays the address of record everywhere (login, notifications, tenant
+    primary_email, student email_primary) until the new one is verified -
+    the swap happens inside verify-email on link click."""
+    pool: asyncpg.Pool = request.app.state.pool
+    role_in = body.subject_role.strip().lower()
+    if role_in not in ("parent", "student"):
+        raise HTTPException(422, {"error": "bad_subject_role"})
+    email = str(body.new_email).strip().lower()
+    async with pool.acquire() as conn:
+        principal = await _tenant_from_bearer(request, conn)
+        tenant_id = principal["tenant_id"]
+        if role_in == "parent":
+            taken = await conn.fetchval(
+                "SELECT 1 FROM users WHERE lower(email)=$1 AND deactivated_at IS NULL", email)
+            if taken:
+                raise HTTPException(409, {"error": "email_in_use",
+                                          "message": "That email already belongs to an account."})
+        review = (role_in == "student") and not _looks_edu(email)
+        raw = secrets.token_urlsafe(32)
+        await conn.execute(
+            "UPDATE email_verifications SET expires_at=now() WHERE tenant_id=$1::uuid "
+            "AND subject_role=$2 AND purpose='email_change' AND verified_at IS NULL",
+            str(tenant_id), role_in)
+        await conn.execute(
+            "INSERT INTO email_verifications (tenant_id, subject_role, email, token_hash, "
+            "needs_review, expires_at, purpose) VALUES ($1::uuid,$2,$3,$4,$5, now() + interval '7 days', 'email_change')",
+            str(tenant_id), role_in, email,
+            hashlib.sha256(raw.encode()).hexdigest(), review)
+        student_name = await conn.fetchval(
+            "SELECT first_name FROM students WHERE tenant_id=$1::uuid ORDER BY created_at LIMIT 1",
+            str(tenant_id)) or "your student"
+    try:
+        await _send_verification_email(email, role_in, student_name, raw)
+        sent = True
+    except Exception as exc:
+        log.warning("request-email-change send failed for %s: %s", email, exc)
+        sent = False
+    return {"sent": sent, "new_email": email,
+            "message": "The current email stays active until the new address is verified."}
 
 
 @router.post("/request-email-verification")
