@@ -8642,7 +8642,9 @@ _ORG_PROFILE_KEYS = {
     "gsa_leader_email", "gsa_troop_phone", "gsa_troop_email", "gsa_troop_website",
     "cap_squadron", "cap_wing", "cap_cap_id",
     "cap_region", "cap_group", "cap_squadron_type",
-    "jrotc_branch", "jrotc_unit", "jrotc_company",
+    "jrotc_branch", "jrotc_unit", "jrotc_company", "jrotc_period",
+    "jrotc_instructor", "jrotc_instructor_phone", "jrotc_instructor_email",
+    "jrotc_unit_phone", "jrotc_unit_email",
 }
 
 
