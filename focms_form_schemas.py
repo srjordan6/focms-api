@@ -8871,6 +8871,12 @@ async def post_billing_checkout(request: Request, student_id: str, body: Checkou
     if mode == "subscription":
         params["subscription_data[metadata][tenant_id]"] = tenant_id
         params["subscription_data[metadata][plan_code]"] = plan["plan_code"]
+    # v0.12.157: attach the tenant's (possibly just-created) Stripe customer so
+    # cards saved via the billing portal are reused at checkout and vice versa.
+    try:
+        params["customer"] = await _get_or_create_stripe_customer(pool, tenant_id)
+    except HTTPException:
+        pass  # checkout can still proceed customer-less if creation fails
     sess = await _stripe("POST", "/checkout/sessions", params)
     return {"plan_code": plan["plan_code"], "url": sess.get("url"),
             "session_id": sess.get("id")}
@@ -9047,3 +9053,49 @@ async def post_billing_sync_quota(request: Request, student_id: str):
             "storage_used_bytes": trow["storage_used_bytes"] if trow else None,
             "storage_quota_bytes": trow["storage_quota_bytes"] if trow else None,
             "storage_plan": trow["storage_plan"] if trow else None}
+
+
+# v0.12.157: on-demand Stripe customer. Card management must work BEFORE any
+# purchase (operator directive), and checkout must attach to the same
+# customer so a card saved in the portal is reused. Resolution order:
+# newest subscriptions.stripe_customer_id -> tenants.stripe_customer_id ->
+# create at Stripe (email/name from the tenant row) and persist on tenants.
+async def _get_or_create_stripe_customer(pool, tenant_id: str) -> str:
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT stripe_customer_id FROM subscriptions "
+            "WHERE tenant_id=$1::uuid AND stripe_customer_id IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT 1", tenant_id)
+    if row and row["stripe_customer_id"]:
+        return row["stripe_customer_id"]
+    async with _tenant_conn(pool, tenant_id) as conn:
+        trow = await conn.fetchrow(
+            "SELECT stripe_customer_id, primary_email, display_name "
+            "FROM tenants WHERE id=$1::uuid", tenant_id)
+    if trow and trow["stripe_customer_id"]:
+        return trow["stripe_customer_id"]
+    cust = await _stripe("POST", "/customers", {
+        "email": (trow["primary_email"] if trow else None) or None,
+        "name": (trow["display_name"] if trow else None) or None,
+        "metadata": {"tenant_id": tenant_id}})
+    cust_id = cust.get("id")
+    if cust_id:
+        async with _tenant_conn(pool, tenant_id) as conn:
+            await conn.execute(
+                "UPDATE tenants SET stripe_customer_id=$2, updated_at=now() "
+                "WHERE id=$1::uuid", tenant_id, cust_id)
+    if not cust_id:
+        raise HTTPException(502, {"error": "stripe_error",
+                                  "detail": "customer creation failed"})
+    return cust_id
+
+
+@router.post("/student/{student_id}/billing/portal-session-v2")
+async def post_billing_portal_v2(request: Request, student_id: str):
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
+    sess = await _stripe("POST", "/billing_portal/sessions", {
+        "customer": cust_id,
+        "return_url": "https://outcomestar.app/portal.html"})
+    return {"url": sess.get("url"), "customer": cust_id}
