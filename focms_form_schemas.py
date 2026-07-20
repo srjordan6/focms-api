@@ -8641,6 +8641,7 @@ _ORG_PROFILE_KEYS = {
     "gsa_level", "gsa_service_unit", "gsa_leader", "gsa_leader_phone",
     "gsa_leader_email", "gsa_troop_phone", "gsa_troop_email", "gsa_troop_website",
     "cap_squadron", "cap_wing", "cap_cap_id",
+    "cap_region", "cap_group", "cap_squadron_type",
     "jrotc_branch", "jrotc_unit", "jrotc_company",
 }
 
