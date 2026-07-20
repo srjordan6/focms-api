@@ -8729,3 +8729,257 @@ async def get_student_access_tier(request: Request, student_id: str):
             "tier": prow["tier_code"], "tier_title": prow["title"],
             "rights": rights, "legal_basis": prow["legal_basis"],
             "parent_access_allowed": parent_allowed}
+
+# ============================================================================
+# v0.12.155: BILLING (Stripe). Env-driven: STRIPE_SECRET_KEY +
+# STRIPE_WEBHOOK_SECRET on the Render service; price/product IDs live in
+# billing_plans.stripe_price_id (configurable-not-hardcoded - run the
+# stripe_bootstrap script once and paste the IDs). Stdlib-only HTTP client
+# (urllib in a thread) - zero new dependencies. Flow: account exists first
+# (free signup), then checkout links the Stripe subscription to the tenant
+# via client_reference_id; the webhook is the single source of truth for
+# entitlement (subscriptions table).
+# ============================================================================
+import os as _os
+import hmac as _hmac
+import hashlib as _hashlib
+import time as _time
+import asyncio as _asyncio
+import urllib.request as _urlreq
+import urllib.parse as _urlparse
+
+_STRIPE_API = "https://api.stripe.com/v1"
+
+
+def _stripe_key():
+    k = (_os.environ.get("STRIPE_SECRET_KEY") or "").strip()
+    if not k:
+        raise HTTPException(503, {"error": "billing_not_configured",
+                                  "detail": "STRIPE_SECRET_KEY is not set"})
+    return k
+
+
+def _stripe_http(method: str, path: str, params: dict = None) -> dict:
+    url = _STRIPE_API + path
+    data = None
+    if params:
+        flat = []
+        for k, v in params.items():
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                for i, item in enumerate(v):
+                    if isinstance(item, dict):
+                        for ik, iv in item.items():
+                            flat.append(("%s[%d][%s]" % (k, i, ik), str(iv)))
+                    else:
+                        flat.append(("%s[%d]" % (k, i), str(item)))
+            elif isinstance(v, dict):
+                for ik, iv in v.items():
+                    flat.append(("%s[%s]" % (k, ik), str(iv)))
+            else:
+                flat.append((k, str(v)))
+        data = _urlparse.urlencode(flat).encode()
+    if method == "GET" and data:
+        url += "?" + data.decode()
+        data = None
+    req = _urlreq.Request(url, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + _stripe_key())
+    if data:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with _urlreq.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except _urlreq.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            err = json.loads(body).get("error", {})
+        except Exception:
+            err = {"message": body[:300]}
+        raise HTTPException(502, {"error": "stripe_error",
+                                  "detail": err.get("message", "unknown")})
+
+
+async def _stripe(method: str, path: str, params: dict = None) -> dict:
+    return await _asyncio.to_thread(_stripe_http, method, path, params)
+
+
+def _stripe_verify_sig(payload: bytes, sig_header: str) -> bool:
+    secret = (_os.environ.get("STRIPE_WEBHOOK_SECRET") or "").strip()
+    if not secret or not sig_header:
+        return False
+    t = None
+    v1s = []
+    for part in sig_header.split(","):
+        kv = part.strip().split("=", 1)
+        if len(kv) != 2:
+            continue
+        if kv[0] == "t":
+            t = kv[1]
+        elif kv[0] == "v1":
+            v1s.append(kv[1])
+    if not t or not v1s:
+        return False
+    try:
+        if abs(_time.time() - int(t)) > 300:
+            return False
+    except Exception:
+        return False
+    signed = ("%s." % t).encode() + payload
+    expected = _hmac.new(secret.encode(), signed, _hashlib.sha256).hexdigest()
+    return any(_hmac.compare_digest(expected, v) for v in v1s)
+
+
+async def _plan_row(pool, plan_code: str):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT plan_code, title, kind, amount_cents, currency, "
+            "billing_interval, stripe_price_id FROM billing_plans "
+            "WHERE plan_code=$1 AND is_active", plan_code)
+    if not row:
+        raise HTTPException(404, {"error": "unknown_plan"})
+    return row
+
+
+class CheckoutBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plan_code: str
+    resume_kind: str = None
+
+
+@router.post("/student/{student_id}/billing/checkout-session")
+async def post_billing_checkout(request: Request, student_id: str, body: CheckoutBody):
+    tenant_id, user_id = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    plan = await _plan_row(pool, body.plan_code)
+    if plan["kind"] == "free":
+        return {"plan_code": plan["plan_code"], "free": True, "url": None}
+    if not plan["stripe_price_id"]:
+        raise HTTPException(503, {"error": "billing_not_configured",
+                                  "detail": "price not provisioned for " + plan["plan_code"]})
+    mode = "subscription" if plan["kind"] == "subscription" else "payment"
+    params = {
+        "mode": mode,
+        "client_reference_id": tenant_id,
+        "success_url": "https://outcomestar.app/portal.html?billing=success",
+        "cancel_url": "https://outcomestar.app/portal.html?billing=cancelled",
+        "line_items": [{"price": plan["stripe_price_id"], "quantity": 1}],
+        "metadata": {"tenant_id": tenant_id, "student_id": student_id,
+                     "plan_code": plan["plan_code"],
+                     "resume_kind": body.resume_kind or ""},
+    }
+    if mode == "subscription":
+        params["subscription_data[metadata][tenant_id]"] = tenant_id
+        params["subscription_data[metadata][plan_code]"] = plan["plan_code"]
+    sess = await _stripe("POST", "/checkout/sessions", params)
+    return {"plan_code": plan["plan_code"], "url": sess.get("url"),
+            "session_id": sess.get("id")}
+
+
+@router.get("/student/{student_id}/billing/status")
+async def get_billing_status(request: Request, student_id: str):
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT s.plan_code, p.title, s.status, s.current_period_end, "
+            "s.cancel_at_period_end, p.kind, p.storage_gb "
+            "FROM subscriptions s JOIN billing_plans p ON p.plan_code = s.plan_code "
+            "WHERE s.tenant_id=$1::uuid ORDER BY s.updated_at DESC", tenant_id)
+    subs = [{"plan_code": r["plan_code"], "title": r["title"], "status": r["status"],
+             "current_period_end": r["current_period_end"].isoformat() if r["current_period_end"] else None,
+             "cancel_at_period_end": r["cancel_at_period_end"],
+             "storage_gb": r["storage_gb"]} for r in rows]
+    active = [s for s in subs if s["status"] in ("active", "trialing")]
+    plan = next((s for s in active if not s["plan_code"].startswith("addon_")), None)
+    async with pool.acquire() as conn:
+        plans = await conn.fetch(
+            "SELECT plan_code, title, kind, amount_cents, billing_interval, storage_gb "
+            "FROM billing_plans WHERE is_active ORDER BY sort_order")
+    return {"tenant_id": tenant_id,
+            "current_plan": plan or {"plan_code": "k5_free", "title": "Free plan", "status": "active"},
+            "subscriptions": subs,
+            "available_plans": [dict(p) for p in plans],
+            "configured": bool((_os.environ.get("STRIPE_SECRET_KEY") or "").strip())}
+
+
+@router.post("/student/{student_id}/billing/portal-session")
+async def post_billing_portal(request: Request, student_id: str):
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT stripe_customer_id FROM subscriptions "
+            "WHERE tenant_id=$1::uuid AND stripe_customer_id IS NOT NULL "
+            "ORDER BY updated_at DESC LIMIT 1", tenant_id)
+    if not row:
+        raise HTTPException(404, {"error": "no_billing_customer"})
+    sess = await _stripe("POST", "/billing_portal/sessions", {
+        "customer": row["stripe_customer_id"],
+        "return_url": "https://outcomestar.app/portal.html"})
+    return {"url": sess.get("url")}
+
+
+@router.post("/billing/webhook")
+async def post_billing_webhook(request: Request):
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    if not _stripe_verify_sig(payload, sig):
+        raise HTTPException(400, {"error": "bad_signature"})
+    try:
+        event = json.loads(payload.decode())
+    except Exception:
+        raise HTTPException(400, {"error": "bad_payload"})
+    ev_id = event.get("id") or ""
+    ev_type = event.get("type") or ""
+    obj = (event.get("data") or {}).get("object") or {}
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        dup = await conn.fetchrow(
+            "INSERT INTO billing_events (stripe_event_id, event_type, payload) "
+            "VALUES ($1, $2, $3::jsonb) ON CONFLICT (stripe_event_id) DO NOTHING "
+            "RETURNING id", ev_id, ev_type, json.dumps(event)[:100000])
+        if not dup:
+            return {"received": True, "duplicate": True}
+        if ev_type == "checkout.session.completed":
+            tenant_id = obj.get("client_reference_id") or (obj.get("metadata") or {}).get("tenant_id")
+            meta = obj.get("metadata") or {}
+            plan_code = meta.get("plan_code") or ""
+            if obj.get("mode") == "subscription" and tenant_id and plan_code:
+                await conn.execute(
+                    "INSERT INTO subscriptions (tenant_id, plan_code, stripe_customer_id, "
+                    "stripe_subscription_id, status) VALUES ($1::uuid, $2, $3, $4, 'active') "
+                    "ON CONFLICT (stripe_subscription_id) DO UPDATE SET "
+                    "status='active', updated_at=now()",
+                    tenant_id, plan_code, obj.get("customer"), obj.get("subscription"))
+            elif obj.get("mode") == "payment" and tenant_id and plan_code == "resume_ai":
+                await conn.execute(
+                    "INSERT INTO resume_ai_charges (tenant_id, student_id, resume_kind, "
+                    "stripe_payment_intent_id, amount_cents, currency, status) "
+                    "VALUES ($1::uuid, $2::uuid, $3, $4, $5, $6, 'succeeded')",
+                    tenant_id, meta.get("student_id"), meta.get("resume_kind") or "standard",
+                    obj.get("payment_intent"), obj.get("amount_total") or 0,
+                    obj.get("currency") or "usd")
+        elif ev_type in ("customer.subscription.updated", "customer.subscription.deleted"):
+            sub_id = obj.get("id")
+            status = "canceled" if ev_type.endswith("deleted") else (obj.get("status") or "active")
+            period_end = obj.get("current_period_end")
+            price_id = None
+            try:
+                price_id = obj["items"]["data"][0]["price"]["id"]
+            except Exception:
+                pass
+            plan_code = None
+            if price_id:
+                prow = await conn.fetchrow(
+                    "SELECT plan_code FROM billing_plans WHERE stripe_price_id=$1", price_id)
+                plan_code = prow["plan_code"] if prow else None
+            await conn.execute(
+                "UPDATE subscriptions SET status=$2, "
+                "current_period_end = CASE WHEN $3::bigint IS NULL THEN current_period_end "
+                "ELSE to_timestamp($3::bigint) END, "
+                "cancel_at_period_end=$4, "
+                "plan_code = COALESCE($5, plan_code), updated_at=now() "
+                "WHERE stripe_subscription_id=$1",
+                sub_id, status, period_end, bool(obj.get("cancel_at_period_end")), plan_code)
+    return {"received": True}
