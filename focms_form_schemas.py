@@ -213,7 +213,7 @@ from uuid import UUID
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 log = logging.getLogger("focms-form-schemas")
 router = APIRouter(prefix="/focms/v1", tags=["form-schemas"])
@@ -8841,15 +8841,50 @@ async def _plan_row(pool, plan_code: str):
     return row
 
 
+# v0.12.158 (security audit): lightweight per-tenant throttle on the endpoints
+# that cost money or create Stripe objects. In-process and per-worker (Render
+# runs a single uvicorn worker for this service), so it is a spam brake, not a
+# distributed limiter - Cloudflare handles volumetric abuse at the edge.
+_BILLING_HITS = {}
+
+
+def _billing_rate_limit(tenant_id: str, bucket: str, limit: int, window_s: int):
+    now = _time.time()
+    key = (tenant_id, bucket)
+    hits = [t for t in _BILLING_HITS.get(key, []) if now - t < window_s]
+    if len(hits) >= limit:
+        raise HTTPException(429, {"error": "rate_limited",
+                                  "detail": "Too many billing requests. Try again shortly."})
+    hits.append(now)
+    _BILLING_HITS[key] = hits
+    if len(_BILLING_HITS) > 5000:          # bound memory on a long-lived process
+        for k in [k for k, v in _BILLING_HITS.items()
+                  if not v or now - v[-1] > 3600]:
+            _BILLING_HITS.pop(k, None)
+
+
 class CheckoutBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    plan_code: str
-    resume_kind: str = None
+    plan_code: str = Field(..., min_length=1, max_length=64)
+    # v0.12.158 (security audit): bounded + whitelisted. Previously a free str
+    # that flowed straight into Stripe metadata and resume_ai_charges.
+    resume_kind: Optional[str] = Field(default=None, max_length=64)
+
+    @field_validator("resume_kind")
+    @classmethod
+    def _check_resume_kind(cls, v):
+        if v is None or v == "":
+            return v
+        allowed = {"standard", "resume_academic", "resume_career"}
+        if v not in allowed:
+            raise ValueError("resume_kind must be one of: " + ", ".join(sorted(allowed)))
+        return v
 
 
 @router.post("/student/{student_id}/billing/checkout-session")
 async def post_billing_checkout(request: Request, student_id: str, body: CheckoutBody):
     tenant_id, user_id = await _pp_context(request, student_id)
+    _billing_rate_limit(tenant_id, "checkout", limit=10, window_s=300)
     pool: asyncpg.Pool = request.app.state.pool
     plan = await _plan_row(pool, body.plan_code)
     if plan["kind"] == "free":
@@ -8939,13 +8974,35 @@ async def post_billing_webhook(request: Request):
     ev_id = event.get("id") or ""
     ev_type = event.get("type") or ""
     obj = (event.get("data") or {}).get("object") or {}
+    # v0.12.158 (security audit): store only what reconciliation needs instead
+    # of the full Stripe event. The raw event carries customer email, billing
+    # address and card metadata; Stripe stays the system of record for those,
+    # so persisting them here would be needless PII retention.
+    _audit = {
+        "id": event.get("id"),
+        "type": ev_type,
+        "created": event.get("created"),
+        "livemode": event.get("livemode"),
+        "object_id": obj.get("id"),
+        "mode": obj.get("mode"),
+        "status": obj.get("status"),
+        "customer": obj.get("customer"),
+        "subscription": obj.get("subscription"),
+        "payment_intent": obj.get("payment_intent"),
+        "amount_total": obj.get("amount_total"),
+        "currency": obj.get("currency"),
+        "client_reference_id": obj.get("client_reference_id"),
+        "metadata": obj.get("metadata") or {},
+        "current_period_end": obj.get("current_period_end"),
+        "cancel_at_period_end": obj.get("cancel_at_period_end"),
+    }
     pool: asyncpg.Pool = request.app.state.pool
     sync_tenant = None
     async with pool.acquire() as conn:
         dup = await conn.fetchrow(
             "INSERT INTO billing_events (stripe_event_id, event_type, payload) "
             "VALUES ($1, $2, $3::jsonb) ON CONFLICT (stripe_event_id) DO NOTHING "
-            "RETURNING id", ev_id, ev_type, json.dumps(event)[:100000])
+            "RETURNING id", ev_id, ev_type, json.dumps(_audit)[:20000])
         if not dup:
             return {"received": True, "duplicate": True}
         if ev_type == "checkout.session.completed":
@@ -9093,6 +9150,7 @@ async def _get_or_create_stripe_customer(pool, tenant_id: str) -> str:
 @router.post("/student/{student_id}/billing/portal-session-v2")
 async def post_billing_portal_v2(request: Request, student_id: str):
     tenant_id, _uid = await _pp_context(request, student_id)
+    _billing_rate_limit(tenant_id, "portal", limit=10, window_s=300)
     pool: asyncpg.Pool = request.app.state.pool
     cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
     sess = await _stripe("POST", "/billing_portal/sessions", {
