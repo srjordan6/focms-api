@@ -6505,6 +6505,11 @@ class SchoolProfileItem(BaseModel):
     school_fax: Optional[str] = None
     principal_name: Optional[str] = None
     principal_phone: Optional[str] = None
+    # v0.12.162: the federal school id, shown on the record. For PUBLIC schools
+    # that is the 12-digit NCES/CCD ncessch (already carried in school_leaid);
+    # for PRIVATE schools it is the PSS id (e.g. A1703455), which has letters and
+    # therefore cannot live in the digits-only leaid the district cascade slices.
+    nces_school_id: Optional[str] = None
     city_town: Optional[str] = None
     state_province: Optional[str] = None
     zip_postal_code: Optional[str] = None
@@ -6625,7 +6630,7 @@ async def get_school_profiles(request: Request, student_id: str):
             "SELECT id::text AS id, school_name, school_leaid, district_leaid, district_name, "
             "student_school_id, school_ceeb_code, ceeb_code, "
             "school_type, street_address, street_address_line_2, city_town, state_province, "
-            "school_phone, school_fax, principal_name, principal_phone, "
+            "school_phone, school_fax, principal_name, principal_phone, nces_school_id, "
             "zip_postal_code, country, counselor_name, counselor_position, "
             "counselor_phone, counselor_email, counselor_fax, "
             "is_current_school, start_date, end_date, grade_levels_attended, "
@@ -6690,6 +6695,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "school_ceeb_code=$4, ceeb_code=$5, school_type=$6, "
                         "street_address=$7, street_address_line_2=$36, city_town=$8, state_province=$9, "
                         "school_phone=$37, school_fax=$38, principal_name=$39, principal_phone=$40, "
+                        "nces_school_id=$41, "
                         "zip_postal_code=$10, country=$11, counselor_name=$12, "
                         "counselor_position=$13, counselor_phone=$14, counselor_email=$15, "
                         "counselor_fax=$16, is_current_school=$17, "
@@ -6716,7 +6722,8 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         it.school_leaid, it.district_leaid, it.district_name,
                         it.student_school_id, it.state_student_id,
                         it.street_address_line_2,
-                        it.school_phone, it.school_fax, it.principal_name, it.principal_phone)
+                        it.school_phone, it.school_fax, it.principal_name, it.principal_phone,
+                        it.nces_school_id)
                     if r and r.endswith(" 1"): updated += 1
                 else:
                     if it.is_current_school:
@@ -6730,7 +6737,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "state_student_id, "
                         "school_ceeb_code, ceeb_code, school_type, "
                         "street_address, street_address_line_2, city_town, state_province, zip_postal_code, "
-                        "school_phone, school_fax, principal_name, principal_phone, "
+                        "school_phone, school_fax, principal_name, principal_phone, nces_school_id, "
                         "country, counselor_name, counselor_position, counselor_phone, "
                         "counselor_email, counselor_fax, is_current_school, "
                         "start_date, end_date, grade_levels_attended, "
@@ -6738,7 +6745,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "courses_available_flags, courses_available_notes, "
                         "graduating_class_size, boarding_students, curriculum_notes, notes, "
                         "visibility, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$31,$32,$33,$34,$35,$4,$5,$6,$7,$36,$8,$9,$10,$37,$38,$39,$40,$11,$12,$13,$14,"
+                        "VALUES ($1::uuid,$2::uuid,$3,$31,$32,$33,$34,$35,$4,$5,$6,$7,$36,$8,$9,$10,$37,$38,$39,$40,$41,$11,$12,$13,$14,"
                         "$15,$16,$17,$18::date,$19::date,$20,$21,$22,$23,$24::jsonb,$25,"
                         "$26,$27,$28,$29,'private','parent_portal',$30::uuid,$30::uuid)",
                         tenant_id, student_id, name, it.school_ceeb_code, it.ceeb_code,
@@ -6752,7 +6759,8 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         it.school_leaid, it.district_leaid, it.district_name,
                         it.student_school_id, it.state_student_id,
                         it.street_address_line_2,
-                        it.school_phone, it.school_fax, it.principal_name, it.principal_phone)
+                        it.school_phone, it.school_fax, it.principal_name, it.principal_phone,
+                        it.nces_school_id)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
