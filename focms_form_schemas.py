@@ -5672,6 +5672,25 @@ async def get_affiliation_programs(request: Request):
     return {"programs": [dict(r) for r in rows]}
 
 
+@router.get("/catalogs/instruments")
+async def get_instruments_catalog(request: Request):
+    """v0.12.165: instruments for the music-performance logger's dropdown.
+
+    49 rows across six families (Strings, Woodwinds, Brass, Percussion,
+    Keyboard, Voice) - the standard orchestral set (taxonomy per
+    greeleyphil.org/instruments) plus the band/jazz staples an orchestral
+    list omits: saxophones, mellophone, sousaphone, euphonium, drum set.
+    Catalog table, not a JS literal, so adding an instrument is an INSERT.
+    """
+    _ = await _resolve_context(request)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT code, title, family FROM instruments_catalog "
+            "WHERE is_active ORDER BY sort_order, title")
+    return {"instruments": [dict(r) for r in rows]}
+
+
 @router.get("/catalogs/cadet-trainings")
 async def get_cadet_trainings(request: Request):
     # v0.12.144: shared (cross-tenant) training list - seeds + every title any
