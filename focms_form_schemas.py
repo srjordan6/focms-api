@@ -1,6 +1,14 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.167 · Card-on-file preflight + SetupIntent capture. GET
+         /billing/payment-method reports has_card in one call so the portal
+         stops offering an add-card detour to parents who already have one.
+         POST /billing/setup-session opens Stripe Checkout in mode=setup -
+         the surface that actually captures and saves a card. The billing
+         PORTAL was being used for this and manages an existing subscription;
+         a tenant with no subscription could open it and complete nothing.
+
 v0.12.166 · Ensemble-scoped instruments. instruments_catalog.ensembles text[]
          + affiliation_programs_catalog.ensemble tag orchestra /
          concert_band / marching_band / jazz_band / rock_band / choir); both
@@ -9481,4 +9489,68 @@ async def post_billing_portal_v2(request: Request, student_id: str):
     sess = await _stripe("POST", "/billing_portal/sessions", {
         "customer": cust_id,
         "return_url": "https://outcomestar.app/portal.html"})
+    return {"url": sess.get("url"), "customer": cust_id}
+
+
+# ============================================================================
+# v0.12.167: CARD-ON-FILE preflight + SetupIntent capture.
+#
+# Two defects this fixes:
+#  (1) The portal offered "add a card" via the Stripe BILLING PORTAL. That
+#      surface manages an EXISTING subscription; for a tenant with no
+#      subscription it can render with nothing actionable, so the parent could
+#      open it and never complete anything. Checkout in mode=setup is the
+#      surface that exists to capture and save a card, and it attaches the
+#      result to the customer as the default for future off_session charges.
+#  (2) The portal could not tell whether a card already existed, so it offered
+#      the billing detour even to parents who had one. GET .../payment-method
+#      answers that in one cheap call.
+# ============================================================================
+
+async def _stripe_card_count(cust_id: str) -> int:
+    """Number of saved cards on the customer. 0 means an off_session charge
+    cannot succeed, which is what the resume-tailor 402 reports."""
+    res = await _stripe("GET", "/payment_methods",
+                        {"customer": cust_id, "type": "card", "limit": 1})
+    return len(res.get("data") or [])
+
+
+@router.get("/student/{student_id}/billing/payment-method")
+async def get_billing_payment_method(request: Request, student_id: str):
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    if not (_os.environ.get("STRIPE_SECRET_KEY") or "").strip():
+        return {"has_card": False, "configured": False}
+    try:
+        cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
+        n = await _stripe_card_count(cust_id)
+    except HTTPException:
+        # Never let a preflight break the caller - it only decides whether to
+        # offer the add-card step, and the charge itself still gates properly.
+        return {"has_card": False, "configured": True, "error": "lookup_failed"}
+    return {"has_card": n > 0, "configured": True, "customer": cust_id}
+
+
+@router.post("/student/{student_id}/billing/setup-session")
+async def post_billing_setup_session(request: Request, student_id: str):
+    """Stripe Checkout in mode=setup: collects a card and saves it to the
+    customer for later off_session charges (the $1.00 AI resume)."""
+    tenant_id, _uid = await _pp_context(request, student_id)
+    _billing_rate_limit(tenant_id, "setup", limit=10, window_s=300)
+    pool: asyncpg.Pool = request.app.state.pool
+    if not (_os.environ.get("STRIPE_SECRET_KEY") or "").strip():
+        raise HTTPException(503, {"error": "billing_not_configured"})
+    cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
+    sess = await _stripe("POST", "/checkout/sessions", {
+        "mode": "setup",
+        "customer": cust_id,
+        "client_reference_id": tenant_id,
+        "success_url": "https://outcomestar.app/portal?card=saved",
+        "cancel_url": "https://outcomestar.app/portal?card=cancelled",
+        "metadata": {"tenant_id": tenant_id, "student_id": student_id,
+                     "purpose": "save_card"},
+        # Make the saved card the default for future off_session charges,
+        # otherwise a card can attach and the charge still fail.
+        "setup_intent_data[metadata][tenant_id]": tenant_id,
+    })
     return {"url": sess.get("url"), "customer": cust_id}
