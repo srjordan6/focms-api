@@ -3473,7 +3473,19 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
                                 'mailing_same_as_physical', $31::boolean,
                                 'mailing_address', $32::jsonb,
                                 'education_level', $39::text,
-                                'county', $40::text),
+                                'county', $40::text,
+                                -- v0.12.163 BUGFIX: parent_role ($41) and phones
+                                -- ($42) were passed as arguments but referenced
+                                -- nowhere in the statement. asyncpg rejects a
+                                -- query whose argument count does not match its
+                                -- placeholders, so EVERY father/mother save
+                                -- raised before touching the table - which is why
+                                -- family_members held no parent_portal row at all.
+                                -- Both keys are read back by GET /family, and
+                                -- parent_role is what the DELETE-then-insert
+                                -- replace step matches on.
+                                'parent_role', $41::text,
+                                'phones', $42::jsonb),
              $33,$34,$35,$36,$37,$38,
              'parent_portal',$28::uuid,$28::uuid)
         """,
