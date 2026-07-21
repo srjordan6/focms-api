@@ -1,6 +1,14 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.166 · Ensemble-scoped instruments. instruments_catalog.ensembles text[]
+         + affiliation_programs_catalog.ensemble tag orchestra /
+         concert_band / marching_band / jazz_band / rock_band / choir); both
+         catalog endpoints return them. The performance logger's instrument
+         dropdown filters to the program's ensemble - previously School
+         Orchestra and Marching Band showed the identical 49-instrument list.
+         Scoping a new program or instrument is a catalog UPDATE, no deploy.
+
 v0.12.165 · /catalogs/affiliation-programs now returns school_based (new
          boolean on affiliation_programs_catalog, 22 programs marked). Drives
          the portal's school-provider picker: previously the picker appeared
@@ -5666,7 +5674,7 @@ async def get_affiliation_programs(request: Request):
             # Data-driven ON PURPOSE - the old test keyed on the title starting
             # with "School", which forced awkward renames ("School Student
             # Council"?) and silently missed everything else.
-            "SELECT code, title, category, capstone_award, school_based "
+            "SELECT code, title, category, capstone_award, school_based, ensemble "
             "FROM affiliation_programs_catalog "
             "WHERE is_active ORDER BY sort_order, title")
     return {"programs": [dict(r) for r in rows]}
@@ -5686,7 +5694,11 @@ async def get_instruments_catalog(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT code, title, family FROM instruments_catalog "
+            # v0.12.166: ensembles[] scopes each instrument to the ensemble
+            # types it belongs in. The portal filters the dropdown by the
+            # program's ensemble tag (affiliation_programs_catalog.ensemble) -
+            # a marching band form no longer offers the harp.
+            "SELECT code, title, family, ensembles FROM instruments_catalog "
             "WHERE is_active ORDER BY sort_order, title")
     return {"instruments": [dict(r) for r in rows]}
 
