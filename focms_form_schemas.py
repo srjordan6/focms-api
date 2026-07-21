@@ -1,6 +1,14 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.171 · type=card was hiding a real payment method. Both the preflight and
+         the resume charge listed payment_methods with type=card; a card saved
+         through Stripe Link is stored as type "link", so a customer with a
+         perfectly usable method counted as zero. Symptom: reconcile-card
+         reported attached=true with a pm_ id AND has_card=false in the same
+         response. Listing is now type-agnostic and prefers
+         invoice_settings.default_payment_method.
+
 v0.12.170 · reconcile-card. A completed Checkout mode=setup could leave the
          customer with no usable card - the PaymentMethod did not stick to the
          Customer - putting the parent in a loop: save a card, see no card,
@@ -2707,12 +2715,15 @@ async def _resume_ai_charge(request: Request, student_id: str, resume_kind: str)
         raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
     hdr = {"Authorization": "Bearer " + api_key}
     async with _es_httpx.AsyncClient(timeout=30) as client:
+        # v0.12.171: type-agnostic. A Link-saved card is type "link", and the
+        # old type=card filter made it invisible - the charge refused for a
+        # customer holding a perfectly chargeable method.
         pmr = await client.get("https://api.stripe.com/v1/payment_methods",
-                               headers=hdr, params={"customer": cust, "type": "card", "limit": 1})
+                               headers=hdr, params={"customer": cust, "limit": 10})
         pms = (pmr.json().get("data") or []) if pmr.status_code == 200 else []
         if not pms and alt and alt != cust:
             pmr = await client.get("https://api.stripe.com/v1/payment_methods",
-                                   headers=hdr, params={"customer": alt, "type": "card", "limit": 1})
+                                   headers=hdr, params={"customer": alt, "limit": 10})
             pms = (pmr.json().get("data") or []) if pmr.status_code == 200 else []
             if pms:
                 cust = alt          # charge where the card actually lives
@@ -9600,12 +9611,35 @@ async def post_billing_reconcile_card(request: Request, student_id: str):
 #      answers that in one cheap call.
 # ============================================================================
 
+async def _stripe_first_pm(cust_id: str):
+    """Newest reusable PaymentMethod on the customer, or None.
+
+    v0.12.171: deliberately does NOT filter type=card. A card saved through
+    Stripe Link is stored as type "link", so a type=card listing returns zero
+    for a customer who demonstrably has a usable payment method - which is
+    exactly what happened here: attach succeeded, pm_1Tvmd... existed, and the
+    count still said 0, sending the parent back round the add-card loop.
+    Prefer the customer's invoice default when set, since that is what an
+    off_session charge should use.
+    """
+    try:
+        cust = await _stripe("GET", "/customers/" + cust_id, None)
+        dflt = ((cust.get("invoice_settings") or {}).get("default_payment_method"))
+        if dflt:
+            return dflt if isinstance(dflt, str) else dflt.get("id")
+    except HTTPException:
+        pass
+    res = await _stripe("GET", "/payment_methods", {"customer": cust_id, "limit": 10})
+    for pm in (res.get("data") or []):
+        if pm.get("type") in ("card", "link", "cashapp", "us_bank_account"):
+            return pm.get("id")
+    data = res.get("data") or []
+    return data[0].get("id") if data else None
+
+
 async def _stripe_card_count(cust_id: str) -> int:
-    """Number of saved cards on the customer. 0 means an off_session charge
-    cannot succeed, which is what the resume-tailor 402 reports."""
-    res = await _stripe("GET", "/payment_methods",
-                        {"customer": cust_id, "type": "card", "limit": 1})
-    return len(res.get("data") or [])
+    """1 when the customer has any usable saved payment method, else 0."""
+    return 1 if await _stripe_first_pm(cust_id) else 0
 
 
 @router.get("/student/{student_id}/billing/payment-method")
