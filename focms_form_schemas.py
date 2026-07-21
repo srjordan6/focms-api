@@ -1,6 +1,14 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.170 · reconcile-card. A completed Checkout mode=setup could leave the
+         customer with no usable card - the PaymentMethod did not stick to the
+         Customer - putting the parent in a loop: save a card, see no card,
+         save again. New POST /billing/reconcile-card finds the newest
+         succeeded SetupIntent, attaches its PaymentMethod explicitly and sets
+         it as the invoice default. Idempotent, and it reports WHY when it
+         cannot (no succeeded SetupIntent, count seen).
+
 v0.12.169 · setup-session sent no currency. Stripe requires it in mode=setup
          (no line items to infer from), so every add-card click returned 400
          parameter_missing and opened nothing. Confirmed from the Stripe
@@ -9524,6 +9532,57 @@ async def post_billing_portal_v2(request: Request, student_id: str):
         "customer": cust_id,
         "return_url": "https://outcomestar.app/portal.html"})
     return {"url": sess.get("url"), "customer": cust_id}
+
+
+@router.post("/student/{student_id}/billing/reconcile-card")
+async def post_billing_reconcile_card(request: Request, student_id: str):
+    """v0.12.170: make a completed SetupIntent actually usable.
+
+    Symptom this exists for: Checkout mode=setup completes, the parent sees the
+    card page close, and the customer STILL reports no card. In principle the
+    PaymentMethod attaches to the Customer when the SetupIntent succeeds; in
+    practice that can fail to stick (Link-wrapped cards, a session completed
+    against a different customer, or an attach that simply never happened), and
+    the parent is left in a loop with no way to see or fix it.
+
+    So rather than trust it: list the customer's recent SetupIntents, take the
+    newest succeeded one that carries a payment_method, attach it explicitly,
+    and set it as the invoice default so later off_session charges find it.
+    Idempotent - attaching an already-attached PaymentMethod is harmless.
+    """
+    tenant_id, _uid = await _pp_context(request, student_id)
+    pool: asyncpg.Pool = request.app.state.pool
+    if not (_os.environ.get("STRIPE_SECRET_KEY") or "").strip():
+        raise HTTPException(503, {"error": "billing_not_configured"})
+    cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
+
+    existing = await _stripe_card_count(cust_id)
+    if existing:
+        return {"attached": False, "already": True, "has_card": True, "customer": cust_id}
+
+    sis = await _stripe("GET", "/setup_intents", {"customer": cust_id, "limit": 10})
+    pm_id = None
+    for si in (sis.get("data") or []):
+        if si.get("status") == "succeeded" and si.get("payment_method"):
+            pm_id = si["payment_method"]
+            break
+    if not pm_id:
+        return {"attached": False, "has_card": False, "customer": cust_id,
+                "reason": "no_succeeded_setup_intent",
+                "setup_intents_seen": len(sis.get("data") or [])}
+
+    try:
+        await _stripe("POST", "/payment_methods/" + pm_id + "/attach", {"customer": cust_id})
+    except HTTPException:
+        pass                      # already attached is fine; verify below
+    try:
+        await _stripe("POST", "/customers/" + cust_id,
+                      {"invoice_settings[default_payment_method]": pm_id})
+    except HTTPException:
+        pass
+
+    n = await _stripe_card_count(cust_id)
+    return {"attached": True, "has_card": n > 0, "customer": cust_id, "payment_method": pm_id}
 
 
 # ============================================================================
