@@ -1,6 +1,16 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.168 · AI resume charge could not see a saved card. _charge_resume_ai
+         resolved the Stripe customer from tenants.stripe_customer_id ONLY,
+         while every card-CAPTURE path (checkout, setup-session, billing
+         portal) resolves via _get_or_create_stripe_customer, which prefers
+         the newest subscriptions.stripe_customer_id. Where the two disagree
+         the card is saved on one customer and the charge queries another -
+         "no card on file" for a parent looking straight at their card. The
+         charge and the preflight now use the shared resolver and fall back
+         to the other known id before failing.
+
 v0.12.167 · Card-on-file preflight + SetupIntent capture. GET
          /billing/payment-method reports has_card in one call so the portal
          stops offering an add-card detour to parents who already have one.
@@ -2663,10 +2673,23 @@ async def _resume_ai_charge(request: Request, student_id: str, resume_kind: str)
         raise HTTPException(status_code=402, detail="payment_unavailable: httpx missing")
     tenant_id, _uid = await _pp_context(request, student_id)
     pool: asyncpg.Pool = request.app.state.pool
+    # v0.12.168: resolve the customer through the SAME path the card-capture
+    # flows use. This function used to read tenants.stripe_customer_id ONLY,
+    # while checkout / setup-session / billing-portal resolve via
+    # _get_or_create_stripe_customer (newest subscriptions.stripe_customer_id
+    # FIRST, then tenants). When those two disagree - which they do for any
+    # tenant whose card was saved through the other billing path - the card is
+    # stored on one customer and the charge looks at another, producing
+    # "no card on file" for a parent who plainly has one.
+    #
+    # Belt and braces: if the resolved customer has no card, fall back to the
+    # other known id before declaring failure, so an existing saved card is
+    # honoured wherever it happens to live.
+    cust = await _get_or_create_stripe_customer(pool, tenant_id)
     async with _tenant_conn(pool, tenant_id) as conn:
         trow = await conn.fetchrow(
             "SELECT stripe_customer_id FROM tenants WHERE id=$1::uuid", tenant_id)
-    cust = trow["stripe_customer_id"] if trow else None
+    alt = (trow["stripe_customer_id"] if trow else None)
     if not cust:
         raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
     hdr = {"Authorization": "Bearer " + api_key}
@@ -2674,6 +2697,12 @@ async def _resume_ai_charge(request: Request, student_id: str, resume_kind: str)
         pmr = await client.get("https://api.stripe.com/v1/payment_methods",
                                headers=hdr, params={"customer": cust, "type": "card", "limit": 1})
         pms = (pmr.json().get("data") or []) if pmr.status_code == 200 else []
+        if not pms and alt and alt != cust:
+            pmr = await client.get("https://api.stripe.com/v1/payment_methods",
+                                   headers=hdr, params={"customer": alt, "type": "card", "limit": 1})
+            pms = (pmr.json().get("data") or []) if pmr.status_code == 200 else []
+            if pms:
+                cust = alt          # charge where the card actually lives
         if not pms:
             raise HTTPException(status_code=402, detail="payment_required: no card on file for this account")
         pm_id = pms[0]["id"]
@@ -9524,11 +9553,25 @@ async def get_billing_payment_method(request: Request, student_id: str):
     try:
         cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
         n = await _stripe_card_count(cust_id)
+        # v0.12.168: check the OTHER known customer id too. A tenant can end up
+        # with a card on tenants.stripe_customer_id while the resolver returns
+        # the subscriptions one (or vice versa); reporting "no card" for a
+        # parent who has one sends them round an add-card loop that never ends.
+        checked = cust_id
+        if n == 0:
+            async with _tenant_conn(pool, tenant_id) as conn:
+                trow = await conn.fetchrow(
+                    "SELECT stripe_customer_id FROM tenants WHERE id=$1::uuid", tenant_id)
+            alt = (trow["stripe_customer_id"] if trow else None)
+            if alt and alt != cust_id:
+                n = await _stripe_card_count(alt)
+                if n:
+                    checked = alt
     except HTTPException:
         # Never let a preflight break the caller - it only decides whether to
         # offer the add-card step, and the charge itself still gates properly.
         return {"has_card": False, "configured": True, "error": "lookup_failed"}
-    return {"has_card": n > 0, "configured": True, "customer": cust_id}
+    return {"has_card": n > 0, "configured": True, "customer": checked}
 
 
 @router.post("/student/{student_id}/billing/setup-session")
