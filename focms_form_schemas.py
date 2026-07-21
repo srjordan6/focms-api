@@ -1,6 +1,11 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.169 · setup-session sent no currency. Stripe requires it in mode=setup
+         (no line items to infer from), so every add-card click returned 400
+         parameter_missing and opened nothing. Confirmed from the Stripe
+         request log, req_MZ418aCZB5Q5wm.
+
 v0.12.168 · AI resume charge could not see a saved card. _charge_resume_ai
          resolved the Stripe customer from tenants.stripe_customer_id ONLY,
          while every card-CAPTURE path (checkout, setup-session, billing
@@ -9586,6 +9591,13 @@ async def post_billing_setup_session(request: Request, student_id: str):
     cust_id = await _get_or_create_stripe_customer(pool, tenant_id)
     sess = await _stripe("POST", "/checkout/sessions", {
         "mode": "setup",
+        # REQUIRED in setup mode. Without it Stripe rejects the call with
+        # 400 parameter_missing "Missing required param: currency" - there are
+        # no line items to infer it from, so the session has nothing to say
+        # what the future charge will be denominated in. Omitting it made the
+        # add-card button look dead: the portal asked, the parent clicked, and
+        # nothing opened.
+        "currency": "usd",
         "customer": cust_id,
         "client_reference_id": tenant_id,
         "success_url": "https://outcomestar.app/portal?card=saved",
