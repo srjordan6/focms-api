@@ -1,6 +1,14 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.165 · /catalogs/affiliation-programs now returns school_based (new
+         boolean on affiliation_programs_catalog, 22 programs marked). Drives
+         the portal's school-provider picker: previously the picker appeared
+         only for programs whose TITLE began with "School", so Yearbook
+         Committee, Student Council, NHS, mock trial, robotics etc. got a bare
+         provider text box. Data-driven flag replaces the title convention;
+         marking a new program school-based is now a catalog UPDATE, no deploy.
+
 v0.12.159 · Two parent-portal capture bugs. (1) School address had no suite /
          building / unit line: student_school_enrollments.street_address_line_2
          has existed since the international-address work, but SchoolProfileItem
@@ -5653,7 +5661,13 @@ async def get_affiliation_programs(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT code, title, category, capstone_award FROM affiliation_programs_catalog "
+            # v0.12.165: school_based drives the portal's school-provider picker
+            # (dropdown over the family's school profiles + address prefill).
+            # Data-driven ON PURPOSE - the old test keyed on the title starting
+            # with "School", which forced awkward renames ("School Student
+            # Council"?) and silently missed everything else.
+            "SELECT code, title, category, capstone_award, school_based "
+            "FROM affiliation_programs_catalog "
             "WHERE is_active ORDER BY sort_order, title")
     return {"programs": [dict(r) for r in rows]}
 
