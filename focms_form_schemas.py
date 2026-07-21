@@ -1,6 +1,20 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.159 · Two parent-portal capture bugs. (1) School address had no suite /
+         building / unit line: student_school_enrollments.street_address_line_2
+         has existed since the international-address work, but SchoolProfileItem
+         never declared it and neither the SELECT, the UPDATE nor the INSERT
+         touched it — so a campus with a suite number had nowhere to put it and
+         anything the portal sent was dropped before SQL. Added to the model,
+         to the GET select list, and to both write paths as $36. (2) Companion
+         portal v283 fix (portal.js, no backend change): teacherSave still
+         validated the legacy single teacher_name field after teacherEdit was
+         split into First name / Last name, so EVERY teacher and counselor save
+         failed with 'Teacher name required' regardless of input. The portal now
+         validates first/last and composes teacher_name for this API, which
+         already accepts first_name/last_name on TeacherItem.
+
 v0.12.158 · Security hardening (full-stack audit 2026-07-19). (1) CheckoutBody
          inputs bounded: plan_code Field(min_length=1, max_length=64);
          resume_kind Optional[str] max_length=64 + field_validator whitelisting
@@ -6480,6 +6494,10 @@ class SchoolProfileItem(BaseModel):
     ceeb_code: Optional[str] = None
     school_type: Optional[str] = None
     street_address: Optional[str] = None
+    # v0.12.159: suite / building / unit line. The column has existed on
+    # student_school_enrollments all along; the model never accepted it, so a
+    # suite typed in the portal was dropped before it reached SQL.
+    street_address_line_2: Optional[str] = None
     city_town: Optional[str] = None
     state_province: Optional[str] = None
     zip_postal_code: Optional[str] = None
@@ -6599,7 +6617,7 @@ async def get_school_profiles(request: Request, student_id: str):
         rows = await conn.fetch(
             "SELECT id::text AS id, school_name, school_leaid, district_leaid, district_name, "
             "student_school_id, school_ceeb_code, ceeb_code, "
-            "school_type, street_address, city_town, state_province, "
+            "school_type, street_address, street_address_line_2, city_town, state_province, "
             "zip_postal_code, country, counselor_name, counselor_position, "
             "counselor_phone, counselor_email, counselor_fax, "
             "is_current_school, start_date, end_date, grade_levels_attended, "
@@ -6662,7 +6680,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                     r = await conn.execute(
                         "UPDATE student_school_enrollments SET school_name=$3, "
                         "school_ceeb_code=$4, ceeb_code=$5, school_type=$6, "
-                        "street_address=$7, city_town=$8, state_province=$9, "
+                        "street_address=$7, street_address_line_2=$36, city_town=$8, state_province=$9, "
                         "zip_postal_code=$10, country=$11, counselor_name=$12, "
                         "counselor_position=$13, counselor_phone=$14, counselor_email=$15, "
                         "counselor_fax=$16, is_current_school=$17, "
@@ -6687,7 +6705,8 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         caf, it.courses_available_notes, it.graduating_class_size,
                         it.boarding_students, it.curriculum_notes, it.notes, user_id,
                         it.school_leaid, it.district_leaid, it.district_name,
-                        it.student_school_id, it.state_student_id)
+                        it.student_school_id, it.state_student_id,
+                        it.street_address_line_2)
                     if r and r.endswith(" 1"): updated += 1
                 else:
                     if it.is_current_school:
@@ -6700,7 +6719,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "student_school_id, "
                         "state_student_id, "
                         "school_ceeb_code, ceeb_code, school_type, "
-                        "street_address, city_town, state_province, zip_postal_code, "
+                        "street_address, street_address_line_2, city_town, state_province, zip_postal_code, "
                         "country, counselor_name, counselor_position, counselor_phone, "
                         "counselor_email, counselor_fax, is_current_school, "
                         "start_date, end_date, grade_levels_attended, "
@@ -6708,7 +6727,7 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         "courses_available_flags, courses_available_notes, "
                         "graduating_class_size, boarding_students, curriculum_notes, notes, "
                         "visibility, source_system, created_by, updated_by) "
-                        "VALUES ($1::uuid,$2::uuid,$3,$31,$32,$33,$34,$35,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,"
+                        "VALUES ($1::uuid,$2::uuid,$3,$31,$32,$33,$34,$35,$4,$5,$6,$7,$36,$8,$9,$10,$11,$12,$13,$14,"
                         "$15,$16,$17,$18::date,$19::date,$20,$21,$22,$23,$24::jsonb,$25,"
                         "$26,$27,$28,$29,'private','parent_portal',$30::uuid,$30::uuid)",
                         tenant_id, student_id, name, it.school_ceeb_code, it.ceeb_code,
@@ -6720,7 +6739,8 @@ async def post_school_profiles(request: Request, student_id: str, body: SchoolPr
                         caf, it.courses_available_notes, it.graduating_class_size,
                         it.boarding_students, it.curriculum_notes, it.notes, user_id,
                         it.school_leaid, it.district_leaid, it.district_name,
-                        it.student_school_id, it.state_student_id)
+                        it.student_school_id, it.state_student_id,
+                        it.street_address_line_2)
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
 
@@ -7248,6 +7268,109 @@ async def post_teachers(request: Request, student_id: str, body: TeachersRequest
                         (_fn or None), (_ln or None))
                     saved += 1
     return {"student_id": student_id, "saved": saved, "updated": updated, "deleted": deleted}
+
+
+@router.get("/catalogs/private-school-search")
+async def private_school_search(request: Request, q: str, state: Optional[str] = None,
+                                limit: int = 15):
+    """NCES PSS private-school lookup (v0.12.160).
+
+    The CCD universe in k12_schools is PUBLIC and CHARTER schools only, so a
+    parent at an independent or parochial school had nothing to pick from and
+    fell through to free text. The Private School Universe Survey is a separate
+    NCES collection that is NOT in the Urban Institute API and not mirrored in
+    our Postgres, so this proxies the NCES search page server-side and parses
+    the result rows. No ingest to keep fresh, and no client-side CORS problem.
+
+    Returns [] rather than raising when NCES is slow or changes its markup -
+    the portal falls back to typing the name, which is what it did before.
+    """
+    _ = await _resolve_context(request)
+    q = (q or "").strip()
+    if len(q) < 3:
+        return {"schools": [], "source": "nces_pss"}
+    limit = max(1, min(int(limit or 15), 50))
+
+    import urllib.parse as _up
+    import urllib.request as _ur
+    import re as _re
+    import html as _html
+    import asyncio as _aio   # NOT imported at module scope in this file
+
+    # NCES keys states by FIPS code, not postal abbreviation.
+    _FIPS = {
+        "AL": "01", "AK": "02", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09",
+        "DE": "10", "DC": "11", "FL": "12", "GA": "13", "HI": "15", "ID": "16", "IL": "17",
+        "IN": "18", "IA": "19", "KS": "20", "KY": "21", "LA": "22", "ME": "23", "MD": "24",
+        "MA": "25", "MI": "26", "MN": "27", "MS": "28", "MO": "29", "MT": "30", "NE": "31",
+        "NV": "32", "NH": "33", "NJ": "34", "NM": "35", "NY": "36", "NC": "37", "ND": "38",
+        "OH": "39", "OK": "40", "OR": "41", "PA": "42", "RI": "44", "SC": "45", "SD": "46",
+        "TN": "47", "TX": "48", "UT": "49", "VT": "50", "VA": "51", "WA": "53", "WV": "54",
+        "WI": "55", "WY": "56",
+    }
+    st = (state or "").strip().upper()
+    fips = _FIPS.get(st, st if st.isdigit() else "")
+
+    params = {"Search": "1", "SchoolName": q}
+    if fips:
+        params["State"] = fips
+    url = ("https://nces.ed.gov/surveys/pss/privateschoolsearch/school_list.asp?"
+           + _up.urlencode(params))
+
+    def _fetch() -> str:
+        req = _ur.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; outcomestar/1.0)"})
+        with _ur.urlopen(req, timeout=12) as r:
+            return r.read().decode("utf-8", "replace")
+
+    try:
+        body = await _aio.to_thread(_fetch)
+    except Exception:
+        return {"schools": [], "source": "nces_pss", "upstream": "unavailable"}
+
+    out = []
+    # Each hit is <div class='resultRow'> idx | name anchor + <span>address</span>
+    # | phone | county | students | grades.
+    for chunk in body.split("<div class='resultRow'>")[1:]:
+        m_name = _re.search(r">([^<]+)</a>", chunk)
+        if not m_name:
+            continue
+        name = _html.unescape(m_name.group(1)).strip()
+        m_id = _re.search(r"ID=([A-Za-z0-9]+)", chunk)
+        m_addr = _re.search(r"<span>(.*?)</span>", chunk, _re.S)
+        addr_raw = _html.unescape(_re.sub(r"<[^>]+>", "", m_addr.group(1))) if m_addr else ""
+        addr_raw = addr_raw.replace("\xa0", " ")
+        addr_raw = _re.sub(r"\s+", " ", addr_raw).strip()
+        # "2400 Dallas Pkwy Ste 180, Plano, TX 75093"
+        street = city = state_ab = zipc = ""
+        parts = [p.strip() for p in addr_raw.split(",") if p.strip()]
+        if parts:
+            street = parts[0]
+        if len(parts) >= 2:
+            city = parts[1]
+        if len(parts) >= 3:
+            m_sz = _re.match(r"([A-Za-z]{2})\s*([0-9]{5}(?:-[0-9]{4})?)?", parts[2])
+            if m_sz:
+                state_ab = (m_sz.group(1) or "").upper()
+                zipc = m_sz.group(2) or ""
+        tail = _re.findall(r"<div>([^<]*)</div>", chunk)
+        phone = county = students = grades = ""
+        if len(tail) >= 5:
+            phone, county, students, grades = tail[1], tail[2], tail[3], tail[4]
+        out.append({
+            "pss_id": (m_id.group(1) if m_id else None),
+            "name": name.title() if name.islower() else name,
+            "street_address": street,
+            "city_town": city,
+            "state_province": state_ab or st,
+            "zip_postal_code": zipc,
+            "phone": _html.unescape(phone).strip(),
+            "county": _html.unescape(county).strip(),
+            "students": _html.unescape(students).strip(),
+            "grades": _html.unescape(grades).strip(),
+        })
+        if len(out) >= limit:
+            break
+    return {"schools": out, "source": "nces_pss"}
 
 
 @router.get("/catalogs/school-search")
