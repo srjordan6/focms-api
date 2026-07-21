@@ -3440,6 +3440,46 @@ def _fm_has_data(m: FamilyMember) -> bool:
     return bool((m.first_name or "").strip() or (m.last_name or "").strip())
 
 
+async def _resolve_subdivision(conn, country, value):
+    """v0.12.164: resolve a state / province / prefecture / emirate to ISO 3166-2.
+
+    The address columns for the international model already exist on
+    family_members, student_addresses, student_school_enrollments and teachers
+    (country_iso2, subdivision_iso, subdivision_name) - nothing was writing
+    them, so 'US-TX' was landing in the legacy free-text state_province column
+    while every purpose-built column stayed null, and school rows held bare
+    'TX'. Same fact, three shapes.
+
+    Accepts whatever the form sends - 'US-TX', 'TX', or 'Texas' - and resolves
+    it against country_subdivisions, which carries the ISO code, the English
+    name, the local abbreviation and the subdivision kind for every country. So
+    this works for GB-ENG, JP-13, IN-KA or AE-DU exactly as it does for US-TX.
+
+    Returns (country_iso2, subdivision_iso, subdivision_name, abbreviation).
+    An unrecognised value is preserved verbatim as the display name rather than
+    discarded - a foreign subdivision we do not yet carry must never be lost.
+    """
+    v = (value or "").strip()
+    c = (country or "").strip().upper()
+    if len(c) != 2:
+        c = ""
+    if not v:
+        return (c or None, None, None, None)
+    row = await conn.fetchrow(
+        "SELECT iso_code, country_iso2, name_en, abbreviation "
+        "  FROM country_subdivisions "
+        " WHERE is_active "
+        "   AND (upper(iso_code) = upper($1) "
+        "        OR (upper(abbreviation) = upper($1) AND ($2 = '' OR country_iso2 = $2)) "
+        "        OR (upper(name_en) = upper($1) AND ($2 = '' OR country_iso2 = $2))) "
+        " LIMIT 1",
+        v, c)
+    if not row:
+        return (c or None, None, v, v)
+    abbrev = row["abbreviation"] or (row["iso_code"] or "").split("-")[-1] or None
+    return (row["country_iso2"], row["iso_code"], row["name_en"], abbrev)
+
+
 async def _insert_family_member(conn, tenant_id, student_id, user_id, relationship, order, m: FamilyMember):
     # v0.12.89: family_members_relationship_check has no father/mother values.
     # Store relationship='parent' and keep the side in details->>'parent_role'.
@@ -3447,6 +3487,9 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
     relationship = "parent"
     public = {k: (False if k in _FAMILY_LOCKED else bool(v)) for k, v in (m.public or {}).items()}
     pub_json = json.dumps(public)
+    # v0.12.164: write the ISO address columns, not just the free-text ones.
+    iso2, sub_iso, sub_name, sub_abbrev = await _resolve_subdivision(
+        conn, m.country, m.state_province)
     await conn.execute(
         """
         INSERT INTO family_members
@@ -3459,6 +3502,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
              marital_relationship, resides_with_student, notes, details,
              street_address, street_address_line_2, city_town, state_province,
              zip_postal_code, country,
+             country_iso2, subdivision_iso, subdivision_name,
              source_system, created_by, updated_by)
         VALUES
             ($1::uuid,$2::uuid,$3,$4,$5,
@@ -3487,6 +3531,7 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
                                 'parent_role', $41::text,
                                 'phones', $42::jsonb),
              $33,$34,$35,$36,$37,$38,
+             $43,$44,$45,
              'parent_portal',$28::uuid,$28::uuid)
         """,
         tenant_id, student_id, relationship, order,
@@ -3504,9 +3549,10 @@ async def _insert_family_member(conn, tenant_id, student_id, user_id, relationsh
         (m.mailing_same_as_physical if m.mailing_same_as_physical is not None else True),
         json.dumps(m.mailing_address or {}),
         (m.street_address or None), (m.street_address_line_2 or None), (m.city_town or None),
-        (m.state_province or None), (m.zip_postal_code or None), (m.country or None),
+        (sub_abbrev or m.state_province or None), (m.zip_postal_code or None), (m.country or None),
         (m.education_level or None), (m.county or None), parent_role,
         json.dumps({"home": m.phone_home or None, "work": m.phone_work or None}),
+        iso2, sub_iso, sub_name,
     )
 
 
