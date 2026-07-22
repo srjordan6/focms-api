@@ -8493,7 +8493,7 @@ async def get_test_catalog(request: Request):
         rows = await conn.fetch(
             "SELECT test_code, display_name, sort_order, target_grade, purpose, "
             "score_fields, total_range, exam_dates, testing_windows, schedule_note, "
-            "catalog_year FROM test_catalog WHERE is_active ORDER BY sort_order")
+            "registration_info, benefits, catalog_year FROM test_catalog WHERE is_active ORDER BY sort_order")
     out = []
     for r in rows:
         d = dict(r)
