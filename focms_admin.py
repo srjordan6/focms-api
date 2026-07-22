@@ -53,6 +53,12 @@ def _verify_password(password: str, stored: str) -> bool:
         return False
 
 
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    h = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+    return f"scrypt$16384$8$1${salt.hex()}${h.hex()}"
+
+
 def _new_admin_token() -> tuple[str, str]:
     raw = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -341,3 +347,133 @@ async def admin_stats(request: Request,
                  "quota_gb": r["storage_quota_gb"]} for r in top_storage],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Password management
+# ---------------------------------------------------------------------------
+class ChangePasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    current_password: str = Field(..., min_length=1, max_length=400)
+    new_password: str = Field(..., min_length=8, max_length=400)
+
+
+@router.post("/change-password")
+async def admin_change_password(body: ChangePasswordRequest, request: Request,
+                                authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """The signed-in admin changes their OWN password. Verifies current first."""
+    ctx = await _admin_context(request, authorization)
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        cred = await conn.fetchrow(
+            "SELECT password_hash FROM user_credentials WHERE user_id=$1", ctx["user_id"])
+        if not cred or not _verify_password(body.current_password, cred["password_hash"]):
+            raise HTTPException(401, {"error": "wrong_password",
+                                      "message": "Current password is incorrect."})
+        new_hash = _hash_password(body.new_password)
+        await conn.execute(
+            "UPDATE user_credentials SET password_hash=$2, algo='scrypt', "
+            "failed_attempts=0, locked_until=NULL, updated_at=now() WHERE user_id=$1",
+            ctx["user_id"], new_hash)
+        # revoke all other admin sessions for this user (force re-login elsewhere),
+        # keep the current one alive
+        await conn.execute(
+            "UPDATE admin_sessions SET revoked_at=now() "
+            "WHERE user_id=$1 AND id<>$2 AND revoked_at IS NULL",
+            ctx["user_id"], ctx["session_id"])
+        await _audit(conn, ctx["user_id"], "admin_change_own_password", ip=_client_ip(request))
+    return {"ok": True, "message": "Password changed."}
+
+
+@router.get("/users")
+async def admin_list_users(request: Request, q: str = "",
+                           authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Search users by email or name. Returns tenant + credential status so the
+    admin can pick who to reset. Empty q returns the most recent users."""
+    ctx = await _admin_context(request, authorization)
+    pool: asyncpg.Pool = request.app.state.pool
+    q = (q or "").strip().lower()
+    async with pool.acquire() as conn:
+        if q:
+            rows = await conn.fetch("""
+                SELECT u.id, u.email, u.display_name, u.is_platform_admin, u.is_active,
+                       u.deactivated_at, u.last_login_at,
+                       (SELECT count(*) FROM user_credentials c WHERE c.user_id=u.id) AS has_cred
+                FROM users u
+                WHERE lower(u.email) LIKE '%'||$1||'%'
+                   OR lower(COALESCE(u.display_name,'')) LIKE '%'||$1||'%'
+                ORDER BY u.created_at DESC LIMIT 50
+            """, q)
+        else:
+            rows = await conn.fetch("""
+                SELECT u.id, u.email, u.display_name, u.is_platform_admin, u.is_active,
+                       u.deactivated_at, u.last_login_at,
+                       (SELECT count(*) FROM user_credentials c WHERE c.user_id=u.id) AS has_cred
+                FROM users u ORDER BY u.created_at DESC LIMIT 50
+            """)
+        out = []
+        for r in rows:
+            # resolve tenant(s) via user_tenant_roles
+            trows = await conn.fetch("""
+                SELECT t.display_name AS name FROM user_tenant_roles utr
+                JOIN tenants t ON t.id = utr.tenant_id
+                WHERE utr.user_id=$1 ORDER BY utr.granted_at LIMIT 3
+            """, r["id"])
+            out.append({
+                "user_id": str(r["id"]), "email": r["email"],
+                "display_name": r["display_name"],
+                "is_platform_admin": r["is_platform_admin"],
+                "active": (r["deactivated_at"] is None),
+                "has_password": r["has_cred"] > 0,
+                "last_login_at": r["last_login_at"].isoformat() if r["last_login_at"] else None,
+                "tenants": [tr["name"] for tr in trows],
+            })
+    return {"users": out, "count": len(out)}
+
+
+class SetUserPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    new_password: str = Field(..., min_length=8, max_length=400)
+
+
+@router.post("/users/{user_id}/set-password")
+async def admin_set_user_password(user_id: str, body: SetUserPasswordRequest,
+                                  request: Request,
+                                  authorization: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Super-admin sets ANY user's password. Audit-logged with the target."""
+    ctx = await _admin_context(request, authorization)
+    import uuid as _uuid
+    try:
+        _uuid.UUID(user_id)
+    except Exception:
+        raise HTTPException(400, {"error": "bad_id", "message": "Invalid user id."})
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        target = await conn.fetchrow(
+            "SELECT id, email FROM users WHERE id=$1", user_id)
+        if not target:
+            raise HTTPException(404, {"error": "not_found", "message": "User not found."})
+        new_hash = _hash_password(body.new_password)
+        # upsert credential
+        existing = await conn.fetchval(
+            "SELECT 1 FROM user_credentials WHERE user_id=$1", user_id)
+        if existing:
+            await conn.execute(
+                "UPDATE user_credentials SET password_hash=$2, algo='scrypt', "
+                "failed_attempts=0, locked_until=NULL, updated_at=now() WHERE user_id=$1",
+                user_id, new_hash)
+        else:
+            await conn.execute(
+                "INSERT INTO user_credentials (user_id, password_hash, algo) "
+                "VALUES ($1,$2,'scrypt')", user_id, new_hash)
+        # revoke that user's parent-portal tokens so the old password can't linger
+        try:
+            await conn.execute(
+                "UPDATE api_tokens SET revoked_at=now() "
+                "WHERE created_by=$1 AND revoked_at IS NULL", user_id)
+        except Exception:
+            pass
+        await _audit(conn, ctx["user_id"], "admin_set_user_password",
+                     target_type="user", target_id=user_id,
+                     detail={"target_email": target["email"]}, ip=_client_ip(request))
+    return {"ok": True, "message": "Password set for " + str(target["email"])}
