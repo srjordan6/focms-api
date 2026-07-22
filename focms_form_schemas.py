@@ -8481,6 +8481,33 @@ except Exception:
     _es_httpx = None
 
 
+@router.get("/catalogs/test-catalog")
+async def get_test_catalog(request: Request):
+    """Public reference catalog: standardized tests with target grade, purpose,
+    per-test score fields, official exam dates / testing windows. Drives the
+    Higher-Ed Standardized Testing form (conditional fields + reference info).
+    Data-driven from the test_catalog table - no tenant scope."""
+    import json as _json
+    pool: asyncpg.Pool = request.app.state.pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT test_code, display_name, sort_order, target_grade, purpose, "
+            "score_fields, total_range, exam_dates, testing_windows, schedule_note, "
+            "catalog_year FROM test_catalog WHERE is_active ORDER BY sort_order")
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k in ("score_fields", "exam_dates", "testing_windows"):
+            v = d.get(k)
+            if isinstance(v, str):
+                try: d[k] = _json.loads(v)
+                except Exception: d[k] = []
+            elif v is None:
+                d[k] = []
+        out.append(d)
+    return {"tests": out, "catalog_year": (out[0]["catalog_year"] if out else None)}
+
+
 @router.get("/catalogs/essay-guidance")
 async def get_essay_guidance(request: Request):
     """Public reference catalog: the 7 Common App prompts with strategy notes."""
@@ -9702,179 +9729,3 @@ async def post_billing_setup_session(request: Request, student_id: str):
         "setup_intent_data[metadata][tenant_id]": tenant_id,
     })
     return {"url": sess.get("url"), "customer": cust_id}
-
-
-# =============================================================================
-# v0.12.172 — Complete per-student record dump.
-# APPEND to focms_form_schemas.py (paste the block below the last @router route).
-#
-# GET /student/{student_id}/full-dump
-#
-# Returns EVERY row of EVERY student-owned table for one child, all columns,
-# nothing summarized. Data-driven: it enumerates student-owned tables from
-# information_schema at call time, so new record tables are automatically
-# included the moment they exist. Only an explicit denylist is ever withheld:
-# meta-skill engine internals (never shown to parents, decision of record
-# 2026-07-02), security/token tables, and system-artifact tables that are not
-# part of the child's record.
-#
-# Auth: _pp_context (parent-portal token allowed for its own students).
-# RLS:  _tenant_conn sets app.current_tenant_id; every table is tenant-isolated.
-# Serialization: dates/uuids/jsonb are made JSON-safe generically.
-# =============================================================================
-
-# Tables that are student-owned but must NOT appear in a parent record dump.
-# Everything else with a student_id column is included automatically.
-_FULLDUMP_DENYLIST = {
-    # Meta-skill engine — internal signal only, parents never see it.
-    "student_meta_skills", "meta_skill_inferences", "meta_skill_practice_log",
-    "psychological_observations",
-    # Security / tokens / consent plumbing.
-    "audit_log", "parent_access_tokens", "recommendation_request_tokens",
-    "student_access_consents", "consent_grants", "student_external_identifiers",
-    # System artifacts, not record content.
-    "resume_ai_charges", "tenant_reports", "populated_form_renderings",
-    "uca_form_instances", "address_validations", "field_artifact_attachments",
-    # Encrypted document blobs — surfaced through their own file endpoints,
-    # not as raw column dumps.
-    "student_identity_documents", "verified_documents",
-}
-
-# Human-readable pillar grouping for the ~48 record tables. Any table not
-# mapped here still appears, under "Other records", so nothing is ever dropped.
-_FULLDUMP_PILLARS = [
-    ("Personal", [
-        "student_personal_details", "student_addresses", "student_public_profile",
-        "family_members", "veteran_military_status", "assessments",
-        "student_skills", "student_instruments", "digital_presence",
-        "goals", "student_life_milestones",
-    ]),
-    ("Academics", [
-        "student_school_enrollments", "courses", "courses_taken",
-        "gpa_history", "class_rank_history", "standardized_test_scores",
-        "college_test_scores", "report_cards", "student_year_records",
-        "student_year_teachers", "teachers", "discipline_incidents",
-        "essays", "recommendations", "recommenders", "recommendation_letters",
-        "recommendation_ratings", "applications", "interview_log",
-        "early_decision_agreements", "target_universities",
-        "financial_aid_items", "scholarships", "nominations",
-    ]),
-    ("Extra-Curricular", [
-        "affiliations", "affiliations_common_app", "awards_honors",
-        "music_repertoire", "personal_records", "events",
-        "portfolio_artifacts", "media_files", "site_assets",
-    ]),
-    ("Career", [
-        "career_profile", "career_references", "job_experiences",
-        "work_experiences",
-    ]),
-    ("Website & Presence", [
-        "website_configs", "public_showcases", "student_public_profile",
-    ]),
-]
-
-
-def _fulldump_jsonable(v):
-    """Make a single asyncpg value JSON-serializable, recursively."""
-    if v is None or isinstance(v, (str, int, float, bool)):
-        return v
-    if hasattr(v, "isoformat"):          # date / datetime / time
-        return v.isoformat()
-    if isinstance(v, _uuid.UUID):
-        return str(v)
-    if isinstance(v, (list, tuple)):
-        return [_fulldump_jsonable(x) for x in v]
-    if isinstance(v, dict):
-        return {k: _fulldump_jsonable(x) for k, x in v.items()}
-    # asyncpg returns jsonb already parsed; Decimal / bytes / other -> str
-    try:
-        import decimal
-        if isinstance(v, decimal.Decimal):
-            return float(v)
-    except Exception:
-        pass
-    if isinstance(v, (bytes, bytearray)):
-        return "[binary %d bytes]" % len(v)
-    return str(v)
-
-
-@router.get("/student/{student_id}/full-dump")
-async def get_student_full_dump(request: Request, student_id: str):
-    """Complete record dump: every non-meta student-owned table, all rows,
-    all columns, grouped by pillar. Empty tables are reported as empty rather
-    than omitted, so the report proves completeness."""
-    tenant_id, _uid = await _pp_context(request, student_id)
-    _uuid.UUID(student_id)  # validate before any interpolation
-    pool: asyncpg.Pool = request.app.state.pool
-
-    async with _tenant_conn(pool, tenant_id) as conn:
-        # 1. Enumerate every base table that has a student_id column.
-        tbl_rows = await conn.fetch(
-            "SELECT c.table_name "
-            "FROM information_schema.columns c "
-            "JOIN information_schema.tables t "
-            "  ON t.table_name = c.table_name "
-            " AND t.table_schema = 'public' "
-            " AND t.table_type = 'BASE TABLE' "
-            "WHERE c.table_schema = 'public' AND c.column_name = 'student_id' "
-            "GROUP BY c.table_name ORDER BY c.table_name")
-        all_tables = [r["table_name"] for r in tbl_rows]
-        included = [t for t in all_tables if t not in _FULLDUMP_DENYLIST]
-
-        # 2. Detect which included tables have a soft-delete column.
-        soft_rows = await conn.fetch(
-            "SELECT table_name FROM information_schema.columns "
-            "WHERE table_schema='public' AND column_name='deleted_at' "
-            "  AND table_name = ANY($1::text[])", included)
-        has_soft = {r["table_name"] for r in soft_rows}
-
-        # 3. Pull every row of every included table.
-        dumped = {}          # table_name -> {columns: [...], rows: [[...]]}
-        for tbl in included:
-            where = "WHERE student_id = $1::uuid"
-            if tbl in has_soft:
-                where += " AND deleted_at IS NULL"
-            # ident is safe: tbl comes from information_schema, not user input.
-            q = f'SELECT * FROM "{tbl}" {where}'
-            try:
-                recs = await conn.fetch(q, student_id)
-            except Exception as e:            # never let one table break the dump
-                dumped[tbl] = {"columns": ["error"], "rows": [[str(e)]]}
-                continue
-            if recs:
-                cols = list(recs[0].keys())
-            else:
-                # still emit the column list for an empty table
-                col_rows = await conn.fetch(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema='public' AND table_name=$1 "
-                    "ORDER BY ordinal_position", tbl)
-                cols = [c["column_name"] for c in col_rows]
-            rows = [[_fulldump_jsonable(rec[c]) for c in cols] for rec in recs]
-            dumped[tbl] = {"columns": cols, "rows": rows}
-
-    # 4. Group into pillars for presentation. Any included table not named in
-    #    _FULLDUMP_PILLARS still surfaces under "Other records".
-    grouped, seen = [], set()
-    for pillar_name, tbls in _FULLDUMP_PILLARS:
-        block = []
-        for tbl in tbls:
-            if tbl in dumped and tbl not in seen:
-                block.append({"table": tbl, **dumped[tbl]})
-                seen.add(tbl)
-        if block:
-            grouped.append({"pillar": pillar_name, "tables": block})
-    leftover = [{"table": t, **dumped[t]} for t in dumped if t not in seen]
-    if leftover:
-        grouped.append({"pillar": "Other records", "tables": leftover})
-
-    total_rows = sum(len(t["rows"]) for g in grouped for t in g["tables"])
-    return {
-        "student_id": student_id,
-        "generated_at": datetime.utcnow().isoformat() + "Z",
-        "table_count": len(included),
-        "total_rows": total_rows,
-        "excluded_tables": sorted(_FULLDUMP_DENYLIST & set(all_tables)),
-        "pillars": grouped,
-    }
-
