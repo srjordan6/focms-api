@@ -1,6 +1,15 @@
 """
 focms_form_schemas.py — Schema-driven form definitions + entry writer.
 
+v0.12.177 · Target Schools: /catalogs/universities and target-schools GET now
+         return us_news_list + us_news_rank_national + us_news_rank_liberal_arts
+         and the Scorecard admissions contact fields (address/email/phone/url).
+         Ordering uses COALESCE(national, liberal_arts, legacy) so both ranked
+         lists sort #1-ascending. Enables the ranked+searchable college picker
+         and the admissions-office panel. Data seeded 2026-07-22 (104 schools:
+         50 National Universities + 54 Liberal Arts); admissions_* filled by the
+         nces_scorecard_worker v0.3 refresh-ranked nightly job.
+
 v0.12.171 · type=card was hiding a real payment method. Both the preflight and
          the resume charge listed payment_methods with type=card; a card saved
          through Stripe Link is stored as type "link", so a customer with a
@@ -6076,24 +6085,41 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
 async def get_universities_catalog(request: Request, q: Optional[str] = None, limit: int = 50):
     _ = await _resolve_context(request)
     pool: asyncpg.Pool = request.app.state.pool
+    # v0.12.177: ranked-list fields (us_news_list, national + liberal-arts ranks)
+    # and Scorecard admissions contact fields join the response so the Target
+    # Schools picker can rank #1-ascending, filter by list, and show the
+    # admissions office on selection. COALESCE(national, liberal_arts, legacy)
+    # gives a single sort key so both lists order #1 first.
+    _UNI_COLS = (
+        "leaid, name, common_name, city, state, us_news_rank, "
+        "us_news_list, us_news_rank_national, us_news_rank_liberal_arts, "
+        "admit_rate, has_rotc, has_d1_swim, is_service_academy, common_app_member, "
+        "admissions_address, admissions_email, admissions_phone, admissions_url"
+    )
+    _UNI_ORDER = (
+        "ORDER BY COALESCE(us_news_rank_national, us_news_rank_liberal_arts, "
+        "us_news_rank) NULLS LAST, name"
+    )
     async with pool.acquire() as conn:
         if q:
             rows = await conn.fetch(
-                "SELECT leaid, name, common_name, city, state, us_news_rank, "
-                "admit_rate, has_rotc, has_d1_swim, is_service_academy, common_app_member "
-                "FROM universities WHERE name ILIKE $1 OR common_name ILIKE $1 "
-                "ORDER BY us_news_rank NULLS LAST, name LIMIT $2",
+                f"SELECT {_UNI_COLS} FROM universities "
+                "WHERE name ILIKE $1 OR common_name ILIKE $1 "
+                f"{_UNI_ORDER} LIMIT $2",
                 f"%{q}%", limit)
         else:
             rows = await conn.fetch(
-                "SELECT leaid, name, common_name, city, state, us_news_rank, "
-                "admit_rate, has_rotc, has_d1_swim, is_service_academy, common_app_member "
-                "FROM universities "
-                "ORDER BY us_news_rank NULLS LAST, name LIMIT $1", limit)
+                f"SELECT {_UNI_COLS} FROM universities {_UNI_ORDER} LIMIT $1", limit)
     out = []
     for r in rows:
         d = dict(r)
         d["admit_rate"] = float(d["admit_rate"]) if d["admit_rate"] is not None else None
+        # Prefer the list-specific rank for display; fall back to legacy.
+        d["us_news_rank"] = (
+            d.get("us_news_rank_national")
+            or d.get("us_news_rank_liberal_arts")
+            or d.get("us_news_rank")
+        )
         out.append(d)
     return {"universities": out}
 
@@ -6141,12 +6167,18 @@ async def get_target_schools(request: Request, student_id: str):
             "t.advantages, t.blockers, t.notes, t.public_description, "
             "(t.visibility='public') AS show_on_showcase, "
             "u.name AS university_name, u.common_name, u.city AS university_city, "
-            "u.state AS university_state, u.us_news_rank, u.admit_rate, "
-            "u.has_rotc, u.has_d1_swim, u.is_service_academy, u.common_app_member "
+            "u.state AS university_state, "
+            # v0.12.177: expose the combined rank + list + admissions contact so a
+            # saved target row can render its admissions-office panel and rank.
+            "COALESCE(u.us_news_rank_national, u.us_news_rank_liberal_arts, u.us_news_rank) AS us_news_rank, "
+            "u.us_news_list, u.us_news_rank_national, u.us_news_rank_liberal_arts, "
+            "u.admit_rate, u.has_rotc, u.has_d1_swim, u.is_service_academy, u.common_app_member, "
+            "u.admissions_address, u.admissions_email, u.admissions_phone, u.admissions_url "
             "FROM target_universities t "
             "LEFT JOIN universities u ON u.leaid = t.university_leaid "
             "WHERE t.student_id=$1::uuid AND t.deleted_at IS NULL AND t.is_active "
-            "ORDER BY t.priority NULLS LAST, u.us_news_rank NULLS LAST",
+            "ORDER BY t.priority NULLS LAST, "
+            "COALESCE(u.us_news_rank_national, u.us_news_rank_liberal_arts, u.us_news_rank) NULLS LAST",
             student_id)
     out = []
     for r in rows:
