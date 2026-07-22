@@ -1,4 +1,4 @@
-﻿from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 """focms_api.py - FOCMS Data Provider REST API v0.12.134
 
 v0.12.134 (2026-07-15):
