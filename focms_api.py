@@ -1,4 +1,4 @@
-from fastapi.middleware.cors import CORSMiddleware
+﻿from fastapi.middleware.cors import CORSMiddleware
 """focms_api.py - FOCMS Data Provider REST API v0.12.134
 
 v0.12.134 (2026-07-15):
@@ -820,6 +820,8 @@ app.include_router(parent_portal_router)
 app.include_router(form_schemas_router)
 from focms_cohort_signup import router as cohort_signup_router
 app.include_router(cohort_signup_router)
+from focms_admin import router as admin_router
+app.include_router(admin_router)
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -3825,3 +3827,4 @@ async def pg_error_handler(request: Request, exc: asyncpg.PostgresError) -> JSON
         status_code=500,
         content={"error": "database_error", "detail": str(exc)},
     )
+
