@@ -1,5 +1,5 @@
 from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.134
+"""focms_api.py - FOCMS Data Provider REST API v0.12.178
 
 v0.12.134 (2026-07-15):
 - New GET /focms/v1/student/{id}/computed/imx-imr: USA Swimming IMX (IM
@@ -1125,7 +1125,7 @@ async def get_tenant_storage(
 # tenants created before tenant_settings got a row.
 # ---------------------------------------------------------------------------
 
-WIZARD_STEPS = {"personal", "academics", "schools", "personnel", "extracurricular"}
+WIZARD_STEPS = {"personal", "academics", "schools", "personnel", "extracurricular", "courses"}
 
 
 @app.get("/focms/v1/tenant/wizard-state")
