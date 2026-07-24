@@ -1,5 +1,5 @@
 from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.178
+"""focms_api.py - FOCMS Data Provider REST API v0.12.179
 
 v0.12.134 (2026-07-15):
 - New GET /focms/v1/student/{id}/computed/imx-imr: USA Swimming IMX (IM
@@ -1126,6 +1126,9 @@ async def get_tenant_storage(
 # ---------------------------------------------------------------------------
 
 WIZARD_STEPS = {"personal", "academics", "schools", "personnel", "extracurricular", "courses"}
+# v0.12.179: 'tour' is a durable server-side latch for the old v140 tour modal
+# (portal v357). Stored alongside the steps but excluded from done_at.
+WIZARD_EXTRA = WIZARD_STEPS | {"tour"}
 
 
 @app.get("/focms/v1/tenant/wizard-state")
@@ -1143,7 +1146,7 @@ async def get_wizard_state(
     state = json.loads(val) if isinstance(val, str) else (val or {})
     visited = state.get("visited") or {}
     return {
-        "visited": {k: bool(visited.get(k)) for k in sorted(WIZARD_STEPS)},
+        "visited": {k: bool(visited.get(k)) for k in sorted(WIZARD_EXTRA)},
         "done_at": state.get("done_at"),
         "done": bool(state.get("done_at")),
     }
@@ -1164,7 +1167,7 @@ async def post_wizard_state(
     steps = body.get("visited") or []
     if not isinstance(steps, list):
         raise HTTPException(422, "visited must be a list of step names")
-    steps = [s for s in steps if s in WIZARD_STEPS]
+    steps = [s for s in steps if s in WIZARD_EXTRA]
     async with tx(request, tenant_id) as conn:
         val = await conn.fetchval(
             "SELECT feature_flags->'wizard_welcome' FROM tenant_settings WHERE tenant_id = $1",
@@ -1189,7 +1192,7 @@ async def post_wizard_state(
             UUID(tenant_id), json.dumps(state),
         )
     return {
-        "visited": {k: bool(visited.get(k)) for k in sorted(WIZARD_STEPS)},
+        "visited": {k: bool(visited.get(k)) for k in sorted(WIZARD_EXTRA)},
         "done_at": state.get("done_at"),
         "done": bool(state.get("done_at")),
     }
