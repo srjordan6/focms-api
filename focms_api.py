@@ -237,7 +237,7 @@ from uuid import UUID
 import asyncpg
 import hashlib as _hashlib
 import time as _time
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, ConfigDict, Field
 from focms_addresses import router as addresses_router
@@ -783,7 +783,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         log.info("DB pool closed")
 
 
-app = FastAPI(title="FOCMS Data Provider API", version="0.12.134", lifespan=lifespan)
+app = FastAPI(title="FOCMS Data Provider API", version="0.12.135", lifespan=lifespan)
 
 
 @app.get("/focms/v1/livez")
@@ -1109,6 +1109,89 @@ async def get_tenant_storage(
         "unlimited":   quota is None,
         "used_human":  _human_bytes(used),
         "quota_human": _human_bytes(quota) if quota is not None else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Onboarding wizard state (v0.12.135)
+#
+# The welcome wizard shows on every portal open until the parent has visited
+# all five starter destinations (personal, academics, schools, personnel,
+# extracurricular) - then never again. Progress must survive devices and
+# browsers, so it lives server-side in tenant_settings.feature_flags under the
+# 'wizard_welcome' key rather than in localStorage. Shape:
+#   {"visited": {"personal": true, ...}, "done_at": "2026-07-23T04:00:00Z"}
+# RLS scopes everything to the calling tenant via tx(); the upsert covers
+# tenants created before tenant_settings got a row.
+# ---------------------------------------------------------------------------
+
+WIZARD_STEPS = {"personal", "academics", "schools", "personnel", "extracurricular"}
+
+
+@app.get("/focms/v1/tenant/wizard-state")
+async def get_wizard_state(
+    request: Request,
+    principal: dict = Depends(authenticate_any),
+) -> dict[str, Any]:
+    """Return the welcome-wizard progress for the calling tenant."""
+    tenant_id = principal["tenant_id"]
+    async with tx(request, tenant_id) as conn:
+        val = await conn.fetchval(
+            "SELECT feature_flags->'wizard_welcome' FROM tenant_settings WHERE tenant_id = $1",
+            UUID(tenant_id),
+        )
+    state = json.loads(val) if isinstance(val, str) else (val or {})
+    visited = state.get("visited") or {}
+    return {
+        "visited": {k: bool(visited.get(k)) for k in sorted(WIZARD_STEPS)},
+        "done_at": state.get("done_at"),
+        "done": bool(state.get("done_at")),
+    }
+
+
+@app.post("/focms/v1/tenant/wizard-state")
+async def post_wizard_state(
+    request: Request,
+    body: dict = Body(...),
+    principal: dict = Depends(authenticate_any),
+) -> dict[str, Any]:
+    """Mark wizard steps visited. Body: {"visited": ["personal", ...]}.
+
+    Merges (never unsets) so two devices cannot regress each other. Stamps
+    done_at exactly once, when the merged set first covers every step.
+    """
+    tenant_id = principal["tenant_id"]
+    steps = body.get("visited") or []
+    if not isinstance(steps, list):
+        raise HTTPException(422, "visited must be a list of step names")
+    steps = [s for s in steps if s in WIZARD_STEPS]
+    async with tx(request, tenant_id) as conn:
+        val = await conn.fetchval(
+            "SELECT feature_flags->'wizard_welcome' FROM tenant_settings WHERE tenant_id = $1",
+            UUID(tenant_id),
+        )
+        state = json.loads(val) if isinstance(val, str) else (val or {})
+        visited = dict(state.get("visited") or {})
+        for st in steps:
+            visited[st] = True
+        state["visited"] = visited
+        if not state.get("done_at") and WIZARD_STEPS.issubset({k for k, v in visited.items() if v}):
+            state["done_at"] = datetime.now(timezone.utc).isoformat()
+        await conn.execute(
+            """
+            INSERT INTO tenant_settings (tenant_id, feature_flags)
+            VALUES ($1, jsonb_build_object('wizard_welcome', $2::jsonb))
+            ON CONFLICT (tenant_id) DO UPDATE
+               SET feature_flags = tenant_settings.feature_flags
+                                   || jsonb_build_object('wizard_welcome', $2::jsonb),
+                   updated_at = now()
+            """,
+            UUID(tenant_id), json.dumps(state),
+        )
+    return {
+        "visited": {k: bool(visited.get(k)) for k in sorted(WIZARD_STEPS)},
+        "done_at": state.get("done_at"),
+        "done": bool(state.get("done_at")),
     }
 
 
