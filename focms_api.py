@@ -1,5 +1,5 @@
 from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.179
+"""focms_api.py - FOCMS Data Provider REST API v0.12.180
 
 v0.12.134 (2026-07-15):
 - New GET /focms/v1/student/{id}/computed/imx-imr: USA Swimming IMX (IM
@@ -1125,7 +1125,10 @@ async def get_tenant_storage(
 # tenants created before tenant_settings got a row.
 # ---------------------------------------------------------------------------
 
-WIZARD_STEPS = {"personal", "academics", "schools", "personnel", "extracurricular", "courses"}
+# v0.12.180: 'website' - the wizard finale for every tenant regardless of the
+# child's age (portal v358). Pre-K..5 and not-in-school tenants have their
+# non-applicable steps auto-marked client-side, so done_at still works.
+WIZARD_STEPS = {"personal", "academics", "schools", "personnel", "extracurricular", "courses", "website"}
 # v0.12.179: 'tour' is a durable server-side latch for the old v140 tour modal
 # (portal v357). Stored alongside the steps but excluded from done_at.
 WIZARD_EXTRA = WIZARD_STEPS | {"tour"}
