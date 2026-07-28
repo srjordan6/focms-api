@@ -5,6 +5,20 @@ record, tenant_owner role, and API token in one atomic transaction.
 
 Architecture: archive_entries source_id='cohort_signup_backend_design_v0_1'
 
+v0.11.21 (2026-07-24) - PORTAL LOGIN TRAFFIC (server-side, no third party):
+- Successful /auth/login now writes audit_log(action='login') and stamps
+  users.last_login_at. This is the ONLY portal traffic measurement: the
+  parent portal carries no GA4, Clarity or StatCounter, and never will -
+  the portal URL fragment contains the live API token and the DOM contains
+  a minor's name, birth date, address and school. Any client-side analytics
+  script would capture both.
+- Recorded: actor_user_id, tenant_id, occurred_at, coarse user-agent class
+  (desktop/mobile/tablet/bot). NOT recorded: IP address, full user-agent
+  string, page, or any child field. Counting logins does not require
+  identifying anyone.
+- Logging never blocks a login: the write is wrapped and failures are logged
+  and swallowed.
+
 v0.11.20 (2026-07-19) - HARD VERIFICATION GATE (operator decision):
 - The birth certificate must PASS automated verification (is a certificate,
   name matches, birth date matches, registrar seal, no tamper signs, high
@@ -1637,6 +1651,39 @@ class LoginRequest(BaseModel):
     turnstile_token: Optional[str] = None
 
 
+def _ua_class(ua: str | None) -> str:
+    """v0.11.21: coarse device class only. The full user-agent string is a
+    fingerprinting vector; 'mobile' is not."""
+    s = (ua or "").lower()
+    if not s:
+        return "unknown"
+    if any(b in s for b in ("bot", "crawl", "spider", "curl", "wget", "python-requests")):
+        return "bot"
+    if "ipad" in s or ("tablet" in s and "mobile" not in s):
+        return "tablet"
+    if any(m in s for m in ("mobile", "iphone", "android", "ipod")):
+        return "mobile"
+    return "desktop"
+
+
+async def _record_login(conn, user_id, tenant_id, request: Request) -> None:
+    """v0.11.21: portal traffic counter. Deliberately stores no IP, no full
+    user-agent, and nothing about the child. Must never break a login."""
+    try:
+        ua = _ua_class(request.headers.get("user-agent"))
+        await conn.execute(
+            """INSERT INTO audit_log
+                 (actor_user_id, actor_role, tenant_id, action,
+                  target_table, target_label, new_value)
+               VALUES ($1,'tenant_owner',$2,'login','users','portal_login',
+                       jsonb_build_object('device', $3::text))""",
+            user_id, tenant_id, ua)
+        await conn.execute(
+            "UPDATE users SET last_login_at = now() WHERE id = $1", user_id)
+    except Exception as exc:
+        log.warning("login audit write failed (login still succeeded): %s", exc)
+
+
 @router.post("/login")
 async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
     """v0.11.13: email + password -> parent-portal api token.
@@ -1689,6 +1736,7 @@ async def login(body: LoginRequest, request: Request) -> dict[str, Any]:
             """INSERT INTO api_tokens (tenant_id, token_hash, student_ids, name, scope, created_by)
                VALUES ($1,$2,$3::uuid[],'login','parent_portal',$4)""",
             tenant_id, token_hash, [r["id"] for r in students], user["id"])
+        await _record_login(conn, user["id"], tenant_id, request)   # v0.11.21
     return {"api_token": raw_token, "tenant_id": str(tenant_id),
             "display_name": user["display_name"],
             "portal_url": f"https://outcomestar.app/portal#t={raw_token}"}
