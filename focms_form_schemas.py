@@ -1726,6 +1726,41 @@ async def get_verified_docs(request: Request, student_id: str):
 @router.post("/student/{student_id}/verified-documents")
 async def post_verified_docs(request: Request, student_id: str, body: VerifiedDocsRequest):
     import base64 as _b64, hashlib as _hash, urllib.request as _url
+    import socket as _sock, ipaddress as _ipaddr
+
+    def _host_is_public(u: str) -> bool:
+        # v0.12.181 SSRF guard: the Parchment-link fetch takes a user-supplied
+        # URL. Resolve every A/AAAA record and refuse anything that lands on a
+        # private, loopback, link-local, or otherwise non-global address so the
+        # API cannot be steered at Render-internal services or cloud metadata.
+        try:
+            host = _url.urlparse(u).hostname if hasattr(_url, "urlparse") else None
+        except Exception:
+            host = None
+        if host is None:
+            from urllib.parse import urlparse as _up
+            try: host = _up(u).hostname
+            except Exception: return False
+        if not host: return False
+        try:
+            infos = _sock.getaddrinfo(host, 443, proto=_sock.IPPROTO_TCP)
+        except Exception:
+            return False
+        for info in infos:
+            try: ip = _ipaddr.ip_address(info[4][0])
+            except Exception: return False
+            if not ip.is_global or ip.is_multicast:
+                return False
+        return True
+
+    class _NoRedirect(_url.HTTPRedirectHandler):
+        # A public URL redirecting to an internal address would bypass the
+        # resolve-time check; refuse redirects outright.
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise _url.HTTPError(req.full_url, code,
+                "redirects not allowed; paste the final PDF link", headers, fp)
+
+    _opener = _url.build_opener(_NoRedirect)
     tenant_id, user_id = await _pp_context(request, student_id)
     saved = deleted = 0
     _DT = {"transcript","diploma","certificate","badge","other"}
@@ -1749,9 +1784,12 @@ async def post_verified_docs(request: Request, student_id: str, body: VerifiedDo
                     except Exception: raise HTTPException(status_code=400, detail="bad base64")
                 elif it.source_url and it.source_url.lower().startswith("https://"):
                     src = "parchment_link"
+                    if not _host_is_public(it.source_url):
+                        raise HTTPException(status_code=400,
+                            detail="link host not allowed; download the PDF from Parchment and upload it instead")
                     try:
                         req = _url.Request(it.source_url, headers={"User-Agent": "FOCMS/1.0"})
-                        with _url.urlopen(req, timeout=30) as resp:
+                        with _opener.open(req, timeout=30) as resp:
                             ct = resp.headers.get("Content-Type","")
                             raw = resp.read(6*1024*1024)
                         if "pdf" not in ct.lower() and not raw.startswith(b"%PDF"):
