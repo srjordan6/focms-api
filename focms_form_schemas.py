@@ -364,6 +364,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re as _re
 from datetime import datetime
 from typing import Any, List, Optional
 from uuid import UUID
@@ -2245,6 +2246,118 @@ async def _swim_metrics_item(tconn, student_id: str) -> Optional[dict]:
         return None
 
 
+# ---------------- Performing-arts adjudication (v0.12.182) ----------------
+# A musician's record IS measured - it is just not measured in the units sport
+# uses. A rating, a chair, a graded level, a mark. Every one of those scales
+# has a direction, and on half of them the BEST result is the SMALLEST number:
+# a Division I rating and a 1st chair are wins. Reading them as "bigger is
+# better" would show an improving player as declining, which is why this is a
+# declared table rather than a guess.
+#
+# Mirrors lib/artsScales.ts in the showcase renderer - keep the two in step.
+# Adding a country's grading system (RCM, ABRSM, AMEB, NYSSMA) is a row here,
+# never a branch in a builder.
+_ARTS_SCALES = {
+    "division":     {"dir": "lower",  "first": "first_rating",  "best": "best_rating"},
+    "rating_named": {"dir": "lower",  "first": "first_rating",  "best": "best_rating"},
+    "chair":        {"dir": "lower",  "first": "first_chair",   "best": "best_chair"},
+    "placing":      {"dir": "lower",  "first": "first_placing", "best": "best_placing"},
+    "grade_level":  {"dir": "higher", "first": "first_grade",   "best": "best_grade"},
+    "mark":         {"dir": "higher", "first": "first_mark",    "best": "best_mark"},
+    "score":        {"dir": "higher", "first": "first_score",   "best": "best_score"},
+}
+_ARTS_ROMAN = {"I": 1, "II": 2, "III": 3, "IV": 4, "V": 5, "VI": 6, "VII": 7, "VIII": 8}
+_ARTS_NAMED = {"superior": 1, "excellent": 2, "good": 3, "fair": 4, "poor": 5}
+
+
+def _arts_parse(raw):
+    """3, "3", "III", "Division III", "Superior", "1st chair" -> a number.
+    Directors write these by hand and no two write them the same way."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    s = str(raw).strip()
+    if s.lower() in _ARTS_NAMED:
+        return float(_ARTS_NAMED[s.lower()])
+    c = _re.sub(r"^(division|div\.?|rating|chair|place|placing|grade|level)\s*", "", s, flags=_re.I).strip()
+    roman = _re.sub(r"[^IVXivx]", "", c).upper()
+    if roman and roman in _ARTS_ROMAN and len(c) <= 4:
+        return float(_ARTS_ROMAN[roman])
+    m = _re.search(r"-?\d+(\.\d+)?", c)
+    return float(m.group(0)) if m else None
+
+
+def _arts_progression_items(rows) -> list[dict]:
+    """Collapse adjudicated performances into one first/best pair per thing
+    judged - a solo, an ensemble seat, an exam subject - so the showcase can
+    render the climb rather than a list of dates.
+
+    Two ways a pair can exist:
+      * two or more results for the same thing (annual chair audition, the
+        same solo taken back to festival) - earliest vs best
+      * a single row that carries its own starting point in
+        adjudication.first_result, the way swim carries details.first_time
+
+    Rows judged on different scales stay separate; the renderer picks one
+    scale per section, so mixing chairs and marks would be meaningless.
+    """
+    groups: dict = {}
+    for r in rows:
+        raw = r["details"]
+        d = raw if isinstance(raw, dict) else (json.loads(raw) if raw else {})
+        adj = d.get("adjudication") or {}
+        if not isinstance(adj, dict):
+            continue
+        scale = adj.get("scale")
+        val = _arts_parse(adj.get("result"))
+        if scale not in _ARTS_SCALES or val is None:
+            continue
+        label = (adj.get("ensemble") or d.get("music_played")
+                 or d.get("instrument") or r["title"] or "Performance")
+        label = str(label).strip()
+        g = groups.setdefault((scale, label), {
+            "instrument": d.get("instrument"), "vals": [], "seed": None})
+        g["vals"].append((r["event_date"], val, adj.get("result")))
+        seed = _arts_parse(adj.get("first_result"))
+        if seed is not None and g["seed"] is None:
+            g["seed"] = (seed, adj.get("first_result"))
+
+    out: list[dict] = []
+    for (scale, label), g in groups.items():
+        spec = _ARTS_SCALES[scale]
+        lower = spec["dir"] == "lower"
+        dated = sorted([v for v in g["vals"] if v[0]], key=lambda x: x[0])
+        ordered = dated or g["vals"]
+        if not ordered:
+            continue
+        best = (min if lower else max)(ordered, key=lambda x: x[1])
+        if g["seed"] is not None:
+            first_val, first_txt = g["seed"]
+        elif len(ordered) >= 2:
+            first_val, first_txt = ordered[0][1], ordered[0][2]
+        else:
+            continue  # one result and no starting point is a fact, not a climb
+        meta = {
+            "scale": scale,
+            spec["first"]: first_txt if first_txt is not None else first_val,
+            spec["best"]: best[2] if best[2] is not None else best[1],
+            "event": label,
+        }
+        inst = g["instrument"]
+        if inst and str(inst).strip().lower() != label.lower():
+            meta["instrument"] = inst
+        out.append({
+            "title": label,
+            "date": best[0].isoformat() if best[0] else None,
+            "body": None,
+            "meta": meta,
+        })
+    return out
+
+
 async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
     """v0.12.95: return public rows for a section code across relevant tables."""
     items: list[dict] = []
@@ -2307,12 +2420,20 @@ async def _section_items(tconn, student_id: str, code: str) -> list[dict]:
                           "body": r["public_description"]})
     elif code in ("fine_arts", "highlight_reel"):
         # Music-performance events + portfolio artifacts (v0.12.115 real-source fix).
+        # v0.12.182: adjudicated results are collapsed into first/best pairs
+        # FIRST, so a musician's section leads with the climb - the same
+        # treatment a swimmer's times get - and the individual performances
+        # follow as the log.
         ev = await tconn.fetch(
-            "SELECT title, event_date, public_description FROM events "
+            "SELECT title, event_date, public_description, details FROM events "
             "WHERE student_id=$1::uuid AND visibility='public' AND deleted_at IS NULL "
             "AND event_type = 'music_performance' "
-            "ORDER BY event_date DESC NULLS LAST LIMIT 50", student_id)
-        for r in ev:
+            "ORDER BY event_date DESC NULLS LAST LIMIT 200", student_id)
+        try:
+            items.extend(_arts_progression_items(ev))
+        except Exception:
+            logging.exception("arts progression failed for student %s", student_id)
+        for r in ev[:50]:
             items.append({"title": r["title"] or "Performance",
                           "date": r["event_date"].isoformat() if r["event_date"] else None,
                           "body": r["public_description"]})
@@ -5987,6 +6108,7 @@ class EcSessionItem(BaseModel):
     event_end_date: Optional[str] = None  # v0.12.144: training end date (events.event_end_date)
     media_ids: Optional[List[str]] = None  # v0.12.145: universal media widget
     location_parts: Optional[dict] = None  # v0.12.146: address-block components for prefill
+    adjudication: Optional[dict] = None   # v0.12.182: performing-arts result, see _ARTS_SCALES
 
 
 class EcSessionsRequest(BaseModel):
@@ -6008,6 +6130,7 @@ async def get_ec_sessions(request: Request, student_id: str):
             "e.details->>'composer' AS composer, e.details->>'milestone_kind' AS milestone_kind, "
             "e.details->'media_ids' AS media_ids, "
             "e.details->'location_parts' AS location_parts, "
+            "e.details->'adjudication' AS adjudication, "
             "e.notes, e.source_system, (e.visibility='public') AS show_on_showcase, "
             "COALESCE((SELECT array_agg(coalesce(ss.skill_code, ss.custom_title)) "
             " FROM student_skills ss WHERE ss.source_activity = 'events:'||e.id::text "
@@ -6029,6 +6152,10 @@ async def get_ec_sessions(request: Request, student_id: str):
             d["location_parts"] = json.loads(d["location_parts"]) if d.get("location_parts") else None
         except Exception:
             d["location_parts"] = None
+        try:
+            d["adjudication"] = json.loads(d["adjudication"]) if d.get("adjudication") else None
+        except Exception:
+            d["adjudication"] = None
         d["duration_hours"] = round(d["duration_minutes"]/60.0, 2) if d["duration_minutes"] is not None else None
         d.pop("duration_minutes", None)
         out.append(d)
@@ -6083,6 +6210,7 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.event_end_date or '',
                         json.dumps({k: v for k, v in (
                             ("media_ids", it.media_ids),
+                            ("adjudication", it.adjudication),
                             ("location_parts", it.location_parts)) if v is not None}))
                     if r and r.endswith(" 1"):
                         await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
@@ -6107,6 +6235,7 @@ async def post_ec_sessions(request: Request, student_id: str, body: EcSessionsRe
                         it.event_end_date or '',
                         json.dumps({k: v for k, v in (
                             ("media_ids", it.media_ids),
+                            ("adjudication", it.adjudication),
                             ("location_parts", it.location_parts)) if v is not None}))
                     await _apply_skills_and_showcase(conn, tenant_id, student_id, user_id,
                         "events", rid, it.skills_gained, it.show_on_showcase)
