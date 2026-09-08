@@ -6,6 +6,15 @@ Drops in alongside focms_api.py. Wired up by adding 3 lines to focms_api.py:
     # ...inside app creation:
     app.include_router(addresses_router)
 
+v0.5.2 (2026-09-07):
+- SECURITY: place_id was interpolated into the Google Places request URL
+  unvalidated (SSRF/URL-injection class: a crafted place_id like
+  "x/../../otherEndpoint?x=" could redirect the request path and ride the
+  privileged API key). Now: pydantic pattern ^[A-Za-z0-9_-]+$ on the request
+  model, a hard re-check in _gplaces_details (400 on mismatch), and
+  percent-encoding at URL build. Place IDs are base64url-alphabet only, so
+  no legitimate ID is rejected.
+
 v0.5.1 (2026-07-05):
 - _require_auth falls back to focms_api.db_token_principal - signup-minted
   parent-portal tokens (api_tokens table) now work on autocomplete/validate.
@@ -58,8 +67,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
+from urllib.parse import quote
 from uuid import UUID
 
 import asyncpg
@@ -72,6 +83,10 @@ logger = logging.getLogger("focms.addresses")
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY")
 GOOGLE_PLACES_BASE = "https://places.googleapis.com/v1"
 GOOGLE_PLACES_TIMEOUT = float(os.environ.get("GOOGLE_PLACES_TIMEOUT_SEC", "10"))
+
+# Google place IDs use the base64url alphabet (e.g. "ChIJN1t_tDeuEmsRUsoyG83frY4").
+# Anything outside it in a URL path position is an injection attempt, not an ID.
+_PLACE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,512}$")
 
 # Default to Google Places everywhere; SmartyStreets US can be wired later as a
 # fallback when GOOGLE_PLACES_API_KEY is missing or returns ambiguous results.
@@ -164,7 +179,9 @@ class AutocompleteResponse(BaseModel):
 
 class ValidateAddressRequest(BaseModel):
     provider: Optional[str] = None
-    place_id: Optional[str] = None  # from a prior autocomplete selection
+    # From a prior autocomplete selection. Pattern-locked to the place-ID
+    # alphabet because this value reaches the outbound request URL (v0.5.2).
+    place_id: Optional[str] = Field(None, max_length=512, pattern=r"^[A-Za-z0-9_-]+$")
     force_revalidate: bool = False
 
 
@@ -225,6 +242,11 @@ async def _gplaces_autocomplete(
 async def _gplaces_details(place_id: str, session_token: Optional[str], language: str) -> dict:
     if not GOOGLE_PLACES_API_KEY:
         raise HTTPException(503, "GOOGLE_PLACES_API_KEY not configured")
+    # Defense in depth: the request model already pattern-locks place_id, but
+    # this function is also called with provider-returned IDs and by any future
+    # caller. Never let an unvetted string reach the URL with the API key.
+    if not _PLACE_ID_RE.fullmatch(place_id or ""):
+        raise HTTPException(400, "invalid place_id")
     headers = {
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
         "X-Goog-FieldMask": (
@@ -237,7 +259,7 @@ async def _gplaces_details(place_id: str, session_token: Optional[str], language
         params["sessionToken"] = session_token
     async with httpx.AsyncClient(timeout=GOOGLE_PLACES_TIMEOUT) as client:
         r = await client.get(
-            f"{GOOGLE_PLACES_BASE}/places/{place_id}",
+            f"{GOOGLE_PLACES_BASE}/places/{quote(place_id, safe='')}",
             headers=headers,
             params=params,
         )
