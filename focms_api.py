@@ -1,5 +1,14 @@
 from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.181
+"""focms_api.py - FOCMS Data Provider REST API v0.12.182
+
+v0.12.182 (2026-09-07):
+- Schemathesis remediation (45x GET 500s, two root causes, one choke point):
+  new exception handlers turn input-shaped errors into 422s - ValueError
+  (bad UUID path params like /student/0/...) and asyncpg DataError (bad
+  casts / NUL bytes reaching Postgres). Registered more-specific than the
+  PostgresError handler, so genuine DB faults still 500.
+- The PostgresError 500 handler no longer echoes str(exc) to the caller
+  (information-exposure class); full detail stays in server logs.
 
 v0.12.134 (2026-07-15):
 - New GET /focms/v1/student/{id}/computed/imx-imr: USA Swimming IMX (IM
@@ -3909,11 +3918,34 @@ async def list_student_media(
 # ---------------------------------------------------------------------------
 
 
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError) -> JSONResponse:
+    """Input-shaped errors are the caller's fault, not ours (v0.12.182).
+
+    Path params are typed str across ~40 endpoints, so UUID('0') and friends
+    raise ValueError inside handlers; before this, every one was a 500. Logged
+    at warning with traceback so a genuine internal ValueError stays visible.
+    """
+    log.warning("ValueError -> 422 on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
+    return JSONResponse(status_code=422, content={"error": "invalid_parameter"})
+
+
+@app.exception_handler(asyncpg.exceptions.DataError)
+async def pg_data_error_handler(request: Request, exc: asyncpg.exceptions.DataError) -> JSONResponse:
+    """Bad casts and NUL bytes that reach Postgres are 422s, not 500s
+    (v0.12.182). More specific than PostgresError below, so it wins for
+    invalid_text_representation / untranslatable_character etc."""
+    log.warning("DataError -> 422 on %s %s: %s", request.method, request.url.path, exc)
+    return JSONResponse(status_code=422, content={"error": "invalid_parameter"})
+
+
 @app.exception_handler(asyncpg.PostgresError)
 async def pg_error_handler(request: Request, exc: asyncpg.PostgresError) -> JSONResponse:
+    # v0.12.182: detail stays in server logs only - echoing str(exc) to the
+    # caller leaked schema/constraint names (information-exposure class).
     log.error("Postgres error: %s", exc, exc_info=True)
     return JSONResponse(
         status_code=500,
-        content={"error": "database_error", "detail": str(exc)},
+        content={"error": "database_error"},
     )
 
