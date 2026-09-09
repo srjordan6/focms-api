@@ -5960,8 +5960,12 @@ async def get_named_awards(request: Request):
     pool: asyncpg.Pool = request.app.state.pool
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT id::text AS id, title, category, granting_organization "
-            "FROM named_awards_catalog WHERE is_active ORDER BY category, title")
+            # v0.12.183: column is award_name, not title (endpoint 500ed on
+            # every call since v0.12.24). Aliased to title so the portal's
+            # response contract is unchanged.
+            "SELECT id::text AS id, award_name AS title, category, granting_organization "
+            "FROM named_awards_catalog WHERE is_active AND deleted_at IS NULL "
+            "ORDER BY category, award_name")
     return {"named_awards": [dict(r) for r in rows]}
 
 
