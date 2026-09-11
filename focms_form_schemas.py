@@ -2779,7 +2779,7 @@ async def public_site_config(request: Request, slug: str):
     theme = next((t for t in cat["themes"] if t["key"] == cfg["theme_key"]), None)         or (cat["themes"][0] if cat["themes"] else None)
     return {
         "slug": slug,
-        "hero_url": (f"https://focms-api.onrender.com/focms/v1/public/site/{slug}/hero" if has_hero else None),
+        "hero_url": (f"https://api.outcomestar.app/focms/v1/public/site/{slug}/hero" if has_hero else None),
         "is_public": bool(cfg["is_public"]) if cfg else True,
         "pillars_enabled": pillar_cfg,
         "student_first_name": student["first_name"],
@@ -3109,7 +3109,7 @@ async def create_rec_link(request: Request, student_id: str, body: RecTokenReque
                 "VALUES ($1,$2::uuid,$3::uuid,$4::uuid,$5,$6,$7, now() + interval '30 days', $8::uuid)",
                 token, tenant_id, student_id, body.recommender_id, body.recommender_name,
                 body.recommender_email, body.role or "teacher", user_id)
-    return {"token": token, "url": "https://focms-api.onrender.com/focms/v1/recommend/" + token,
+    return {"token": token, "url": "https://api.outcomestar.app/focms/v1/recommend/" + token,
             "expires_days": 30}
 
 

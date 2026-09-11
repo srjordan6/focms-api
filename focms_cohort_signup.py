@@ -543,7 +543,7 @@ async def _send_verification_email(to_email: str, role: str, student_name: str, 
     # v0.11.19 FIX: this function referenced an undefined `html` variable since
     # its introduction - NameError on EVERY call, silently swallowed by the
     # callers' non-fatal try/except. No verification email was ever sent.
-    link = f"https://focms-api.onrender.com/focms/v1/auth/verify-email?token={token}"
+    link = f"https://api.outcomestar.app/focms/v1/auth/verify-email?token={token}"
     who = "your" if role == "parent" else f"{student_name}'s"
     html = (
         "<div style='font-family:Arial,sans-serif;max-width:520px;margin:0 auto;color:#1a1a2e'>"

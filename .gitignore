@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 .env
 .env.*
+.venv/
 api_keys.txt
