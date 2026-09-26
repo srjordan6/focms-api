@@ -1,5 +1,11 @@
 from fastapi.middleware.cors import CORSMiddleware
-"""focms_api.py - FOCMS Data Provider REST API v0.12.182
+"""focms_api.py - FOCMS Data Provider REST API v0.12.184
+
+v0.12.184 (2026-09-25):
+- Log hygiene after two weeks on the PC: uvicorn access log no longer records
+  the watchdog's /livez probe (was ~2,000 lines/week); startup migrations that
+  fail only because the app role does not own the object are collected into one
+  INFO summary line instead of 22 WARNINGs per boot.
 
 v0.12.182 (2026-09-07):
 - Schemathesis remediation (45x GET 500s, two root causes, one choke point):
@@ -268,6 +274,20 @@ FOCMS_KEK_MASTER = os.environ.get("FOCMS_KEK_MASTER")
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("focms-api")
+
+
+# v0.12.184 (2026-09-25): the local watchdog hits /livez every 5 minutes, which
+# was ~2,000 identical access-log lines a week and buried everything else.
+# Drop only that path; every other request still logs normally.
+class _DropLivezAccessLog(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            return "/focms/v1/livez" not in record.getMessage()
+        except Exception:
+            return True
+
+
+logging.getLogger("uvicorn.access").addFilter(_DropLivezAccessLog())
 
 
 # ---------------------------------------------------------------------------
@@ -722,14 +742,27 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
 
         success_count = 0
         skip_count = 0
+        # v0.12.184: on the PC the app connects as focms_app but 35 tables and
+        # several functions are owned by focms_user, so the owner-only DDL in
+        # these idempotent migrations is refused every boot. The objects already
+        # exist (verified 2026-09-10 post-restore), so that is a no-op, not a
+        # fault: collect them and log one summary line instead of 22 warnings.
+        ownership_skips: list[str] = []
         for name, sql in MIGRATIONS:
             try:
                 await conn.execute(sql)
                 log.info("migration ok: %s", name)
                 success_count += 1
             except Exception as exc:
-                log.warning("migration skipped: %s: %s", name, exc)
+                msg = str(exc)
+                if "must be owner" in msg or "permission denied to change default privileges" in msg:
+                    ownership_skips.append(name)
+                else:
+                    log.warning("migration skipped: %s: %s", name, exc)
                 skip_count += 1
+        if ownership_skips:
+            log.info("migrations: %d owner-only steps skipped as %s (objects pre-exist; expected on the PC): %s",
+                     len(ownership_skips), current, ", ".join(ownership_skips))
         log.info("migrations complete: %d ok, %d skipped", success_count, skip_count)
 
 
